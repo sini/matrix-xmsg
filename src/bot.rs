@@ -11,6 +11,7 @@ pub enum BotOutcome {
     IgnoredRoom,
     IgnoredNoMention,
     IgnoredUntrustedUser,
+    IgnoredSelf,
     SizeCapRefusal,
     RateLimitRefusal,
     EscalatedUserRequest,
@@ -39,6 +40,11 @@ pub async fn handle_incoming_event(
     xmsg: &dyn XmsgClient,
     store: &Store,
 ) -> Result<BotOutcome, AppError> {
+    // 0. Self-Sender Gate: Drop silently if sender is the bot itself (F8)
+    if event.sender_mxid == config.bot_mxid {
+        return Ok(BotOutcome::IgnoredSelf);
+    }
+
     // 1. Room Allowlist Gate: Drop silently if not allowlisted
     if !config.is_room_allowlisted(&event.room_id) {
         return Ok(BotOutcome::IgnoredRoom);
@@ -219,6 +225,11 @@ pub fn extract_incoming_event(
     use matrix_sdk::ruma::events::room::message::{MessageType, Relation, SyncRoomMessageEvent};
 
     if let SyncRoomMessageEvent::Original(orig) = event {
+        // F3: Edits (m.replace) must not re-trigger questions
+        if let Some(Relation::Replacement(_)) = &orig.content.relates_to {
+            return None;
+        }
+
         let formatted_body = match &orig.content.msgtype {
             MessageType::Text(t) => t.formatted.as_ref().map(|f| f.body.clone()),
             MessageType::Notice(n) => n.formatted.as_ref().map(|f| f.body.clone()),
@@ -256,6 +267,22 @@ pub fn register_event_handlers(
     xmsg: std::sync::Arc<dyn XmsgClient>,
     store: std::sync::Arc<Store>,
 ) {
+    let startup_ts = chrono::Utc::now().timestamp_millis();
+    register_event_handlers_with_startup_ts(client, config, matrix, xmsg, store, startup_ts);
+}
+
+/// Registers event handlers with an explicit startup cutoff timestamp (useful for testing backlog suppression).
+pub fn register_event_handlers_with_startup_ts(
+    client: &matrix_sdk::Client,
+    config: std::sync::Arc<Config>,
+    matrix: std::sync::Arc<dyn MatrixClient>,
+    xmsg: std::sync::Arc<dyn XmsgClient>,
+    store: std::sync::Arc<Store>,
+    startup_ts: i64,
+) {
+    matrix.set_store(store.clone());
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+
     client.add_event_handler(
         move |event: matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent,
               room: matrix_sdk::room::Room| {
@@ -263,26 +290,54 @@ pub fn register_event_handlers(
             let matrix = matrix.clone();
             let xmsg = xmsg.clone();
             let store = store.clone();
+            let sem = semaphore.clone();
 
             async move {
                 if let Some(incoming) = extract_incoming_event(&event, room.room_id()) {
-                    let history = matrix
-                        .fetch_history(&incoming.room_id, config.history_n * 2)
-                        .await
-                        .unwrap_or_default();
-
-                    if let Err(e) = handle_incoming_event(
-                        &incoming,
-                        &history,
-                        &config,
-                        matrix.as_ref(),
-                        xmsg.as_ref(),
-                        &store,
-                    )
-                    .await
-                    {
-                        tracing::error!("Error handling incoming event {}: {e}", incoming.event_id);
+                    // F1: Backlog suppression - ignore events timestamped before bot boot
+                    if incoming.timestamp_ms < startup_ts {
+                        tracing::debug!(
+                            "Ignoring historical backlog event {} (ts {} < startup {})",
+                            incoming.event_id,
+                            incoming.timestamp_ms,
+                            startup_ts
+                        );
+                        return;
                     }
+
+                    // F8: Self-sender guard
+                    if incoming.sender_mxid == config.bot_mxid {
+                        return;
+                    }
+
+                    // F2: Spawn handling pipeline to prevent long-poll from blocking sync loop
+                    tokio::spawn(async move {
+                        let _permit = match sem.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+
+                        let history = matrix
+                            .fetch_history(&incoming.room_id, config.history_n * 2)
+                            .await
+                            .unwrap_or_default();
+
+                        if let Err(e) = handle_incoming_event(
+                            &incoming,
+                            &history,
+                            &config,
+                            matrix.as_ref(),
+                            xmsg.as_ref(),
+                            &store,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                "Error handling incoming event {}: {e}",
+                                incoming.event_id
+                            );
+                        }
+                    });
                 }
             }
         },
@@ -292,10 +347,17 @@ pub fn register_event_handlers(
 /// Runs the continuous Matrix sync loop until a shutdown signal is received.
 pub async fn run_daemon_loop(
     client: &matrix_sdk::Client,
+    store: std::sync::Arc<Store>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), AppError> {
     use matrix_sdk::config::SyncSettings;
     let mut sync_settings = SyncSettings::default();
+
+    // F1: Resume from persisted sync token if present
+    if let Ok(Some(saved_token)) = store.get_sync_token() {
+        tracing::info!("Resuming sync from saved token: {saved_token}");
+        sync_settings = sync_settings.token(saved_token);
+    }
 
     loop {
         tokio::select! {
@@ -306,7 +368,10 @@ pub async fn run_daemon_loop(
             res = client.sync_once(sync_settings.clone()) => {
                 match res {
                     Ok(sync_resp) => {
-                        sync_settings = sync_settings.token(sync_resp.next_batch);
+                        sync_settings = sync_settings.token(sync_resp.next_batch.clone());
+                        if let Err(e) = store.set_sync_token(&sync_resp.next_batch) {
+                            tracing::error!("Failed to persist sync token: {e}");
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("Sync error: {e}, retrying in 3 seconds");

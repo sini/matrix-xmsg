@@ -24,11 +24,16 @@ pub trait MatrixClient: Send + Sync {
         room_id: &str,
         limit: usize,
     ) -> Result<Vec<EventMessage>, AppError>;
+
+    /// Attaches the SQLite Store for DM room caching and state persistence.
+    fn set_store(&self, _store: std::sync::Arc<crate::store::Store>) {}
 }
 
 /// Real Matrix client backed by `matrix-sdk`.
 pub struct MatrixSdkClient {
     client: Client,
+    dm_rooms: Mutex<std::collections::HashMap<String, String>>,
+    store: Mutex<Option<std::sync::Arc<crate::store::Store>>>,
 }
 
 impl MatrixSdkClient {
@@ -62,7 +67,16 @@ impl MatrixSdkClient {
             .await
             .map_err(|e| AppError::Matrix(format!("Failed to restore session: {e}")))?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            dm_rooms: Mutex::new(std::collections::HashMap::new()),
+            store: Mutex::new(None),
+        })
+    }
+
+    pub fn set_store(&self, store: std::sync::Arc<crate::store::Store>) {
+        let mut guard = self.store.lock().unwrap();
+        *guard = Some(store);
     }
 
     pub fn inner(&self) -> &Client {
@@ -148,20 +162,64 @@ impl MatrixClient for MatrixSdkClient {
     async fn send_dm(&self, user_id: &str, body: &str) -> Result<String, AppError> {
         use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
         use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-        use matrix_sdk::ruma::UserId;
+        use matrix_sdk::ruma::{RoomId, UserId};
 
         let u_id = <&UserId>::try_from(user_id)
             .map_err(|e| AppError::Matrix(format!("Invalid owner user ID '{user_id}': {e}")))?;
 
-        let mut req = CreateRoomRequest::new();
-        req.is_direct = true;
-        req.invite = vec![u_id.to_owned()];
+        // F6: Reuse existing DM room for this user/owner if cached and present in client state
+        let cached_room_id: Option<String> = {
+            let in_memory = self.dm_rooms.lock().unwrap().get(user_id).cloned();
+            if in_memory.is_some() {
+                in_memory
+            } else {
+                let store_guard = self.store.lock().unwrap();
+                if let Some(store) = store_guard.as_ref() {
+                    store.get_dm_room(user_id).ok().flatten()
+                } else {
+                    None
+                }
+            }
+        };
 
-        let room = self
-            .client
-            .create_room(req)
-            .await
-            .map_err(|e| AppError::Matrix(format!("Failed to create DM room: {e}")))?;
+        let existing_room = if let Some(ref r_id_str) = cached_room_id {
+            if let Ok(r_id) = <&RoomId>::try_from(r_id_str.as_str()) {
+                self.client.get_room(r_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let room = match existing_room {
+            Some(r) => r,
+            None => {
+                let mut req = CreateRoomRequest::new();
+                req.is_direct = true;
+                req.invite = vec![u_id.to_owned()];
+
+                let created = self
+                    .client
+                    .create_room(req)
+                    .await
+                    .map_err(|e| AppError::Matrix(format!("Failed to create DM room: {e}")))?;
+
+                let new_room_id = created.room_id().to_string();
+                self.dm_rooms
+                    .lock()
+                    .unwrap()
+                    .insert(user_id.to_string(), new_room_id.clone());
+
+                let store_guard = self.store.lock().unwrap();
+                if let Some(store) = store_guard.as_ref() {
+                    let now = chrono::Utc::now().timestamp();
+                    let _ = store.set_dm_room(user_id, &new_room_id, now);
+                }
+
+                created
+            }
+        };
 
         let content = RoomMessageEventContent::notice_markdown(body);
         let send_resp = room
@@ -207,6 +265,10 @@ impl MatrixClient for MatrixSdkClient {
         messages.reverse();
         Ok(messages)
     }
+
+    fn set_store(&self, store: std::sync::Arc<crate::store::Store>) {
+        self.set_store(store);
+    }
 }
 
 /// Checks whether the incoming Matrix event mentions the bot.
@@ -236,10 +298,28 @@ pub fn is_bot_mentioned(
         return true;
     }
 
-    // 4. Localpart mention (e.g. "@genie" if bot_mxid is "@genie:example.org")
+    // 4. Localpart mention with boundary checks (e.g. "@genie" if bot_mxid is "@genie:example.org")
     if let Some(localpart) = bot_mxid.split(':').next() {
-        if !localpart.is_empty() && event_body.contains(localpart) {
-            return true;
+        if !localpart.is_empty() {
+            let mut start = 0;
+            while let Some(pos) = event_body[start..].find(localpart) {
+                let idx = start + pos;
+                let after_idx = idx + localpart.len();
+                let boundary_before = idx == 0
+                    || event_body[..idx]
+                        .chars()
+                        .last()
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '@');
+                let boundary_after = after_idx == event_body.len()
+                    || event_body[after_idx..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_');
+                if boundary_before && boundary_after {
+                    return true;
+                }
+                start = idx + localpart.len();
+            }
         }
     }
 
@@ -302,5 +382,58 @@ impl MatrixClient for MockMatrixClient {
     ) -> Result<Vec<EventMessage>, AppError> {
         let list = self.canned_history.lock().unwrap();
         Ok(list.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_bot_mentioned_boundary_checks() {
+        let bot_mxid = "@genie:example.org";
+
+        // Positive matches
+        assert!(is_bot_mentioned("@genie help", None, None, bot_mxid));
+        assert!(is_bot_mentioned(
+            "Hey @genie, what's up?",
+            None,
+            None,
+            bot_mxid
+        ));
+        assert!(is_bot_mentioned("Hello @genie!", None, None, bot_mxid));
+        assert!(is_bot_mentioned(
+            "Contact @genie:example.org",
+            None,
+            None,
+            bot_mxid
+        ));
+        assert!(is_bot_mentioned(
+            "can you help @genie",
+            None,
+            None,
+            bot_mxid
+        ));
+
+        // Negative matches: substrings that should NOT trigger bot
+        assert!(!is_bot_mentioned(
+            "Hey @genies how are you?",
+            None,
+            None,
+            bot_mxid
+        ));
+        assert!(!is_bot_mentioned(
+            "Contact @genie-x:evil.org",
+            None,
+            None,
+            bot_mxid
+        ));
+        assert!(!is_bot_mentioned(
+            "email user@genie.org",
+            None,
+            None,
+            bot_mxid
+        ));
+        assert!(!is_bot_mentioned("Look at @@genie", None, None, bot_mxid));
     }
 }

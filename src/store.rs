@@ -45,7 +45,16 @@ impl Store {
                 user_mxid TEXT NOT NULL,
                 timestamp INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_rate_limits_user ON rate_limits(user_mxid, timestamp);",
+            CREATE INDEX IF NOT EXISTS idx_rate_limits_user ON rate_limits(user_mxid, timestamp);
+            CREATE TABLE IF NOT EXISTS bot_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dm_rooms (
+                user_mxid TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
         Ok(())
@@ -151,6 +160,60 @@ impl Store {
 
         Ok(())
     }
+
+    /// Retrieves the persisted sync token (next_batch) if available.
+    pub fn get_sync_token(&self) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT value FROM bot_meta WHERE key = 'sync_token'")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+
+        let res = stmt.query_row([], |row| row.get(0));
+        match res {
+            Ok(token) => Ok(Some(token)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Persists the Matrix sync token (next_batch) into the bot_meta table.
+    pub fn set_sync_token(&self, token: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO bot_meta (key, value) VALUES ('sync_token', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![token],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Looks up a cached DM room ID for an escalated user/owner.
+    pub fn get_dm_room(&self, user_mxid: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT room_id FROM dm_rooms WHERE user_mxid = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+
+        let res = stmt.query_row(params![user_mxid], |row| row.get(0));
+        match res {
+            Ok(room_id) => Ok(Some(room_id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Records a cached DM room ID for an escalated user/owner.
+    pub fn set_dm_room(&self, user_mxid: &str, room_id: &str, now: i64) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO dm_rooms (user_mxid, room_id, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_mxid) DO UPDATE SET room_id = ?2, created_at = ?3",
+            params![user_mxid, room_id, now],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +252,45 @@ mod tests {
 
         // Attempt after window (t = 61) succeeds (since cutoff = 1, t = 0 expired)
         assert!(store.check_and_record_rate_limit(user, 5, 60, 61).is_ok());
+    }
+
+    #[test]
+    fn test_sync_token_persistence() {
+        let store = Store::new_in_memory().unwrap();
+        assert_eq!(store.get_sync_token().unwrap(), None);
+
+        store.set_sync_token("syt_batch_001").unwrap();
+        assert_eq!(
+            store.get_sync_token().unwrap(),
+            Some("syt_batch_001".to_string())
+        );
+
+        store.set_sync_token("syt_batch_002").unwrap();
+        assert_eq!(
+            store.get_sync_token().unwrap(),
+            Some("syt_batch_002".to_string())
+        );
+    }
+
+    #[test]
+    fn test_dm_room_caching() {
+        let store = Store::new_in_memory().unwrap();
+        assert_eq!(store.get_dm_room("@owner:example.org").unwrap(), None);
+
+        store
+            .set_dm_room("@owner:example.org", "!dm_123:example.org", 1000)
+            .unwrap();
+        assert_eq!(
+            store.get_dm_room("@owner:example.org").unwrap(),
+            Some("!dm_123:example.org".to_string())
+        );
+
+        store
+            .set_dm_room("@owner:example.org", "!dm_456:example.org", 2000)
+            .unwrap();
+        assert_eq!(
+            store.get_dm_room("@owner:example.org").unwrap(),
+            Some("!dm_456:example.org".to_string())
+        );
     }
 }

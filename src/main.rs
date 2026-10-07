@@ -55,10 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.bot_mxid, config.homeserver_url
     );
     info!(
-        "Allowlisted rooms: {:?}, trusted users: {}, token len: {}",
+        "Allowlisted rooms: {:?}, trusted users: {}",
         config.rooms,
-        config.trusted_mxids.len(),
-        token.len()
+        config.trusted_mxids.len()
     );
 
     let matrix_client = std::sync::Arc::new(
@@ -86,21 +85,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.clone(),
         matrix_client.clone(),
         xmsg_client,
-        store,
+        store.clone(),
     );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-    let shutdown_tx_clone = shutdown_tx.clone();
+    let shutdown_tx_ctrl_c = shutdown_tx.clone();
 
     tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {
             info!("Received SIGINT/ctrl-c, initiating graceful shutdown");
-            let _ = shutdown_tx_clone.send(());
+            let _ = shutdown_tx_ctrl_c.send(());
         }
     });
 
+    #[cfg(unix)]
+    {
+        let shutdown_tx_sigterm = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(mut sig) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                sig.recv().await;
+                info!("Received SIGTERM, initiating graceful shutdown");
+                let _ = shutdown_tx_sigterm.send(());
+            }
+        });
+    }
+
     info!("Starting Matrix event sync loop");
-    if let Err(e) = matrix_xmsg::bot::run_daemon_loop(matrix_client.inner(), shutdown_rx).await {
+    if let Err(e) =
+        matrix_xmsg::bot::run_daemon_loop(matrix_client.inner(), store, shutdown_rx).await
+    {
         error!("Fatal sync loop error: {e}");
         std::process::exit(1);
     }
