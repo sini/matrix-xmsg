@@ -210,3 +210,111 @@ pub async fn handle_incoming_event(
         Err(e) => Err(e),
     }
 }
+
+/// Extracts an `IncomingMatrixEvent` from a Matrix SDK `SyncRoomMessageEvent`.
+pub fn extract_incoming_event(
+    event: &matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent,
+    room_id: &matrix_sdk::ruma::RoomId,
+) -> Option<IncomingMatrixEvent> {
+    use matrix_sdk::ruma::events::room::message::{MessageType, Relation, SyncRoomMessageEvent};
+
+    if let SyncRoomMessageEvent::Original(orig) = event {
+        let formatted_body = match &orig.content.msgtype {
+            MessageType::Text(t) => t.formatted.as_ref().map(|f| f.body.clone()),
+            MessageType::Notice(n) => n.formatted.as_ref().map(|f| f.body.clone()),
+            _ => None,
+        };
+        let mentions = orig
+            .content
+            .mentions
+            .as_ref()
+            .map(|m| m.user_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>());
+        let thread_root_id = match &orig.content.relates_to {
+            Some(Relation::Thread(t)) => Some(t.event_id.to_string()),
+            _ => None,
+        };
+        Some(IncomingMatrixEvent {
+            room_id: room_id.to_string(),
+            event_id: orig.event_id.to_string(),
+            sender_mxid: orig.sender.to_string(),
+            body: orig.content.body().to_string(),
+            formatted_body,
+            mentions,
+            timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
+            thread_root_id,
+        })
+    } else {
+        None
+    }
+}
+
+/// Registers the Matrix SDK event handlers to dispatch room message events through the bot gating pipeline.
+pub fn register_event_handlers(
+    client: &matrix_sdk::Client,
+    config: std::sync::Arc<Config>,
+    matrix: std::sync::Arc<dyn MatrixClient>,
+    xmsg: std::sync::Arc<dyn XmsgClient>,
+    store: std::sync::Arc<Store>,
+) {
+    client.add_event_handler(
+        move |event: matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent,
+              room: matrix_sdk::room::Room| {
+            let config = config.clone();
+            let matrix = matrix.clone();
+            let xmsg = xmsg.clone();
+            let store = store.clone();
+
+            async move {
+                if let Some(incoming) = extract_incoming_event(&event, room.room_id()) {
+                    let history = matrix
+                        .fetch_history(&incoming.room_id, config.history_n * 2)
+                        .await
+                        .unwrap_or_default();
+
+                    if let Err(e) = handle_incoming_event(
+                        &incoming,
+                        &history,
+                        &config,
+                        matrix.as_ref(),
+                        xmsg.as_ref(),
+                        &store,
+                    )
+                    .await
+                    {
+                        tracing::error!("Error handling incoming event {}: {e}", incoming.event_id);
+                    }
+                }
+            }
+        },
+    );
+}
+
+/// Runs the continuous Matrix sync loop until a shutdown signal is received.
+pub async fn run_daemon_loop(
+    client: &matrix_sdk::Client,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), AppError> {
+    use matrix_sdk::config::SyncSettings;
+    let mut sync_settings = SyncSettings::default();
+
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => {
+                tracing::info!("Shutdown signal received, exiting sync loop");
+                break;
+            }
+            res = client.sync_once(sync_settings.clone()) => {
+                match res {
+                    Ok(sync_resp) => {
+                        sync_settings = sync_settings.token(sync_resp.next_batch);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Sync error: {e}, retrying in 3 seconds");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}

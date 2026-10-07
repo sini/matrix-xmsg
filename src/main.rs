@@ -41,16 +41,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let _store = match Store::new(&config.db_path) {
+    let config = std::sync::Arc::new(config);
+    let store = std::sync::Arc::new(match Store::new(&config.db_path) {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to open store at {}: {e}", config.db_path.display());
             std::process::exit(1);
         }
-    };
+    });
 
     info!(
-        "matrix-xmsg daemon initialized for bot {} on homeserver {}",
+        "matrix-xmsg daemon initializing for bot {} on homeserver {}",
         config.bot_mxid, config.homeserver_url
     );
     info!(
@@ -60,10 +61,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token.len()
     );
 
-    // In M1, scaffold daemon runs until shutdown signal.
-    // Live homeserver sync loop is wired in M2.
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down matrix-xmsg");
+    let matrix_client = std::sync::Arc::new(
+        match matrix_xmsg::matrix::MatrixSdkClient::new(
+            &config.homeserver_url,
+            &config.bot_mxid,
+            &token,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to initialize Matrix client: {e}");
+                std::process::exit(1);
+            }
+        },
+    );
 
+    let xmsg_client = std::sync::Arc::new(matrix_xmsg::xmsg::HttpXmsgClient::new(
+        config.xmsg_url.clone(),
+    ));
+
+    matrix_xmsg::bot::register_event_handlers(
+        matrix_client.inner(),
+        config.clone(),
+        matrix_client.clone(),
+        xmsg_client,
+        store,
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let shutdown_tx_clone = shutdown_tx.clone();
+
+    tokio::spawn(async move {
+        if let Ok(()) = tokio::signal::ctrl_c().await {
+            info!("Received SIGINT/ctrl-c, initiating graceful shutdown");
+            let _ = shutdown_tx_clone.send(());
+        }
+    });
+
+    info!("Starting Matrix event sync loop");
+    if let Err(e) = matrix_xmsg::bot::run_daemon_loop(matrix_client.inner(), shutdown_rx).await {
+        error!("Fatal sync loop error: {e}");
+        std::process::exit(1);
+    }
+
+    info!("matrix-xmsg stopped cleanly");
     Ok(())
 }

@@ -22,6 +22,8 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = true;
+          nativeCheckInputs = [ pkgs.cacert ];
+          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
           meta = {
             description = "Matrix support bot backed by an expert agent session";
             mainProgram = "matrix-xmsg";
