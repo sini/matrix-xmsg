@@ -1,0 +1,37 @@
+[package]
+name = "matrix-xmsg"
+version = "0.1.0"
+edition = "2021"
+description = "Matrix support bot backed by an expert agent session"
+license = "MIT"
+
+[[bin]]
+name = "matrix-xmsg"
+path = "src/main.rs"
+
+[lib]
+name = "matrix_xmsg"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "fs", "signal"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0"
+regex = "1.11"
+rusqlite = { version = "0.33", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+matrix-sdk = { version = "0.19", default-features = false }
+
+[dev-dependencies]
+proptest = "1.6"
+tempfile = "3.17"
+
+[profile.release]
+opt-level = 2
