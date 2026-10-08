@@ -167,7 +167,7 @@ impl MatrixClient for MatrixSdkClient {
         let u_id = <&UserId>::try_from(user_id)
             .map_err(|e| AppError::Matrix(format!("Invalid owner user ID '{user_id}': {e}")))?;
 
-        // F6: Reuse existing DM room for this user/owner if cached and present in client state
+        // F6 & N2: Reuse existing DM room for this user/owner if cached and valid
         let cached_room_id: Option<String> = {
             let in_memory = self.dm_rooms.lock().unwrap().get(user_id).cloned();
             if in_memory.is_some() {
@@ -182,47 +182,86 @@ impl MatrixClient for MatrixSdkClient {
             }
         };
 
-        let existing_room = if let Some(ref r_id_str) = cached_room_id {
-            if let Ok(r_id) = <&RoomId>::try_from(r_id_str.as_str()) {
-                self.client.get_room(r_id)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let room = match existing_room {
-            Some(r) => r,
-            None => {
-                let mut req = CreateRoomRequest::new();
-                req.is_direct = true;
-                req.invite = vec![u_id.to_owned()];
-
-                let created = self
-                    .client
-                    .create_room(req)
-                    .await
-                    .map_err(|e| AppError::Matrix(format!("Failed to create DM room: {e}")))?;
-
-                let new_room_id = created.room_id().to_string();
-                self.dm_rooms
-                    .lock()
-                    .unwrap()
-                    .insert(user_id.to_string(), new_room_id.clone());
-
-                let store_guard = self.store.lock().unwrap();
-                if let Some(store) = store_guard.as_ref() {
-                    let now = chrono::Utc::now().timestamp();
-                    let _ = store.set_dm_room(user_id, &new_room_id, now);
-                }
-
-                created
-            }
-        };
-
         let content = RoomMessageEventContent::notice_markdown(body);
-        let send_resp = room
+
+        if let Some(ref r_id_str) = cached_room_id {
+            if let Ok(r_id) = <&RoomId>::try_from(r_id_str.as_str()) {
+                if let Some(room) = self.client.get_room(r_id) {
+                    // Check if owner left or was banned
+                    let mut owner_left = false;
+                    if let Ok(Some(member)) = room.get_member_no_sync(u_id).await {
+                        let state = member.membership();
+                        if *state == matrix_sdk::ruma::events::room::member::MembershipState::Leave
+                            || *state
+                                == matrix_sdk::ruma::events::room::member::MembershipState::Ban
+                        {
+                            owner_left = true;
+                        }
+                    }
+                    if !owner_left {
+                        if let Ok(send_resp) = room.send(content.clone()).await {
+                            self.dm_rooms
+                                .lock()
+                                .unwrap()
+                                .insert(user_id.to_string(), r_id_str.clone());
+                            return Ok(send_resp.response.event_id.to_string());
+                        }
+                    }
+                } else {
+                    // Room is not in SDK in-memory cache (e.g. after restart).
+                    // Send directly to the cached room ID without createRoom!
+                    use matrix_sdk::ruma::api::client::message::send_message_event::v3::Request as SendMessageEventRequest;
+                    use matrix_sdk::ruma::events::MessageLikeEventType;
+                    use matrix_sdk::ruma::TransactionId;
+
+                    if let Ok(raw_content) = serde_json::to_string(&content) {
+                        if let Ok(raw_val) =
+                            matrix_sdk::ruma::serde::Raw::from_json_string(raw_content)
+                        {
+                            let req = SendMessageEventRequest::new_raw(
+                                r_id.to_owned(),
+                                TransactionId::new(),
+                                MessageLikeEventType::RoomMessage,
+                                raw_val,
+                            );
+                            if let Ok(resp) = self.client.send(req).await {
+                                self.dm_rooms
+                                    .lock()
+                                    .unwrap()
+                                    .insert(user_id.to_string(), r_id_str.clone());
+                                return Ok(resp.event_id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut req = CreateRoomRequest::new();
+        req.is_direct = true;
+        req.invite = vec![u_id.to_owned()];
+
+        let created = self
+            .client
+            .create_room(req)
+            .await
+            .map_err(|e| AppError::Matrix(format!("Failed to create DM room: {e}")))?;
+
+        let new_room_id = created.room_id().to_string();
+        self.dm_rooms
+            .lock()
+            .unwrap()
+            .insert(user_id.to_string(), new_room_id.clone());
+
+        {
+            let store_guard = self.store.lock().unwrap();
+            if let Some(store) = store_guard.as_ref() {
+                let now = chrono::Utc::now().timestamp();
+                let _ = store.set_dm_room(user_id, &new_room_id, now);
+            }
+        }
+
+        let send_resp = created
             .send(content)
             .await
             .map_err(|e| AppError::Matrix(format!("Failed to send DM message: {e}")))?;
@@ -310,11 +349,28 @@ pub fn is_bot_mentioned(
                         .chars()
                         .last()
                         .is_none_or(|c| !c.is_alphanumeric() && c != '@');
-                let boundary_after = after_idx == event_body.len()
-                    || event_body[after_idx..]
-                        .chars()
-                        .next()
-                        .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_');
+                let boundary_after = if after_idx == event_body.len() {
+                    true
+                } else {
+                    let remainder = &event_body[after_idx..];
+                    let next_char = remainder.chars().next().unwrap();
+                    if next_char.is_alphanumeric() || next_char == '-' || next_char == '_' {
+                        false
+                    } else if next_char == ':' {
+                        event_body[idx..].starts_with(bot_mxid)
+                            || remainder[1..]
+                                .chars()
+                                .next()
+                                .is_none_or(|c| c.is_whitespace())
+                    } else if next_char == '.' || next_char == '/' {
+                        remainder[1..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+                    } else {
+                        true
+                    }
+                };
                 if boundary_before && boundary_after {
                     return true;
                 }
@@ -435,5 +491,16 @@ mod tests {
             bot_mxid
         ));
         assert!(!is_bot_mentioned("Look at @@genie", None, None, bot_mxid));
+        assert!(is_bot_mentioned("hey @genie", None, None, bot_mxid));
+        assert!(is_bot_mentioned("@genie: help", None, None, bot_mxid));
+        assert!(is_bot_mentioned("ask @genie.", None, None, bot_mxid));
+        assert!(!is_bot_mentioned(
+            "ask @genie:evil.org",
+            None,
+            None,
+            bot_mxid
+        ));
+        assert!(!is_bot_mentioned("@genie.bot hi", None, None, bot_mxid));
+        assert!(!is_bot_mentioned("@genie/x", None, None, bot_mxid));
     }
 }

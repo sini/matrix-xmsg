@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.xmsg_url.clone(),
     ));
 
-    matrix_xmsg::bot::register_event_handlers(
+    let tracker = matrix_xmsg::bot::register_event_handlers(
         matrix_client.inner(),
         config.clone(),
         matrix_client.clone(),
@@ -113,8 +113,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("Starting Matrix event sync loop");
-    if let Err(e) =
-        matrix_xmsg::bot::run_daemon_loop(matrix_client.inner(), store, shutdown_rx).await
+    if let Err(e) = matrix_xmsg::bot::run_daemon_loop_with_drain(
+        matrix_client.inner(),
+        store,
+        matrix_client.as_ref(),
+        &tracker,
+        std::time::Duration::from_secs(5),
+        shutdown_rx,
+    )
+    .await
     {
         error!("Fatal sync loop error: {e}");
         std::process::exit(1);

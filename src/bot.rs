@@ -259,6 +259,92 @@ pub fn extract_incoming_event(
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct InFlightQuestion {
+    pub room_id: String,
+    pub thread_root: String,
+    pub sender_mxid: String,
+}
+
+#[derive(Clone, Default)]
+pub struct TaskTracker {
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    tasks: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<u64, (InFlightQuestion, tokio::task::AbortHandle)>,
+        >,
+    >,
+}
+
+impl TaskTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn track<F, Fut>(
+        &self,
+        question: InFlightQuestion,
+        future_fn: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let id = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let tasks = self.tasks.clone();
+        let handle = tokio::spawn(async move {
+            future_fn().await;
+            tasks.lock().await.remove(&id);
+        });
+        self.tasks
+            .lock()
+            .await
+            .insert(id, (question, handle.abort_handle()));
+        handle
+    }
+
+    pub async fn drain_or_notify(
+        &self,
+        matrix: &dyn MatrixClient,
+        grace_period: std::time::Duration,
+    ) {
+        let start = tokio::time::Instant::now();
+        loop {
+            {
+                let guard = self.tasks.lock().await;
+                if guard.is_empty() {
+                    return;
+                }
+            }
+            if start.elapsed() >= grace_period {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Grace period expired: abort in-flight tasks and post notice
+        let remaining: Vec<(InFlightQuestion, tokio::task::AbortHandle)> = {
+            let mut guard = self.tasks.lock().await;
+            guard.drain().map(|(_, v)| v).collect()
+        };
+
+        for (q, abort_handle) in remaining {
+            abort_handle.abort();
+            let notice = "The bot is restarting; please re-ask your question in a moment.";
+            let _ = matrix
+                .send_notice(
+                    &q.room_id,
+                    Some(&q.thread_root),
+                    notice,
+                    Some(&q.sender_mxid),
+                )
+                .await;
+        }
+    }
+}
+
 /// Registers the Matrix SDK event handlers to dispatch room message events through the bot gating pipeline.
 pub fn register_event_handlers(
     client: &matrix_sdk::Client,
@@ -266,9 +352,19 @@ pub fn register_event_handlers(
     matrix: std::sync::Arc<dyn MatrixClient>,
     xmsg: std::sync::Arc<dyn XmsgClient>,
     store: std::sync::Arc<Store>,
-) {
+) -> TaskTracker {
     let startup_ts = chrono::Utc::now().timestamp_millis();
-    register_event_handlers_with_startup_ts(client, config, matrix, xmsg, store, startup_ts);
+    let tracker = TaskTracker::new();
+    register_event_handlers_full(
+        client,
+        config,
+        matrix,
+        xmsg,
+        store,
+        startup_ts,
+        tracker.clone(),
+    );
+    tracker
 }
 
 /// Registers event handlers with an explicit startup cutoff timestamp (useful for testing backlog suppression).
@@ -279,6 +375,29 @@ pub fn register_event_handlers_with_startup_ts(
     xmsg: std::sync::Arc<dyn XmsgClient>,
     store: std::sync::Arc<Store>,
     startup_ts: i64,
+) -> TaskTracker {
+    let tracker = TaskTracker::new();
+    register_event_handlers_full(
+        client,
+        config,
+        matrix,
+        xmsg,
+        store,
+        startup_ts,
+        tracker.clone(),
+    );
+    tracker
+}
+
+/// Registers event handlers with an explicit startup cutoff timestamp and task tracker.
+pub fn register_event_handlers_full(
+    client: &matrix_sdk::Client,
+    config: std::sync::Arc<Config>,
+    matrix: std::sync::Arc<dyn MatrixClient>,
+    xmsg: std::sync::Arc<dyn XmsgClient>,
+    store: std::sync::Arc<Store>,
+    startup_ts: i64,
+    tracker: TaskTracker,
 ) {
     matrix.set_store(store.clone());
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
@@ -291,11 +410,12 @@ pub fn register_event_handlers_with_startup_ts(
             let xmsg = xmsg.clone();
             let store = store.clone();
             let sem = semaphore.clone();
+            let tracker = tracker.clone();
 
             async move {
                 if let Some(incoming) = extract_incoming_event(&event, room.room_id()) {
-                    // F1: Backlog suppression - ignore events timestamped before bot boot
-                    if incoming.timestamp_ms < startup_ts {
+                    // F1 & N4: Backlog suppression with 10s clock skew tolerance
+                    if incoming.timestamp_ms < startup_ts - 10_000 {
                         tracing::debug!(
                             "Ignoring historical backlog event {} (ts {} < startup {})",
                             incoming.event_id,
@@ -305,39 +425,75 @@ pub fn register_event_handlers_with_startup_ts(
                         return;
                     }
 
-                    // F8: Self-sender guard
+                    // F8 & N7: Self-sender guard
                     if incoming.sender_mxid == config.bot_mxid {
                         return;
                     }
 
-                    // F2: Spawn handling pipeline to prevent long-poll from blocking sync loop
-                    tokio::spawn(async move {
-                        let _permit = match sem.acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => return,
-                        };
+                    // N3 Gate 1: Room allowlist check (synchronous)
+                    if !config.is_room_allowlisted(&incoming.room_id) {
+                        return;
+                    }
 
-                        let history = matrix
-                            .fetch_history(&incoming.room_id, config.history_n * 2)
+                    // N3 Gate 2: Mention / Command check (synchronous)
+                    let is_thread_escalate =
+                        incoming.thread_root_id.is_some() && incoming.body.trim() == "!escalate";
+                    let is_mentioned = is_bot_mentioned(
+                        &incoming.body,
+                        incoming.formatted_body.as_deref(),
+                        incoming.mentions.as_deref(),
+                        &config.bot_mxid,
+                    );
+                    if !is_thread_escalate && !is_mentioned {
+                        return;
+                    }
+
+                    // N3 Gate 3: Trusted user check (synchronous)
+                    if !config.is_user_trusted(&incoming.sender_mxid) {
+                        return;
+                    }
+
+                    // All synchronous gates passed! Track in-flight task and spawn pipeline.
+                    let thread_root = incoming
+                        .thread_root_id
+                        .clone()
+                        .unwrap_or_else(|| incoming.event_id.clone());
+
+                    let question = InFlightQuestion {
+                        room_id: incoming.room_id.clone(),
+                        thread_root,
+                        sender_mxid: incoming.sender_mxid.clone(),
+                    };
+
+                    tracker
+                        .track(question, move || async move {
+                            let _permit = match sem.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => return,
+                            };
+
+                            let history = matrix
+                                .fetch_history(&incoming.room_id, config.history_n * 2)
+                                .await
+                                .unwrap_or_default();
+
+                            if let Err(e) = handle_incoming_event(
+                                &incoming,
+                                &history,
+                                &config,
+                                matrix.as_ref(),
+                                xmsg.as_ref(),
+                                &store,
+                            )
                             .await
-                            .unwrap_or_default();
-
-                        if let Err(e) = handle_incoming_event(
-                            &incoming,
-                            &history,
-                            &config,
-                            matrix.as_ref(),
-                            xmsg.as_ref(),
-                            &store,
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                "Error handling incoming event {}: {e}",
-                                incoming.event_id
-                            );
-                        }
-                    });
+                            {
+                                tracing::error!(
+                                    "Error handling incoming event {}: {e}",
+                                    incoming.event_id
+                                );
+                            }
+                        })
+                        .await;
                 }
             }
         },
@@ -353,7 +509,7 @@ pub async fn run_daemon_loop(
     use matrix_sdk::config::SyncSettings;
     let mut sync_settings = SyncSettings::default();
 
-    // F1: Resume from persisted sync token if present
+    // F1 & N9: Resume from persisted sync token if present
     if let Ok(Some(saved_token)) = store.get_sync_token() {
         tracing::info!("Resuming sync from saved token: {saved_token}");
         sync_settings = sync_settings.token(saved_token);
@@ -381,5 +537,19 @@ pub async fn run_daemon_loop(
             }
         }
     }
+    Ok(())
+}
+
+/// Runs the continuous Matrix sync loop and drains in-flight tasks upon shutdown.
+pub async fn run_daemon_loop_with_drain(
+    client: &matrix_sdk::Client,
+    store: std::sync::Arc<Store>,
+    matrix: &dyn MatrixClient,
+    tracker: &TaskTracker,
+    grace_period: std::time::Duration,
+    shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), AppError> {
+    run_daemon_loop(client, store, shutdown).await?;
+    tracker.drain_or_notify(matrix, grace_period).await;
     Ok(())
 }

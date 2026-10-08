@@ -36,7 +36,7 @@ fn default_answer_timeout_secs() -> u64 {
 }
 
 fn default_db_path() -> PathBuf {
-    PathBuf::from("matrix-xmsg.db")
+    PathBuf::from("/var/lib/matrix-xmsg/matrix-xmsg.db")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

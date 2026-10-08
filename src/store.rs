@@ -15,6 +15,11 @@ impl Store {
                 path.display()
             ))
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -292,5 +297,16 @@ mod tests {
             store.get_dm_room("@owner:example.org").unwrap(),
             Some("!dm_456:example.org".to_string())
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_store_file_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test_perms.db");
+        let _store = Store::new(&db_path).unwrap();
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "Created SQLite database must have 0600 mode");
     }
 }
