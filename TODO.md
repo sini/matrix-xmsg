@@ -23,7 +23,8 @@
   - Boots against stub Matrix homeserver (port 8008) and stub xmsg server (port 7787).
   - Asserts service starts, loads token from credential, creates DB `0600` under stateDir, answers 1 trusted mention in-thread, and cleanly deactivates within `TimeoutStopSec`.
   - Verified green under timeout (runtime: ~10s).
-- [x] Mutant test implemented as `checks.<system>.nixos-module-mutant` demonstrating RED failure under timeout when token path is invalid (`status=243/CREDENTIALS` exit).
+- [x] Mutant 1 (`checks.<system>.nixos-module-mutant-missing`) verifying RED failure when token path is invalid (`status=243/CREDENTIALS` exit).
+- [x] Mutant 2 (`checks.<system>.nixos-module-mutant-wrong-token`, Condition M3.1) verifying Bearer token authentication in mock homeserver, 401 `M_UNKNOWN_TOKEN` on unauthorized token, reply suppression, and 3s retry backoff.
 - [x] xmsg attestation evaluation: analyzed `xmsg` socket permissions (`0600`/`0700`), peer UID check (`peer_cred`), and ancestor process walk. Documented findings and minimal xmsg evolution path.
 - [x] Documentation updated in `README.md` (deployment guide, options table, token provisioning) and `TODO.md`.
 
