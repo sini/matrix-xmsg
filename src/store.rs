@@ -9,17 +9,43 @@ pub struct Store {
 
 impl Store {
     pub fn new(path: &Path) -> Result<Self, AppError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+
+            // Atomically create file with 0600 permissions if it does not exist
+            let _ = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| {
+                    AppError::Store(format!(
+                        "Failed to create SQLite file with mode 0600 at {}: {e}",
+                        path.display()
+                    ))
+                })?;
+
+            // Ensure permissions are 0600 even if file pre-existed, and propagate failure
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    AppError::Store(format!(
+                        "Failed to set 0600 permissions on SQLite database at {}: {e}",
+                        path.display()
+                    ))
+                },
+            )?;
+        }
+
         let conn = Connection::open(path).map_err(|e| {
             AppError::Store(format!(
                 "Failed to open SQLite database at {}: {e}",
                 path.display()
             ))
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
         let store = Self {
             conn: Mutex::new(conn),
         };

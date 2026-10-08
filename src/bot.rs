@@ -18,6 +18,7 @@ pub enum BotOutcome {
     Replied,
     RepliedAndEscalated,
     TimedOutAndEscalated,
+    AbortedByRestart,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,18 @@ pub async fn handle_incoming_event(
     matrix: &dyn MatrixClient,
     xmsg: &dyn XmsgClient,
     store: &Store,
+) -> Result<BotOutcome, AppError> {
+    handle_incoming_event_with_claim(event, room_history, config, matrix, xmsg, store, None).await
+}
+
+pub async fn handle_incoming_event_with_claim(
+    event: &IncomingMatrixEvent,
+    room_history: &[EventMessage],
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    xmsg: &dyn XmsgClient,
+    store: &Store,
+    claimed: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BotOutcome, AppError> {
     // 0. Self-Sender Gate: Drop silently if sender is the bot itself (F8)
     if event.sender_mxid == config.bot_mxid {
@@ -165,6 +178,20 @@ pub async fn handle_incoming_event(
         .await
     {
         Ok(reply_text) => {
+            // R2: Atomic claim before posting reply
+            if let Some(flag) = claimed {
+                if flag
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    return Ok(BotOutcome::AbortedByRestart);
+                }
+            }
             let trimmed = reply_text.trim();
             if trimmed.ends_with("[escalate]") {
                 let clean_reply = trimmed.strip_suffix("[escalate]").unwrap_or(trimmed).trim();
@@ -196,6 +223,20 @@ pub async fn handle_incoming_event(
             }
         }
         Err(AppError::Timeout(_)) => {
+            // R2: Atomic claim before posting timeout notice
+            if let Some(flag) = claimed {
+                if flag
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    return Ok(BotOutcome::AbortedByRestart);
+                }
+            }
             let dm_text = format!(
                 "[matrix-xmsg] Answer timeout in room {} thread {} for message {}",
                 event.room_id, thread_root, message_id
@@ -264,6 +305,18 @@ pub struct InFlightQuestion {
     pub room_id: String,
     pub thread_root: String,
     pub sender_mxid: String,
+    pub claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl InFlightQuestion {
+    pub fn new(room_id: String, thread_root: String, sender_mxid: String) -> Self {
+        Self {
+            room_id,
+            thread_root,
+            sender_mxid,
+            claimed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -294,14 +347,13 @@ impl TaskTracker {
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tasks = self.tasks.clone();
+        let mut guard = self.tasks.lock().await;
         let handle = tokio::spawn(async move {
             future_fn().await;
             tasks.lock().await.remove(&id);
         });
-        self.tasks
-            .lock()
-            .await
-            .insert(id, (question, handle.abort_handle()));
+        guard.insert(id, (question, handle.abort_handle()));
+        drop(guard);
         handle
     }
 
@@ -330,18 +382,60 @@ impl TaskTracker {
             guard.drain().map(|(_, v)| v).collect()
         };
 
+        let mut notices_to_send = Vec::new();
         for (q, abort_handle) in remaining {
             abort_handle.abort();
+            // R2: Atomic claim. Whichever claims first posts; the other skips.
+            if q.claimed
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                notices_to_send.push(q);
+            }
+        }
+
+        // R4: Send notices concurrently with 3s per-notice timeout, logging warnings on failure with room_id and thread_root, under 5s overall cap.
+        let notice_futures = notices_to_send.into_iter().map(|q| async move {
             let notice = "The bot is restarting; please re-ask your question in a moment.";
-            let _ = matrix
-                .send_notice(
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                matrix.send_notice(
                     &q.room_id,
                     Some(&q.thread_root),
                     notice,
                     Some(&q.sender_mxid),
-                )
-                .await;
-        }
+                ),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        room_id = %q.room_id,
+                        thread_root = %q.thread_root,
+                        "Failed to send restart notice: {e}"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        room_id = %q.room_id,
+                        thread_root = %q.thread_root,
+                        "Timed out sending restart notice after 3s"
+                    );
+                }
+            }
+        });
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures_util::future::join_all(notice_futures),
+        )
+        .await;
     }
 }
 
@@ -414,13 +508,22 @@ pub fn register_event_handlers_full(
 
             async move {
                 if let Some(incoming) = extract_incoming_event(&event, room.room_id()) {
-                    // F1 & N4: Backlog suppression with 10s clock skew tolerance
-                    if incoming.timestamp_ms < startup_ts - 10_000 {
+                    // R5: Backlog suppression: primary guard is the persisted sync token.
+                    // On initial token-less sync, no skew tolerance is granted: events before startup_ts are backlog.
+                    // On resumed sync with token, a 10s clock skew tolerance is allowed.
+                    let has_persisted_token = store.get_sync_token().ok().flatten().is_some();
+                    let cutoff_ts = if has_persisted_token {
+                        startup_ts - 10_000
+                    } else {
+                        startup_ts
+                    };
+
+                    if incoming.timestamp_ms < cutoff_ts {
                         tracing::debug!(
-                            "Ignoring historical backlog event {} (ts {} < startup {})",
+                            "Ignoring historical backlog event {} (ts {} < cutoff {})",
                             incoming.event_id,
                             incoming.timestamp_ms,
-                            startup_ts
+                            cutoff_ts
                         );
                         return;
                     }
@@ -459,11 +562,12 @@ pub fn register_event_handlers_full(
                         .clone()
                         .unwrap_or_else(|| incoming.event_id.clone());
 
-                    let question = InFlightQuestion {
-                        room_id: incoming.room_id.clone(),
+                    let question = InFlightQuestion::new(
+                        incoming.room_id.clone(),
                         thread_root,
-                        sender_mxid: incoming.sender_mxid.clone(),
-                    };
+                        incoming.sender_mxid.clone(),
+                    );
+                    let claimed = question.claimed.clone();
 
                     tracker
                         .track(question, move || async move {
@@ -477,13 +581,14 @@ pub fn register_event_handlers_full(
                                 .await
                                 .unwrap_or_default();
 
-                            if let Err(e) = handle_incoming_event(
+                            if let Err(e) = handle_incoming_event_with_claim(
                                 &incoming,
                                 &history,
                                 &config,
                                 matrix.as_ref(),
                                 xmsg.as_ref(),
                                 &store,
+                                Some(&claimed),
                             )
                             .await
                             {

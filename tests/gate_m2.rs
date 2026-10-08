@@ -1088,6 +1088,17 @@ async fn test_dm_room_reused_across_multiple_escalations() {
         .mount(&mock_server)
         .await;
 
+    // R1: Owner membership query for cached DM room returns join
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/!owner_dm:example\.org/(state/m\.room\.member/.*|members|joined_members)$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "membership": "join"
+        })))
+        .mount(&mock_server)
+        .await;
+
     // Send notice: 2 notices in room + 2 notices in DM = 4 total sends
     Mock::given(method("PUT"))
         .and(path_regex(
@@ -1336,10 +1347,21 @@ async fn test_n2_cached_dm_room_reused_after_restart() {
         .set_dm_room("@owner:example.org", "!dm_old:example.org", 1000)
         .unwrap();
 
-    // createRoom must NOT be called on restart when room is cached in SQLite
+    // R1: Query server for owner membership; returns join so cached room is valid
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/!dm_old:example\.org/(state/m\.room\.member/.*|members|joined_members)$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "membership": "join"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // P-b: createRoom returns terminal 403 (not 500 which triggers SDK infinite retries) and must NOT be called
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/createRoom"))
-        .respond_with(ResponseTemplate::new(500))
+        .respond_with(ResponseTemplate::new(403))
         .expect(0)
         .mount(&mock_server)
         .await;
@@ -1360,7 +1382,12 @@ async fn test_n2_cached_dm_room_reused_after_restart() {
         .unwrap();
     sdk.set_store(store.clone());
 
-    let res = sdk.send_dm("@owner:example.org", "Escalation notice").await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        sdk.send_dm("@owner:example.org", "Escalation notice"),
+    )
+    .await
+    .expect("send_dm must not hang (P-b timeout)");
     assert!(res.is_ok(), "Direct send on restart must succeed: {res:?}");
     assert_eq!(res.unwrap(), "$dm_ev_1");
 }
@@ -1735,4 +1762,609 @@ fn test_mention_boundary_other_server_mxid() {
     assert!(is_bot_mentioned("@genie: help", None, None, b));
     assert!(!is_bot_mentioned("@genies", None, None, b));
     assert!(is_bot_mentioned("@genie:example.org help", None, None, b));
+}
+
+#[tokio::test]
+async fn test_n2b_restart_owner_left() {
+    let mock_server = MockServer::start().await;
+    setup_versions_mock(&mock_server).await;
+
+    let store = Arc::new(Store::new_in_memory().unwrap());
+    store
+        .set_dm_room("@owner:example.org", "!dm_old:example.org", 1000)
+        .unwrap();
+
+    // R1: Owner has left !dm_old on the homeserver
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/!dm_old:example\.org/(state/m\.room\.member/.*|members|joined_members)$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "membership": "leave"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // createRoom MUST be called because owner left cached room
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/createRoom"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "room_id": "!dm_new:example.org"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Send must go to !dm_new:example.org
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/!dm_new:example\.org/send/m\.room\.message/.*$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$dm_ev_new"})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Old room must NOT receive message
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/!dm_old:example\.org/send/m\.room\.message/.*$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$dm_ev_old"})))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = test_config(&mock_server.uri());
+    let sdk = MatrixSdkClient::new(&config.homeserver_url, &config.bot_mxid, "syt_token")
+        .await
+        .unwrap();
+    sdk.set_store(store.clone());
+
+    let res = sdk.send_dm("@owner:example.org", "Escalation notice").await;
+    assert!(
+        res.is_ok(),
+        "Send DM after owner left must succeed via createRoom: {res:?}"
+    );
+    assert_eq!(res.unwrap(), "$dm_ev_new");
+}
+
+#[tokio::test]
+async fn test_n2c_restart_room_in_sync_without_member_state() {
+    let mock_server = MockServer::start().await;
+    setup_versions_mock(&mock_server).await;
+
+    let store = Arc::new(Store::new_in_memory().unwrap());
+    store
+        .set_dm_room("@owner:example.org", "!dm_old:example.org", 1000)
+        .unwrap();
+
+    let ev = json!({
+        "type": "m.room.message",
+        "sender": "@genie:example.org",
+        "event_id": "$old_dm_msg",
+        "origin_server_ts": live_ts(),
+        "content": {"msgtype": "m.notice", "body": "earlier escalation"}
+    });
+
+    let sync_resp = json!({
+        "next_batch": "nb1",
+        "rooms": {
+            "join": {
+                "!dm_old:example.org": {
+                    "timeline": {
+                        "events": [ev]
+                    }
+                }
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v3/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sync_resp))
+        .mount(&mock_server)
+        .await;
+
+    // Server state query shows owner has left !dm_old
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/!dm_old:example\.org/(state/m\.room\.member/.*|members|joined_members)$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "membership": "leave"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // createRoom MUST be called
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/createRoom"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "room_id": "!dm_new:example.org"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/!dm_new:example\.org/send/m\.room\.message/.*$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$dm_ev_new"})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = test_config(&mock_server.uri());
+    let sdk = MatrixSdkClient::new(&config.homeserver_url, &config.bot_mxid, "syt_token")
+        .await
+        .unwrap();
+    sdk.set_store(store.clone());
+
+    // Sync once with a saved token to put room into SDK state without member events
+    sdk.inner()
+        .sync_once(SyncSettings::default().token("saved"))
+        .await
+        .unwrap();
+    assert!(
+        sdk.inner()
+            .get_room(<&matrix_sdk::ruma::RoomId>::try_from("!dm_old:example.org").unwrap())
+            .is_some(),
+        "Room must be in SDK state"
+    );
+
+    let res = sdk.send_dm("@owner:example.org", "Escalation notice").await;
+    assert!(res.is_ok(), "Must create new room when owner left: {res:?}");
+    assert_eq!(res.unwrap(), "$dm_ev_new");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_n1_double_post() {
+    let mock_server = MockServer::start().await;
+    setup_versions_mock(&mock_server).await;
+
+    let ts = live_ts() + 5000;
+    let event = json!({
+        "type": "m.room.message",
+        "sender": "@alice:example.org",
+        "event_id": "$q_dbl",
+        "origin_server_ts": ts,
+        "content": {
+            "msgtype": "m.text",
+            "body": "@genie:example.org help with race",
+            "m.mentions": {
+                "user_ids": ["@genie:example.org"]
+            }
+        }
+    });
+
+    let sync_resp = json!({
+        "next_batch": "nb1",
+        "rooms": {
+            "join": {
+                "!public:example.org": {
+                    "timeline": {
+                        "events": [event]
+                    }
+                }
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v3/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sync_resp))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "start": "s",
+            "end": "e",
+            "chunk": []
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // Reply PUT takes 400ms delay to induce race with 100ms shutdown drain
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/.*/send/m\.room\.message/.*$",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"event_id": "$r"}))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let store = Arc::new(Store::new_in_memory().unwrap());
+    store.set_sync_token("saved_tok").unwrap();
+
+    let config = Arc::new(test_config(&mock_server.uri()));
+    let sdk = Arc::new(
+        MatrixSdkClient::new(&config.homeserver_url, &config.bot_mxid, "syt_token")
+            .await
+            .unwrap(),
+    );
+    let xmsg = Arc::new(TestXmsgMock::with_reply("THE-EXPERT-ANSWER"));
+
+    let tracker = register_event_handlers(
+        sdk.inner(),
+        config.clone(),
+        sdk.clone(),
+        xmsg.clone(),
+        store.clone(),
+    );
+
+    sdk.inner()
+        .sync_once(SyncSettings::default().token("saved_tok"))
+        .await
+        .unwrap();
+
+    // 100ms grace period expires while the 400ms reply PUT is in flight
+    tracker
+        .drain_or_notify(sdk.as_ref(), Duration::from_millis(100))
+        .await;
+
+    // Wait for the in-flight reply PUT to complete
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let put_reqs: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .collect();
+
+    // R2 Gating Oracle: EXACTLY 1 PUT under race! Never both answer and restart notice.
+    assert_eq!(
+        put_reqs.len(),
+        1,
+        "Expected exactly 1 PUT under race, got {}: {:?}",
+        put_reqs.len(),
+        put_reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_n1_tracker_leak_eliminated() {
+    use matrix_xmsg::bot::{InFlightQuestion, TaskTracker};
+    use matrix_xmsg::context::EventMessage;
+
+    struct CountNoticeClient(AtomicUsize);
+    #[async_trait]
+    impl MatrixClient for CountNoticeClient {
+        async fn send_notice(
+            &self,
+            _r: &str,
+            _t: Option<&str>,
+            _b: &str,
+            _m: Option<&str>,
+        ) -> Result<String, AppError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("$notice".into())
+        }
+        async fn send_dm(&self, _u: &str, _b: &str) -> Result<String, AppError> {
+            Ok("$dm".into())
+        }
+        async fn fetch_history(&self, _r: &str, _l: usize) -> Result<Vec<EventMessage>, AppError> {
+            Ok(vec![])
+        }
+    }
+
+    let tracker = TaskTracker::new();
+    let mut handles = Vec::new();
+    for i in 0..2000 {
+        let q = InFlightQuestion::new(
+            "!r:example.org".into(),
+            format!("$t{i}"),
+            "@a:example.org".into(),
+        );
+        handles.push(tracker.track(q, || async {}).await);
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+
+    let client = CountNoticeClient(AtomicUsize::new(0));
+    tracker
+        .drain_or_notify(&client, Duration::from_millis(300))
+        .await;
+
+    // R3 Oracle: 0 spurious restart notices for 2000 completed tasks!
+    assert_eq!(
+        client.0.load(Ordering::SeqCst),
+        0,
+        "Finished tasks must not be leaked into task map or receive spurious notices"
+    );
+}
+
+#[tokio::test]
+async fn test_r5_backlog_suppression_primary_token_guard() {
+    let mock_server = MockServer::start().await;
+    setup_versions_mock(&mock_server).await;
+
+    let ts = live_ts();
+    let event_initial = json!({
+        "type": "m.room.message",
+        "sender": "@alice:example.org",
+        "event_id": "$ev_init",
+        "origin_server_ts": ts - 5000, // Within 10s skew, but initial sync!
+        "content": {
+            "msgtype": "m.text",
+            "body": "@genie:example.org question during initial sync",
+            "m.mentions": {
+                "user_ids": ["@genie:example.org"]
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v3/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "next_batch": "nb1",
+            "rooms": {
+                "join": {
+                    "!public:example.org": {
+                        "timeline": {
+                            "events": [event_initial]
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "start": "s",
+            "end": "e",
+            "chunk": []
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let store = Arc::new(Store::new_in_memory().unwrap());
+    // Store has NO sync token -> initial token-less sync!
+    assert!(store.get_sync_token().unwrap().is_none());
+
+    let config = Arc::new(test_config(&mock_server.uri()));
+    let sdk = Arc::new(
+        MatrixSdkClient::new(&config.homeserver_url, &config.bot_mxid, "syt_token")
+            .await
+            .unwrap(),
+    );
+    let xmsg = Arc::new(TestXmsgMock::with_reply("answer"));
+
+    let _tracker = register_event_handlers(
+        sdk.inner(),
+        config.clone(),
+        sdk.clone(),
+        xmsg.clone(),
+        store.clone(),
+    );
+
+    sdk.inner()
+        .sync_once(SyncSettings::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // R5 Oracle: initial token-less sync MUST drop timeline events even if ts > startup - 10s!
+    assert_eq!(
+        xmsg.send_counter.load(Ordering::SeqCst),
+        0,
+        "Initial token-less sync must suppress all timeline backlog events"
+    );
+}
+
+#[test]
+fn test_r6_mention_boundary_subdomain_and_tld() {
+    use matrix_xmsg::matrix::is_bot_mentioned;
+    let bot_mxid = "@genie:example.org";
+
+    // Valid mentions
+    assert!(is_bot_mentioned("@genie:example.org", None, None, bot_mxid));
+    assert!(is_bot_mentioned(
+        "@genie:example.org help",
+        None,
+        None,
+        bot_mxid
+    ));
+    assert!(is_bot_mentioned(
+        "hello @genie:example.org",
+        None,
+        None,
+        bot_mxid
+    ));
+
+    // R6 Defects: Subdomains and TLD extensions of the bot MXID must be REJECTED!
+    assert!(!is_bot_mentioned(
+        "@genie:example.org.evil.com",
+        None,
+        None,
+        bot_mxid
+    ));
+    assert!(!is_bot_mentioned(
+        "@genie:example.organic",
+        None,
+        None,
+        bot_mxid
+    ));
+    assert!(!is_bot_mentioned(
+        "@genie:example.org:8448",
+        None,
+        None,
+        bot_mxid
+    ));
+    assert!(!is_bot_mentioned("@genie:evil.org", None, None, bot_mxid));
+}
+
+#[tokio::test]
+async fn test_p_a_n4_tolerance_resumed_sync() {
+    let mock_server = MockServer::start().await;
+    setup_versions_mock(&mock_server).await;
+
+    let ts = live_ts();
+    // Event at startup - 5s (within 10s skew)
+    let ev_within = json!({
+        "type": "m.room.message",
+        "sender": "@alice:example.org",
+        "event_id": "$ev_within",
+        "origin_server_ts": ts - 5000,
+        "content": {
+            "msgtype": "m.text",
+            "body": "@genie:example.org within tolerance",
+            "m.mentions": {
+                "user_ids": ["@genie:example.org"]
+            }
+        }
+    });
+    // Event at startup - 11s (outside 10s skew)
+    let ev_outside = json!({
+        "type": "m.room.message",
+        "sender": "@alice:example.org",
+        "event_id": "$ev_outside",
+        "origin_server_ts": ts - 11000,
+        "content": {
+            "msgtype": "m.text",
+            "body": "@genie:example.org outside tolerance",
+            "m.mentions": {
+                "user_ids": ["@genie:example.org"]
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v3/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "next_batch": "nb1",
+            "rooms": {
+                "join": {
+                    "!public:example.org": {
+                        "timeline": {
+                            "events": [ev_within, ev_outside]
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "start": "s",
+            "end": "e",
+            "chunk": []
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/.*/send/m\.room\.message/.*$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$r"})))
+        .mount(&mock_server)
+        .await;
+
+    let store = Arc::new(Store::new_in_memory().unwrap());
+    store.set_sync_token("resumed_tok").unwrap();
+
+    let config = Arc::new(test_config(&mock_server.uri()));
+    let sdk = Arc::new(
+        MatrixSdkClient::new(&config.homeserver_url, &config.bot_mxid, "syt_token")
+            .await
+            .unwrap(),
+    );
+    let xmsg = Arc::new(TestXmsgMock::with_reply("answer"));
+
+    let _tracker = matrix_xmsg::bot::register_event_handlers_with_startup_ts(
+        sdk.inner(),
+        config.clone(),
+        sdk.clone(),
+        xmsg.clone(),
+        store.clone(),
+        ts,
+    );
+
+    sdk.inner()
+        .sync_once(SyncSettings::default().token("resumed_tok"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // P-a / N4 Oracle: exactly 1 dispatch (ev_within within 10s skew dispatched; ev_outside dropped)
+    assert_eq!(
+        xmsg.send_counter.load(Ordering::SeqCst),
+        1,
+        "Expected exactly 1 dispatch for event within 10s tolerance on resumed sync"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_p_a_n1_abort_oracle() {
+    use matrix_xmsg::bot::{InFlightQuestion, TaskTracker};
+    use matrix_xmsg::context::EventMessage;
+
+    struct MockNoticeClient;
+    #[async_trait]
+    impl MatrixClient for MockNoticeClient {
+        async fn send_notice(
+            &self,
+            _r: &str,
+            _t: Option<&str>,
+            _b: &str,
+            _m: Option<&str>,
+        ) -> Result<String, AppError> {
+            Ok("$n".into())
+        }
+        async fn send_dm(&self, _u: &str, _b: &str) -> Result<String, AppError> {
+            Ok("$d".into())
+        }
+        async fn fetch_history(&self, _r: &str, _l: usize) -> Result<Vec<EventMessage>, AppError> {
+            Ok(vec![])
+        }
+    }
+
+    let tracker = TaskTracker::new();
+    let executed_after_abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exec_clone = executed_after_abort.clone();
+
+    let q = InFlightQuestion::new(
+        "!r:example.org".into(),
+        "$t1".into(),
+        "@a:example.org".into(),
+    );
+    let _handle = tracker
+        .track(q, move || async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            exec_clone.store(true, Ordering::SeqCst);
+        })
+        .await;
+
+    let client = MockNoticeClient;
+    // Drain with 50ms grace -> expires and aborts the task!
+    tracker
+        .drain_or_notify(&client, Duration::from_millis(50))
+        .await;
+
+    // Wait past the task's 150ms sleep
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // P-a / N1 abort Oracle: the task future was aborted and must not have set the flag
+    assert!(
+        !executed_after_abort.load(Ordering::SeqCst),
+        "Aborted task must be cancelled and not run to completion"
+    );
 }

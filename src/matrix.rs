@@ -112,6 +112,48 @@ pub fn parse_timeline_event(
     }
 }
 
+async fn is_owner_member_of_room(
+    client: &matrix_sdk::Client,
+    room_id: &matrix_sdk::ruma::RoomId,
+    user_id: &matrix_sdk::ruma::UserId,
+) -> bool {
+    use matrix_sdk::ruma::api::client::state::get_state_event_for_key::v3::Request as GetStateEventRequest;
+    use matrix_sdk::ruma::events::StateEventType;
+
+    let req = GetStateEventRequest::new(
+        room_id.to_owned(),
+        StateEventType::RoomMember,
+        user_id.to_string(),
+    );
+
+    if let Ok(resp) = client.send(req).await {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(resp.event_or_content.get()) {
+            let direct_m = val.get("membership").and_then(|m| m.as_str());
+            let content_m = val
+                .get("content")
+                .and_then(|c| c.get("membership"))
+                .and_then(|m| m.as_str());
+            let chunk_m = val
+                .get("chunk")
+                .and_then(|arr| arr.as_array())
+                .and_then(|list| {
+                    list.iter()
+                        .find(|ev| {
+                            ev.get("state_key").and_then(|k| k.as_str()) == Some(user_id.as_str())
+                        })
+                        .and_then(|ev| {
+                            ev.get("content")
+                                .and_then(|c| c.get("membership"))
+                                .and_then(|m| m.as_str())
+                        })
+                });
+            let membership = direct_m.or(content_m).or(chunk_m);
+            return matches!(membership, Some("join") | Some("invite"));
+        }
+    }
+    false
+}
+
 #[async_trait]
 impl MatrixClient for MatrixSdkClient {
     async fn send_notice(
@@ -186,19 +228,11 @@ impl MatrixClient for MatrixSdkClient {
 
         if let Some(ref r_id_str) = cached_room_id {
             if let Ok(r_id) = <&RoomId>::try_from(r_id_str.as_str()) {
-                if let Some(room) = self.client.get_room(r_id) {
-                    // Check if owner left or was banned
-                    let mut owner_left = false;
-                    if let Ok(Some(member)) = room.get_member_no_sync(u_id).await {
-                        let state = member.membership();
-                        if *state == matrix_sdk::ruma::events::room::member::MembershipState::Leave
-                            || *state
-                                == matrix_sdk::ruma::events::room::member::MembershipState::Ban
-                        {
-                            owner_left = true;
-                        }
-                    }
-                    if !owner_left {
+                // R1: Query the server for the owner's membership of the cached DM room.
+                // Reuse only if the owner has joined or been invited; otherwise create a new room.
+                if is_owner_member_of_room(&self.client, r_id, u_id).await {
+                    if let Some(room) = self.client.get_room(r_id) {
+                        // Arm A: room in SDK state
                         if let Ok(send_resp) = room.send(content.clone()).await {
                             self.dm_rooms
                                 .lock()
@@ -206,30 +240,29 @@ impl MatrixClient for MatrixSdkClient {
                                 .insert(user_id.to_string(), r_id_str.clone());
                             return Ok(send_resp.response.event_id.to_string());
                         }
-                    }
-                } else {
-                    // Room is not in SDK in-memory cache (e.g. after restart).
-                    // Send directly to the cached room ID without createRoom!
-                    use matrix_sdk::ruma::api::client::message::send_message_event::v3::Request as SendMessageEventRequest;
-                    use matrix_sdk::ruma::events::MessageLikeEventType;
-                    use matrix_sdk::ruma::TransactionId;
+                    } else {
+                        // Arm B: room not in SDK state (e.g. after restart)
+                        use matrix_sdk::ruma::api::client::message::send_message_event::v3::Request as SendMessageEventRequest;
+                        use matrix_sdk::ruma::events::MessageLikeEventType;
+                        use matrix_sdk::ruma::TransactionId;
 
-                    if let Ok(raw_content) = serde_json::to_string(&content) {
-                        if let Ok(raw_val) =
-                            matrix_sdk::ruma::serde::Raw::from_json_string(raw_content)
-                        {
-                            let req = SendMessageEventRequest::new_raw(
-                                r_id.to_owned(),
-                                TransactionId::new(),
-                                MessageLikeEventType::RoomMessage,
-                                raw_val,
-                            );
-                            if let Ok(resp) = self.client.send(req).await {
-                                self.dm_rooms
-                                    .lock()
-                                    .unwrap()
-                                    .insert(user_id.to_string(), r_id_str.clone());
-                                return Ok(resp.event_id.to_string());
+                        if let Ok(raw_content) = serde_json::to_string(&content) {
+                            if let Ok(raw_val) =
+                                matrix_sdk::ruma::serde::Raw::from_json_string(raw_content)
+                            {
+                                let req = SendMessageEventRequest::new_raw(
+                                    r_id.to_owned(),
+                                    TransactionId::new(),
+                                    MessageLikeEventType::RoomMessage,
+                                    raw_val,
+                                );
+                                if let Ok(resp) = self.client.send(req).await {
+                                    self.dm_rooms
+                                        .lock()
+                                        .unwrap()
+                                        .insert(user_id.to_string(), r_id_str.clone());
+                                    return Ok(resp.event_id.to_string());
+                                }
                             }
                         }
                     }
@@ -310,6 +343,48 @@ impl MatrixClient for MatrixSdkClient {
     }
 }
 
+fn is_full_mxid_mentioned(event_body: &str, bot_mxid: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = event_body[start..].find(bot_mxid) {
+        let idx = start + pos;
+        let after_idx = idx + bot_mxid.len();
+
+        let boundary_before = idx == 0
+            || event_body[..idx]
+                .chars()
+                .last()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '@');
+
+        let boundary_after = if after_idx == event_body.len() {
+            true
+        } else {
+            let remainder = &event_body[after_idx..];
+            let next_char = remainder.chars().next().unwrap();
+            if next_char.is_alphanumeric() || next_char == '-' || next_char == '_' {
+                false
+            } else if next_char == '.' || next_char == '/' {
+                remainder[1..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+            } else if next_char == ':' {
+                remainder[1..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace())
+            } else {
+                true
+            }
+        };
+
+        if boundary_before && boundary_after {
+            return true;
+        }
+        start = idx + bot_mxid.len();
+    }
+    false
+}
+
 /// Checks whether the incoming Matrix event mentions the bot.
 pub fn is_bot_mentioned(
     event_body: &str,
@@ -332,8 +407,8 @@ pub fn is_bot_mentioned(
         }
     }
 
-    // 3. Plain text exact MXID mention
-    if event_body.contains(bot_mxid) {
+    // 3. Plain text exact MXID mention with token boundary checks
+    if is_full_mxid_mentioned(event_body, bot_mxid) {
         return true;
     }
 
@@ -357,11 +432,10 @@ pub fn is_bot_mentioned(
                     if next_char.is_alphanumeric() || next_char == '-' || next_char == '_' {
                         false
                     } else if next_char == ':' {
-                        event_body[idx..].starts_with(bot_mxid)
-                            || remainder[1..]
-                                .chars()
-                                .next()
-                                .is_none_or(|c| c.is_whitespace())
+                        remainder[1..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| c.is_whitespace())
                     } else if next_char == '.' || next_char == '/' {
                         remainder[1..]
                             .chars()
