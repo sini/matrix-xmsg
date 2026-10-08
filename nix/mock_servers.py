@@ -7,6 +7,8 @@ import threading
 import time
 from urllib.parse import urlparse, parse_qs
 
+VALID_TOKEN = "syt_valid_test_token_12345"
+
 class MatrixHandler(http.server.BaseHTTPRequestHandler):
     sync_count = 0
     lock = threading.Lock()
@@ -14,11 +16,26 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         sys.stderr.write(f"[matrix-mock] {format % args}\n")
 
+    def check_auth(self):
+        auth = self.headers.get("Authorization", "")
+        if auth != f"Bearer {VALID_TOKEN}":
+            sys.stderr.write(f"[matrix-mock] rejecting unauthorized request (auth: '{auth}')\n")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "errcode": "M_UNKNOWN_TOKEN",
+                "error": "Invalid or missing access token"
+            }).encode())
+            return False
+        return True
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        # Versions endpoint is public/unauthenticated in Matrix spec
         if path == "/_matrix/client/versions":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -29,6 +46,10 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
                     "v1.6", "v1.7", "v1.8", "v1.9", "v1.10", "v1.11"
                 ]
             }).encode())
+            return
+
+        # All other endpoints require valid Bearer token
+        if not self.check_auth():
             return
 
         if path == "/_matrix/client/v3/sync":
@@ -115,6 +136,9 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"{}")
 
     def do_PUT(self):
+        if not self.check_auth():
+            return
+
         parsed = urlparse(self.path)
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length > 0 else b""
@@ -134,6 +158,9 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"{}")
 
     def do_POST(self):
+        if not self.check_auth():
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -214,7 +241,7 @@ if __name__ == "__main__":
     t2 = threading.Thread(target=run_xmsg_server, daemon=True)
     t1.start()
     t2.start()
-    print("Mock servers listening on 127.0.0.1:8008 (Matrix) and 127.0.0.1:7787 (xmsg)")
+    print(f"Mock servers listening on 127.0.0.1:8008 (Matrix) and 127.0.0.1:7787 (xmsg)")
     sys.stdout.flush()
     while True:
         time.sleep(1)

@@ -53,9 +53,13 @@
         pkgs:
         nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           nixos-module = import ./nix/test.nix { inherit pkgs self; };
-          nixos-module-mutant = import ./nix/test.nix {
+          nixos-module-mutant-missing = import ./nix/test.nix {
             inherit pkgs self;
-            mutant = true;
+            mode = "mutant-missing";
+          };
+          nixos-module-mutant-wrong-token = import ./nix/test.nix {
+            inherit pkgs self;
+            mode = "mutant-wrong-token";
           };
         }
       );
