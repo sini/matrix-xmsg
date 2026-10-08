@@ -101,7 +101,9 @@ impl XmsgClient for HttpXmsgClient {
                                     after_seq = seq;
                                 }
                             }
-                            if let Some(text) = rep["body"].as_str() {
+                            if let Some(text) =
+                                rep["body"].as_str().or_else(|| rep["text"].as_str())
+                            {
                                 return Ok(text.to_string());
                             }
                         }
