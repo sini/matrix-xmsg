@@ -85,6 +85,23 @@ impl Store {
                 user_mxid TEXT PRIMARY KEY,
                 room_id TEXT NOT NULL,
                 created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS thread_askers (
+                thread_root_id TEXT PRIMARY KEY,
+                asker_mxid TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bot_messages (
+                event_id TEXT PRIMARY KEY,
+                thread_root_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bot_messages_thread ON bot_messages(thread_root_id);
+            CREATE TABLE IF NOT EXISTS control_events (
+                message_id TEXT NOT NULL,
+                user_mxid TEXT NOT NULL,
+                control TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                PRIMARY KEY (message_id, user_mxid, control)
             );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
@@ -244,6 +261,110 @@ impl Store {
         )
         .map_err(|e| AppError::Store(e.to_string()))?;
         Ok(())
+    }
+
+    /// Records the original asking user of a thread root event ID.
+    /// Preserves the original asker (INSERT OR IGNORE).
+    pub fn record_thread_asker(
+        &self,
+        thread_root_id: &str,
+        asker_mxid: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO thread_askers (thread_root_id, asker_mxid) VALUES (?1, ?2)",
+            params![thread_root_id, asker_mxid],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to record thread asker: {e}")))?;
+        Ok(())
+    }
+
+    /// Retrieves the original asking user of a thread root event ID.
+    pub fn get_thread_asker(&self, thread_root_id: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT asker_mxid FROM thread_askers WHERE thread_root_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![thread_root_id], |row| row.get(0));
+        match res {
+            Ok(asker) => Ok(Some(asker)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Records an event_id posted by the bot in a given thread.
+    pub fn record_bot_message(
+        &self,
+        event_id: &str,
+        thread_root_id: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_messages (event_id, thread_root_id, timestamp) VALUES (?1, ?2, ?3)",
+            params![event_id, thread_root_id, now],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to record bot message: {e}")))?;
+        Ok(())
+    }
+
+    /// Retrieves the thread_root_id for a message posted by the bot.
+    pub fn get_bot_message_thread(&self, event_id: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT thread_root_id FROM bot_messages WHERE event_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![event_id], |row| row.get(0));
+        match res {
+            Ok(thread) => Ok(Some(thread)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Retrieves the latest bot message event_id in a thread.
+    pub fn get_latest_bot_message_in_thread(
+        &self,
+        thread_root_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT event_id FROM bot_messages WHERE thread_root_id = ?1 ORDER BY timestamp DESC LIMIT 1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![thread_root_id], |row| row.get(0));
+        match res {
+            Ok(ev) => Ok(Some(ev)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Records a control event if it has not already been recorded for this (message_id, user_mxid, control).
+    /// Returns Ok(true) if newly inserted, or Ok(false) if debounced (duplicate).
+    pub fn record_control_if_new(
+        &self,
+        message_id: &str,
+        user_mxid: &str,
+        control: &str,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT 1 FROM control_events WHERE message_id = ?1 AND user_mxid = ?2 AND control = ?3")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let exists = stmt
+            .exists(params![message_id, user_mxid, control])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        if exists {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO control_events (message_id, user_mxid, control, timestamp) VALUES (?1, ?2, ?3, ?4)",
+            params![message_id, user_mxid, control, now],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to record control event: {e}")))?;
+        Ok(true)
     }
 }
 

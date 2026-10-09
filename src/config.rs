@@ -39,6 +39,14 @@ fn default_db_path() -> PathBuf {
     PathBuf::from("/var/lib/matrix-xmsg/matrix-xmsg.db")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Admission {
+    #[default]
+    Trusted,
+    Public,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub homeserver_url: String,
@@ -47,6 +55,9 @@ pub struct Config {
     pub rooms: Vec<String>,
     pub trusted_mxids: Vec<String>,
     pub owner_mxid: String,
+
+    #[serde(default)]
+    pub admission: Admission,
 
     #[serde(default = "default_xmsg_url")]
     pub xmsg_url: String,
@@ -108,5 +119,54 @@ impl Config {
 
     pub fn is_user_trusted(&self, user_mxid: &str) -> bool {
         self.trusted_mxids.iter().any(|u| u == user_mxid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_admission_default_trusted() {
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = ["@alice:example.org"]
+            owner_mxid = "@owner:example.org"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.admission, Admission::Trusted);
+    }
+
+    #[test]
+    fn test_admission_public() {
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = []
+            owner_mxid = "@owner:example.org"
+            admission = "public"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.admission, Admission::Public);
+    }
+
+    #[test]
+    fn test_admission_explicit_trusted() {
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = []
+            owner_mxid = "@owner:example.org"
+            admission = "trusted"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.admission, Admission::Trusted);
     }
 }

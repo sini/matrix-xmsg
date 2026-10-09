@@ -6,18 +6,37 @@
 
 ## 1. Security Architecture & Trust Model
 
-### 1.1 Strict Allowlist & Silence Policy
+### 1.1 Admission Policy & Silence Rule
 - **Public Room Posture:** Anyone may join and post in the room.
-- **Mention Trigger:** The bot acts **only** on messages that `@`-mention it (via `m.mentions.user_ids`, Matrix pills, or plain text).
-- **Silent Drop for Non-Trusted Users:** Mentions from non-allowlisted senders are dropped **silently**. The bot never responds or sends an error notice, preventing oracle attacks where attackers probe for valid allowlisted usernames.
+- **Mention Trigger:** The bot acts **only** on messages that `@`-mention it (via `m.mentions.user_ids`, Matrix pills, or plain text) or in-thread control triggers.
+- **Admission Modes:**
+  - `trusted` (default): Mentions from non-allowlisted senders are dropped **silently**. The bot never responds or sends an error notice, preventing oracle attacks where attackers probe for valid allowlisted usernames.
+  - `public`: Any room member's top-level question is relayed to the expert session.
 
-### 1.2 Context Isolation & Provenance Tagging
+### 1.2 Interaction Controls & Authorization (M5a)
+- **Reactions & Commands:**
+  - `✅` reaction: Accept answer.
+  - `🔍` reaction: Request deeper investigation.
+  - `!deeper` text fallback: Thread message requesting deeper investigation.
+- **Authorization Rule:** Only the original thread asker or a trusted MXID (`trusted_mxids` or `owner_mxid`) can issue interaction controls. Reactions or `!deeper` commands from strangers are silently ignored.
+- **Debouncing:** Duplicate reactions or commands from the same user on the same bot message are debounced via SQLite `(message_id, user_mxid, control)` unique constraints, emitting exactly one event to the expert.
+- **Expert Event Format:** Interaction controls emit JSON payloads to the expert over xmsg: `{"thread_id": ..., "control": "accept"|"deeper", "by": ...}`.
+
+### 1.3 Tiered Genie Rendering (M5b)
+- **Structured JSON Replies:** When the expert responds with JSON containing `confidence`, `gaps`, and/or `tier`:
+  - Renders answer body.
+  - Confidence metadata line: `confidence 0.72 · gaps: ...` (or `gaps: none`).
+  - `tier: "expert"` replies display `[expert review]` header and `expert review` in the metadata line.
+  - Hint line: `Controls: ✅ accept · 🔍 deeper · !deeper`.
+- **Backward Compatibility:** Plain-text replies with no JSON structure render byte-identically to legacy outputs without confidence or control hint lines.
+
+### 1.4 Context Isolation & Provenance Tagging
 - Messages sent to the expert include recent room history (for top-level questions) or thread history (for threaded questions) under count and byte caps.
 - Each history line is explicitly tagged with the sender's trust status: `[hh:mm] <user> (trusted|public): <text>`.
 - The envelope wraps context in `<context>` blocks and requests in `<request>` blocks per spec §4.4.
 - Any `<request>`, `</request>`, `<context`, or `</context>` tags occurring inside user-supplied message text are automatically escaped to prevent XML sandbox breakouts.
 
-### 1.3 Strict ASCII Sender Mapping
+### 1.5 Strict ASCII Sender Mapping
 Matrix IDs (`@alice:example.org`) are converted to sanitized ASCII identifiers (`matrix alice at example.org`):
 - Never contains `:` or `/` (conforming to xmsg HTTP sender invariants).
 - Strips non-ASCII characters.
@@ -36,6 +55,7 @@ access_token_file = "/run/credentials/matrix-xmsg.service/access-token"
 rooms = ["!support:example.org"]
 trusted_mxids = ["@alice:example.org", "@bob:example.org"]
 owner_mxid = "@owner:example.org"
+admission = "trusted" # "trusted" (default) or "public"
 xmsg_url = "http://127.0.0.1:7787"
 expert_ref = "claude"
 history_n = 30

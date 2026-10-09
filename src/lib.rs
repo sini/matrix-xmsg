@@ -7,6 +7,9 @@ pub mod sender_map;
 pub mod store;
 pub mod xmsg;
 
-pub use bot::{handle_incoming_event, BotOutcome, IncomingMatrixEvent};
-pub use config::Config;
+pub use bot::{
+    format_expert_reply, handle_incoming_event, handle_incoming_reaction, parse_reaction_control,
+    BotOutcome, ControlAction, IncomingMatrixEvent, IncomingReactionEvent,
+};
+pub use config::{Admission, Config};
 pub use error::AppError;

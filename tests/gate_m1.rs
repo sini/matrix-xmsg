@@ -74,6 +74,7 @@ fn test_config() -> Config {
             "@charlie:example.org".to_string(),
         ],
         owner_mxid: "@owner:example.org".to_string(),
+        admission: matrix_xmsg::config::Admission::Trusted,
         xmsg_url: "http://127.0.0.1:7787".to_string(),
         expert_ref: "claude".to_string(),
         history_n: 5,
