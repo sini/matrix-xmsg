@@ -2148,25 +2148,36 @@ async fn test_r5_backlog_suppression_primary_token_guard() {
     );
     let xmsg = Arc::new(TestXmsgMock::with_reply("answer"));
 
-    let _tracker = register_event_handlers(
+    let _tracker = matrix_xmsg::bot::register_event_handlers_with_startup_ts(
         sdk.inner(),
         config.clone(),
         sdk.clone(),
         xmsg.clone(),
         store.clone(),
+        ts,
     );
 
     sdk.inner()
         .sync_once(SyncSettings::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let start = tokio::time::Instant::now();
+    let deadline = Duration::from_secs(2);
+    let mut last_observed = xmsg.send_counter.load(Ordering::SeqCst);
+    while start.elapsed() < deadline {
+        last_observed = xmsg.send_counter.load(Ordering::SeqCst);
+        if last_observed > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // R5 Oracle: initial token-less sync MUST drop timeline events even if ts > startup - 10s!
     assert_eq!(
-        xmsg.send_counter.load(Ordering::SeqCst),
+        last_observed,
         0,
-        "Initial token-less sync must suppress all timeline backlog events"
+        "Initial token-less sync must suppress all timeline backlog events (last observed: {last_observed})"
     );
 }
 
