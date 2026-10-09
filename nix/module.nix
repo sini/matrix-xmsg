@@ -10,26 +10,30 @@ let
   cfg = config.services.matrix-xmsg;
 
   # Format config.toml matching matrix_xmsg::config::Config
-  configToml = (pkgs.formats.toml { }).generate "matrix-xmsg-config.toml" {
-    homeserver_url = cfg.homeserverUrl;
-    bot_mxid = cfg.botMxid;
-    # Systemd LoadCredential mounts the secret at /run/credentials/matrix-xmsg.service/access-token
-    access_token_file = "/run/credentials/matrix-xmsg.service/access-token";
-    rooms = cfg.rooms;
-    trusted_mxids = cfg.trustedMxids;
-    owner_mxid = cfg.ownerMxid;
-    xmsg_socket = toString cfg.xmsgSocket;
-    expert_ref = cfg.expertRef;
-    history_n = cfg.historyN;
-    history_byte_cap = cfg.historyByteCap;
-    resync_byte_cap = cfg.resyncByteCap;
-    rate_limit_count = cfg.rateLimitCount;
-    rate_limit_window_secs = cfg.rateLimitWindowSecs;
-    size_cap_bytes = cfg.sizeCapBytes;
-    answer_timeout_secs = cfg.answerTimeoutSecs;
-    session_live_secs = cfg.sessionLiveSecs;
-    db_path = cfg.dbPath;
-  };
+  configToml = (pkgs.formats.toml { }).generate "matrix-xmsg-config.toml" (
+    {
+      homeserver_url = cfg.homeserverUrl;
+      bot_mxid = cfg.botMxid;
+      # Systemd LoadCredential mounts the secret at /run/credentials/matrix-xmsg.service/access-token
+      access_token_file = "/run/credentials/matrix-xmsg.service/access-token";
+      rooms = cfg.rooms;
+      trusted_mxids = cfg.trustedMxids;
+      owner_mxid = cfg.ownerMxid;
+      expert_ref = cfg.expertRef;
+      history_n = cfg.historyN;
+      history_byte_cap = cfg.historyByteCap;
+      resync_byte_cap = cfg.resyncByteCap;
+      rate_limit_count = cfg.rateLimitCount;
+      rate_limit_window_secs = cfg.rateLimitWindowSecs;
+      size_cap_bytes = cfg.sizeCapBytes;
+      answer_timeout_secs = cfg.answerTimeoutSecs;
+      session_live_secs = cfg.sessionLiveSecs;
+      db_path = cfg.dbPath;
+    }
+    // lib.optionalAttrs (cfg.xmsgSocket != null) {
+      xmsg_socket = toString cfg.xmsgSocket;
+    }
+  );
 in
 {
   options.services.matrix-xmsg = {
@@ -94,7 +98,7 @@ in
     };
 
     xmsgSocket = lib.mkOption {
-      type = lib.types.either lib.types.path lib.types.str;
+      type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
       default = "/run/user/1000/xmsg";
       example = "/run/user/1000/xmsg";
       description = ''
@@ -196,7 +200,7 @@ in
         '';
       }
       {
-        assertion = !cfg.dynamicUser;
+        assertion = cfg.xmsgSocket != null -> !cfg.dynamicUser;
         message = "services.matrix-xmsg: when xmsgSocket is configured, dynamicUser must be false because the socket's UID check requires running as the socket's owner. Configure services.matrix-xmsg.user to the socket's owning user.";
       }
     ];
@@ -251,10 +255,14 @@ in
         NoNewPrivileges = true;
         PrivateDevices = true;
         PrivateTmp = true;
-        PrivateUsers = true;
+        # PrivateUsers must be false when xmsgSocket is configured so the xmsg daemon
+        # can read /proc/<pid>/exe for svc attestation (otherwise refused with Permission denied).
+        PrivateUsers = if cfg.xmsgSocket != null then false else true;
         ProtectClock = true;
         ProtectControlGroups = true;
-        ProtectHome = true;
+        # ProtectHome=yes hides /run/user, preventing connection to user-owned xmsg sockets.
+        # When xmsgSocket is set, ProtectHome is relaxed to tmpfs and BindPaths exposes the socket dir.
+        ProtectHome = if cfg.xmsgSocket != null then "tmpfs" else true;
         ProtectHostname = true;
         ProtectKernelLogs = true;
         ProtectKernelModules = true;
@@ -276,6 +284,9 @@ in
           "~@privileged"
         ];
         UMask = "0077";
+      }
+      // lib.optionalAttrs (cfg.xmsgSocket != null) {
+        BindPaths = [ (toString cfg.xmsgSocket) ];
       };
     };
   };
