@@ -328,6 +328,7 @@ pub async fn handle_incoming_event_with_claim(
         &trigger_msg,
         room_history,
         &config.trusted_mxids,
+        Some(&config.owner_mxid),
         config.history_n,
         config.history_byte_cap,
     );

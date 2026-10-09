@@ -985,6 +985,7 @@ fn test_p5_history_newline_forgery_prevented() {
         &trig,
         &hist,
         &["@alice:example.org".into()],
+        None,
         30,
         12288,
     );
@@ -1742,6 +1743,7 @@ fn test_p5b_unicode_line_separators_collapsed() {
             &trig,
             &hist,
             &["@alice:example.org".into()],
+            None,
             30,
             12288,
         );

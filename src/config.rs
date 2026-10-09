@@ -118,7 +118,7 @@ impl Config {
     }
 
     pub fn is_user_trusted(&self, user_mxid: &str) -> bool {
-        self.trusted_mxids.iter().any(|u| u == user_mxid)
+        self.owner_mxid == user_mxid || self.trusted_mxids.iter().any(|u| u == user_mxid)
     }
 }
 

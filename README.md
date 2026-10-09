@@ -30,11 +30,17 @@
   - Hint line: `Controls: ✅ accept · 🔍 deeper · !deeper`.
 - **Backward Compatibility:** Plain-text replies with no JSON structure render byte-identically to legacy outputs without confidence or control hint lines.
 
-### 1.4 Context Isolation & Provenance Tagging
+### 1.4 Context Isolation & Provenance Tagging (M5d)
 - Messages sent to the expert include recent room history (for top-level questions) or thread history (for threaded questions) under count and byte caps.
-- Each history line is explicitly tagged with the sender's trust status: `[hh:mm] <user> (trusted|public): <text>`.
+- Header format: `[matrix] room={room_id} thread={thread_root_id} user={mapped_sender} ({trigger_tier}) thread_tier={thread_tier}`.
+  - Senders in `trusted_mxids` or matching `owner_mxid` receive tier `trusted`; all others receive `public`.
+  - `thread_tier`: lowest tier across all lines in the request and context history (`public < trusted`).
 - The envelope wraps context in `<context>` blocks and requests in `<request>` blocks per spec §4.4.
-- Any `<request>`, `</request>`, `<context`, or `</context>` tags occurring inside user-supplied message text are automatically escaped to prevent XML sandbox breakouts.
+- Each line within `<request>` and `<context>` is an authenticated JSON object:
+  ```json
+  {"sender": "matrix alice at example.org", "tier": "trusted", "text": "message text"}
+  ```
+- Any `<request>`, `</request>`, `<context`, or `</context>` tags occurring inside user-supplied message text are automatically escaped prior to JSON serialization to prevent XML sandbox breakouts.
 
 ### 1.5 Strict ASCII Sender Mapping
 Matrix IDs (`@alice:example.org`) are converted to sanitized ASCII identifiers (`matrix alice at example.org`):

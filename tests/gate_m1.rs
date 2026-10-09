@@ -214,9 +214,13 @@ async fn test_allowlisted_mention_triggers_and_replies_in_thread() {
     let (expert, from, text) = &xmsg_calls[0];
     assert_eq!(expert, "claude");
     assert_eq!(from, "matrix alice at example.org");
-    assert!(text.contains("<request>\n@genie How do I configure logging?\n</request>"));
-    assert!(text
-        .contains("matrix public_bob at example.org (public): I am having an issue with startup"));
+    assert!(text.contains("<request>"));
+    assert!(text.contains("\"sender\":\"matrix alice at example.org\""));
+    assert!(text.contains("\"tier\":\"trusted\""));
+    assert!(text.contains("How do I configure logging?"));
+    assert!(text.contains("\"sender\":\"matrix public_bob at example.org\""));
+    assert!(text.contains("\"tier\":\"public\""));
+    assert!(text.contains("I am having an issue with startup"));
 
     // Verify matrix notice posted in thread rooted at trigger event
     let notices = matrix.sent_notices.lock().unwrap();
