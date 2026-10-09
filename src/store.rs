@@ -106,6 +106,11 @@ impl Store {
             CREATE TABLE IF NOT EXISTS relayed_events (
                 event_id TEXT PRIMARY KEY,
                 timestamp INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS thread_cursors (
+                thread_root_id TEXT PRIMARY KEY,
+                cursor_event_id TEXT NOT NULL,
+                forwarded_at INTEGER NOT NULL
             );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
@@ -408,6 +413,45 @@ impl Store {
         Ok(())
     }
 
+    /// Retrieves the thread cursor (last forwarded event ID and timestamp) for a thread root.
+    pub fn get_thread_cursor(
+        &self,
+        thread_root_id: &str,
+    ) -> Result<Option<ThreadCursor>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT cursor_event_id, forwarded_at FROM thread_cursors WHERE thread_root_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![thread_root_id], |row| {
+            Ok(ThreadCursor {
+                cursor_event_id: row.get(0)?,
+                forwarded_at: row.get(1)?,
+            })
+        });
+        match res {
+            Ok(cursor) => Ok(Some(cursor)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Sets or updates the thread cursor for a thread root.
+    pub fn set_thread_cursor(
+        &self,
+        thread_root_id: &str,
+        cursor_event_id: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO thread_cursors (thread_root_id, cursor_event_id, forwarded_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(thread_root_id) DO UPDATE SET cursor_event_id = ?2, forwarded_at = ?3",
+            params![thread_root_id, cursor_event_id, now],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
     /// Returns the count of rows across all tables in the store.
     pub fn total_row_count(&self) -> Result<usize, AppError> {
         let conn = self.conn.lock().unwrap();
@@ -420,6 +464,7 @@ impl Store {
             "bot_messages",
             "control_events",
             "relayed_events",
+            "thread_cursors",
         ];
         let mut total = 0;
         for table in tables {
@@ -431,6 +476,12 @@ impl Store {
         }
         Ok(total)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadCursor {
+    pub cursor_event_id: String,
+    pub forwarded_at: i64,
 }
 
 #[cfg(test)]
@@ -542,5 +593,22 @@ mod tests {
         assert_eq!(store.total_row_count().unwrap(), 0);
         store.record_event_relayed("$ev_1", 1000).unwrap();
         assert_eq!(store.total_row_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_thread_cursor_storage() {
+        let store = Store::new_in_memory().unwrap();
+        assert_eq!(store.get_thread_cursor("$root_1").unwrap(), None);
+
+        store.set_thread_cursor("$root_1", "$ev_1", 1000).unwrap();
+        let cursor = store.get_thread_cursor("$root_1").unwrap().unwrap();
+        assert_eq!(cursor.cursor_event_id, "$ev_1");
+        assert_eq!(cursor.forwarded_at, 1000);
+
+        // Update cursor
+        store.set_thread_cursor("$root_1", "$ev_2", 2000).unwrap();
+        let updated = store.get_thread_cursor("$root_1").unwrap().unwrap();
+        assert_eq!(updated.cursor_event_id, "$ev_2");
+        assert_eq!(updated.forwarded_at, 2000);
     }
 }

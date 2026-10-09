@@ -1,5 +1,5 @@
 use crate::config::{Admission, Config};
-use crate::context::{build_envelope, EventMessage};
+use crate::context::{build_envelope, ContextMode, EventMessage};
 use crate::error::AppError;
 use crate::matrix::{is_bot_mentioned, MatrixClient};
 use crate::sender_map::map_sender_mxid;
@@ -442,6 +442,21 @@ pub async fn handle_incoming_event_with_claim(
     }
 
     // 7. Context & Envelope Assembly
+    let cursor_opt = store.get_thread_cursor(&thread_root)?;
+    let mode = match cursor_opt {
+        None => ContextMode::Bootstrap,
+        Some(cursor) => {
+            let elapsed = now_secs.saturating_sub(cursor.forwarded_at);
+            if elapsed >= config.session_live_secs as i64 {
+                ContextMode::Bootstrap
+            } else {
+                ContextMode::Delta {
+                    cursor_event_id: Some(cursor.cursor_event_id),
+                }
+            }
+        }
+    };
+
     let envelope = build_envelope(
         &event.room_id,
         &thread_root,
@@ -452,6 +467,7 @@ pub async fn handle_incoming_event_with_claim(
         config.history_n,
         config.history_byte_cap,
         is_addressed,
+        mode,
     );
 
     // Record relay claim in SQLite
@@ -462,6 +478,9 @@ pub async fn handle_incoming_event_with_claim(
     let message_id = xmsg
         .send_message(&config.expert_ref, &mapped_sender, &envelope)
         .await?;
+
+    // Rule 1 & Rule 3 & Rule 5: Advance cursor only after send_message succeeds
+    store.set_thread_cursor(&thread_root, &trigger_msg.event_id, now_secs)?;
 
     let mut ack_reaction_id: Option<String> = None;
     if is_addressed {

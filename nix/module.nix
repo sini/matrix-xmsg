@@ -27,6 +27,7 @@ let
       size_cap_bytes = cfg.sizeCapBytes;
       answer_timeout_secs = cfg.answerTimeoutSecs;
       answer_deadline_secs = cfg.answerDeadlineSecs;
+      session_live_secs = cfg.sessionLiveSecs;
       db_path = cfg.dbPath;
     }
     // lib.optionalAttrs (cfg.xmsgUrl != null) {
@@ -165,6 +166,12 @@ in
       type = lib.types.ints.unsigned;
       default = 3600;
       description = "Deadline in seconds to wait for late answers before giving up.";
+    };
+
+    sessionLiveSecs = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 3600;
+      description = "Duration in seconds before an idle thread/session context is re-bootstrapped.";
     };
 
     dbPath = lib.mkOption {

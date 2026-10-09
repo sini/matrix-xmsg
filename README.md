@@ -49,18 +49,30 @@
 - **Silent Decline (`{"silent": true}`):** If the agent determines the message requires no response, it replies with `{"silent": true}`. The bot posts no room message, sends no owner DM, redacts its original 👀 reaction, and reacts with 🫡 ("noted"). The bot's own reactions are filtered by the self-sender guard and never parsed as controls.
 - **Backward Compatibility:** Plain-text replies with no JSON structure render byte-identically to legacy outputs without confidence or control hint lines.
 
-### 1.4 Context Isolation & Provenance Tagging (M5d)
+### 1.4 Context Framing: Bootstrap & Delta Contexts (M5d, M11)
 
-- Messages sent to the expert include recent room history (for top-level questions) or thread history (for threaded questions) under count and byte caps.
-- Header format: `[matrix] room={room_id} thread={thread_root_id} user={mapped_sender} ({trigger_tier}) thread_tier={thread_tier}`.
+- **Bootstrap vs. Delta per Root:**
+  - A top-level trigger is its own root. The bot records in SQLite (`thread_cursors`) the cursor (last forwarded event ID) and timestamp of the forward per thread root.
+  - A forward is a **`BOOTSTRAP`** when the root has no recorded cursor or the last forward is older than `session_live_secs` (default `3600`, 1 hour live window). Otherwise, it is a **`DELTA`**.
+  - On a failed send (`xmsg` refused), the cursor does not advance, ensuring subsequent forwards re-carry context.
+- **Two Blocks for Threaded Bootstrap:**
+  - When a threaded trigger is bootstrapped, it carries:
+    1. A room background block of recent room messages prior to the thread root: `<context kind="channel" role="background" context="bootstrap" note="...">`.
+    2. A thread block of the thread's messages so far: `<context kind="thread" role="thread" context="bootstrap" note="...">`.
+  - Both blocks obey `history_byte_cap` together: oldest room lines are dropped first, and thread lines are only dropped if all room lines have been dropped and the total size still exceeds the cap.
+- **Delta Context:**
+  - A `DELTA` carries only the lines after the root's cursor (thread lines for threads, room lines for top-level): `<context kind="thread" role="thread" context="delta" note="...">`.
+  - Deltas carry bystander lines (M8) that arrived between forwards. No room background block is emitted in deltas.
+  - The cursor advances to the trigger event ID only after `xmsg.send_message` succeeds.
+- **Envelope & Provenance:**
+  - Header format: `[matrix] room={room_id} thread={thread_root_id} user={mapped_sender} ({trigger_tier})`.
+  - Per design §5.1, thread tier folding belongs to the supervisor (C7) from the per-line `tier` tags, so `thread_tier` is not carried in the envelope header in any mode. The header carries the trigger's own user tier (`({trigger_tier})`).
   - Senders in `trusted_mxids` or matching `owner_mxid` receive tier `trusted`; all others receive `public`.
-  - `thread_tier`: lowest tier across all lines in the request and context history (`public < trusted`).
-- The envelope wraps context in `<context>` blocks and requests in `<request>` blocks per spec §4.4.
-- Each line within `<request>` and `<context>` is an authenticated JSON object:
-  ```json
-  {"sender": "matrix alice at example.org", "tier": "trusted", "text": "message text"}
-  ```
-- Any `<request>`, `</request>`, `<context`, or `</context>` tags occurring inside user-supplied message text are automatically escaped prior to JSON serialization to prevent XML sandbox breakouts.
+  - Each line within `<request>` and `<context>` is an authenticated JSON object:
+    ```json
+    {"sender": "matrix alice at example.org", "tier": "trusted", "text": "message text"}
+    ```
+  - XML escaping: `<request>`, `</request>`, `<context`, and `</context>` tags occurring inside user-supplied message text are escaped (`<\request`, `<\context`) prior to JSON serialization, preventing sandbox breakouts or fake block imitation.
 
 ### 1.5 Strict ASCII Sender Mapping
 
@@ -93,6 +105,7 @@ rate_limit_window_secs = 600
 size_cap_bytes = 4096
 answer_timeout_secs = 300
 answer_deadline_secs = 3600
+session_live_secs = 3600
 db_path = "/var/lib/matrix-xmsg/matrix-xmsg.db"
 ```
 
@@ -160,6 +173,7 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
 | `sizeCapBytes`        | `uint`        | `4096`                         | Max body size of queries accepted.                                                                 |
 | `answerTimeoutSecs`   | `uint`        | `300`                          | Timeout before escalating to owner.                                                                |
 | `answerDeadlineSecs`  | `uint`        | `3600`                         | Deadline in seconds to wait for late answers before giving up.                                     |
+| `sessionLiveSecs`     | `uint`        | `3600`                         | Duration in seconds before an idle thread/session context is re-bootstrapped.                      |
 | `dbPath`              | `path`        | `"${stateDir}/matrix-xmsg.db"` | Path to SQLite database (created mode `0600`).                                                     |
 | `dynamicUser`         | `bool`        | `true`                         | Whether to allocate an ephemeral systemd DynamicUser.                                              |
 | `user`                | `str`         | `"matrix-xmsg"`                | Static user when `dynamicUser = false`.                                                            |

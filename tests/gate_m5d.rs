@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use matrix_xmsg::bot::{handle_incoming_event, BotOutcome, IncomingMatrixEvent};
 use matrix_xmsg::config::{Admission, Config};
-use matrix_xmsg::context::{build_envelope, EventMessage, RelayedLine};
+use matrix_xmsg::context::{build_envelope, ContextMode, EventMessage, RelayedLine};
 use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::store::Store;
@@ -69,6 +69,7 @@ fn test_config() -> Config {
         size_cap_bytes: 500,
         answer_timeout_secs: 30,
         answer_deadline_secs: 3600,
+        session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
 }
@@ -146,6 +147,7 @@ fn oracle_1_per_line_tier_tags() {
         10,
         4096,
         true,
+        ContextMode::Bootstrap,
     );
 
     let req_lines = parse_relayed_lines(&envelope, "request");
@@ -201,12 +203,13 @@ fn oracle_2_thread_tier_mixed() {
         10,
         4096,
         true,
+        ContextMode::Bootstrap,
     );
 
     let first_line = envelope.lines().next().unwrap_or("");
     assert!(
-        first_line.contains("thread_tier=public"),
-        "Mixed thread with public history must have thread_tier=public, got: {first_line}"
+        !first_line.contains("thread_tier="),
+        "Envelope header must not contain thread_tier, got: {first_line}"
     );
     assert!(
         first_line.contains("user=matrix alice at example.org (trusted)"),
@@ -239,6 +242,7 @@ fn oracle_3_text_tier_injection_neutralized() {
         10,
         4096,
         true,
+        ContextMode::Bootstrap,
     );
 
     let req_lines = parse_relayed_lines(&envelope, "request");
@@ -293,8 +297,8 @@ async fn oracle_4_public_admission_header_and_thread_tier() {
         "Stranger header user tier must be (public), got: {first_line}"
     );
     assert!(
-        first_line.contains("thread_tier=public"),
-        "Stranger top-level thread_tier must be public, got: {first_line}"
+        !first_line.contains("thread_tier="),
+        "Header must not contain thread_tier, got: {first_line}"
     );
     assert!(
         !first_line.contains("(trusted)"),

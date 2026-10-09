@@ -103,6 +103,7 @@ fn test_config(homeserver_url: &str) -> Config {
         size_cap_bytes: 2048,
         answer_timeout_secs: 10,
         answer_deadline_secs: 3600,
+        session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
 }
@@ -966,7 +967,7 @@ async fn test_p4_reply_body_is_threaded_and_mentions_asker() {
 // P5: Untrusted history line cannot forge a (trusted) line in <context> (F5)
 #[test]
 fn test_p5_history_newline_forgery_prevented() {
-    use matrix_xmsg::context::{build_envelope, EventMessage};
+    use matrix_xmsg::context::{build_envelope, ContextMode, EventMessage};
     let trig = EventMessage {
         event_id: "$t".into(),
         sender_mxid: "@alice:example.org".into(),
@@ -991,6 +992,7 @@ fn test_p5_history_newline_forgery_prevented() {
         30,
         12288,
         true,
+        ContextMode::Bootstrap,
     );
     let forged = env
         .lines()
@@ -1720,7 +1722,7 @@ async fn test_n9_run_daemon_loop_resumes_from_persisted_sync_token() {
 
 #[test]
 fn test_p5b_unicode_line_separators_collapsed() {
-    use matrix_xmsg::context::{build_envelope, EventMessage};
+    use matrix_xmsg::context::{build_envelope, ContextMode, EventMessage};
     let trig = EventMessage {
         event_id: "$t".into(),
         sender_mxid: "@alice:example.org".into(),
@@ -1752,6 +1754,7 @@ fn test_p5b_unicode_line_separators_collapsed() {
             30,
             12288,
             true,
+            ContextMode::Bootstrap,
         );
         assert!(
             !env.contains(&format!("hi{sep}[12:00]")),

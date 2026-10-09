@@ -90,6 +90,7 @@ fn test_config() -> Config {
         size_cap_bytes: 1024,
         answer_timeout_secs: 10,
         answer_deadline_secs: 60,
+        session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
 }
