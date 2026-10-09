@@ -10,24 +10,32 @@ let
   cfg = config.services.matrix-xmsg;
 
   # Format config.toml matching matrix_xmsg::config::Config
-  configToml = (pkgs.formats.toml { }).generate "matrix-xmsg-config.toml" {
-    homeserver_url = cfg.homeserverUrl;
-    bot_mxid = cfg.botMxid;
-    # Systemd LoadCredential mounts the secret at /run/credentials/matrix-xmsg.service/access-token
-    access_token_file = "/run/credentials/matrix-xmsg.service/access-token";
-    rooms = cfg.rooms;
-    trusted_mxids = cfg.trustedMxids;
-    owner_mxid = cfg.ownerMxid;
-    xmsg_url = cfg.xmsgUrl;
-    expert_ref = cfg.expertRef;
-    history_n = cfg.historyN;
-    history_byte_cap = cfg.historyByteCap;
-    rate_limit_count = cfg.rateLimitCount;
-    rate_limit_window_secs = cfg.rateLimitWindowSecs;
-    size_cap_bytes = cfg.sizeCapBytes;
-    answer_timeout_secs = cfg.answerTimeoutSecs;
-    db_path = cfg.dbPath;
-  };
+  configToml = (pkgs.formats.toml { }).generate "matrix-xmsg-config.toml" (
+    {
+      homeserver_url = cfg.homeserverUrl;
+      bot_mxid = cfg.botMxid;
+      # Systemd LoadCredential mounts the secret at /run/credentials/matrix-xmsg.service/access-token
+      access_token_file = "/run/credentials/matrix-xmsg.service/access-token";
+      rooms = cfg.rooms;
+      trusted_mxids = cfg.trustedMxids;
+      owner_mxid = cfg.ownerMxid;
+      expert_ref = cfg.expertRef;
+      history_n = cfg.historyN;
+      history_byte_cap = cfg.historyByteCap;
+      rate_limit_count = cfg.rateLimitCount;
+      rate_limit_window_secs = cfg.rateLimitWindowSecs;
+      size_cap_bytes = cfg.sizeCapBytes;
+      answer_timeout_secs = cfg.answerTimeoutSecs;
+      db_path = cfg.dbPath;
+    }
+    // lib.optionalAttrs (cfg.xmsgUrl != null) {
+      xmsg_url = cfg.xmsgUrl;
+    }
+    // lib.optionalAttrs (cfg.xmsgSocket != null) {
+      xmsg_url = "unix://${toString cfg.xmsgSocket}";
+      xmsg_socket = toString cfg.xmsgSocket;
+    }
+  );
 in
 {
   options.services.matrix-xmsg = {
@@ -92,18 +100,21 @@ in
     };
 
     xmsgUrl = lib.mkOption {
-      type = lib.types.str;
-      default = "http://127.0.0.1:7787";
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "http://127.0.0.1:7787";
       description = "HTTP URL of the xmsg daemon bridge.";
     };
 
     xmsgSocket = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
+      type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
       default = null;
+      example = "/run/user/1000/xmsg/http.sock";
       description = ''
         Optional path to the xmsg agent Unix domain socket.
-        Note: matrix-xmsg currently sends queries via the xmsg HTTP bridge (`xmsgUrl`).
-        Direct Unix socket attestation is not supported by xmsg for system services.
+        The socket's UID check requires that the bot run as the socket's owner.
+        Therefore, when xmsgSocket is configured, services.matrix-xmsg.dynamicUser
+        must be false, and services.matrix-xmsg.user must be configured to the socket's owning user.
       '';
     };
 
@@ -184,11 +195,12 @@ in
         '';
       }
       {
-        assertion = cfg.xmsgSocket == null;
-        message = ''
-          services.matrix-xmsg.xmsgSocket is configured, but direct Unix socket transport is not supported by matrix-xmsg.
-          matrix-xmsg communicates via services.matrix-xmsg.xmsgUrl (HTTP bridge).
-        '';
+        assertion = (cfg.xmsgUrl != null) != (cfg.xmsgSocket != null);
+        message = "services.matrix-xmsg: exactly one of services.matrix-xmsg.xmsgUrl or services.matrix-xmsg.xmsgSocket must be set.";
+      }
+      {
+        assertion = cfg.xmsgSocket != null -> !cfg.dynamicUser;
+        message = "services.matrix-xmsg: when xmsgSocket is configured, dynamicUser must be false because the socket's UID check requires running as the socket's owner. Configure services.matrix-xmsg.user to the socket's owning user.";
       }
     ];
 

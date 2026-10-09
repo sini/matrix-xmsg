@@ -60,6 +60,7 @@ fn test_config() -> Config {
         owner_mxid: "@owner:example.org".to_string(),
         admission: Admission::Trusted,
         xmsg_url: "http://127.0.0.1:7787".to_string(),
+        xmsg_socket: None,
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,

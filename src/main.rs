@@ -76,9 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    let xmsg_client = std::sync::Arc::new(matrix_xmsg::xmsg::HttpXmsgClient::new(
-        config.xmsg_url.clone(),
-    ));
+    let xmsg_client = matrix_xmsg::xmsg::create_xmsg_client(&config);
 
     let tracker = matrix_xmsg::bot::register_event_handlers(
         matrix_client.inner(),
