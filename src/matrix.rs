@@ -137,6 +137,97 @@ pub fn parse_timeline_event(
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IncomingMatrixEvent {
+    pub room_id: String,
+    pub event_id: String,
+    pub sender_mxid: String,
+    pub body: String,
+    pub formatted_body: Option<String>,
+    pub mentions: Option<Vec<String>>,
+    pub timestamp_ms: i64,
+    pub thread_root_id: Option<String>,
+    pub replaces_event_id: Option<String>,
+    pub in_reply_to_event_id: Option<String>,
+    pub is_falling_back: bool,
+}
+
+/// Extracts an `IncomingMatrixEvent` from a Matrix SDK `SyncRoomMessageEvent`.
+pub fn extract_incoming_event(
+    event: &matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent,
+    room_id: &matrix_sdk::ruma::RoomId,
+) -> Option<IncomingMatrixEvent> {
+    use matrix_sdk::ruma::events::room::message::{MessageType, Relation, SyncRoomMessageEvent};
+
+    if let SyncRoomMessageEvent::Original(orig) = event {
+        if let Some(Relation::Replacement(repl)) = &orig.content.relates_to {
+            let formatted_body = match &repl.new_content.msgtype {
+                MessageType::Text(t) => t.formatted.as_ref().map(|f| f.body.clone()),
+                MessageType::Notice(n) => n.formatted.as_ref().map(|f| f.body.clone()),
+                _ => None,
+            };
+            let mentions = repl
+                .new_content
+                .mentions
+                .as_ref()
+                .map(|m| m.user_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>());
+            let body = repl.new_content.msgtype.body().to_string();
+
+            return Some(IncomingMatrixEvent {
+                room_id: room_id.to_string(),
+                event_id: orig.event_id.to_string(),
+                sender_mxid: orig.sender.to_string(),
+                body,
+                formatted_body,
+                mentions,
+                timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
+                thread_root_id: None,
+                replaces_event_id: Some(repl.event_id.to_string()),
+                in_reply_to_event_id: None,
+                is_falling_back: false,
+            });
+        }
+
+        let formatted_body = match &orig.content.msgtype {
+            MessageType::Text(t) => t.formatted.as_ref().map(|f| f.body.clone()),
+            MessageType::Notice(n) => n.formatted.as_ref().map(|f| f.body.clone()),
+            _ => None,
+        };
+        let mentions = orig
+            .content
+            .mentions
+            .as_ref()
+            .map(|m| m.user_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>());
+
+        let (thread_root_id, in_reply_to_event_id, is_falling_back) = match &orig.content.relates_to
+        {
+            Some(Relation::Thread(t)) => (
+                Some(t.event_id.to_string()),
+                t.in_reply_to.as_ref().map(|r| r.event_id.to_string()),
+                t.is_falling_back,
+            ),
+            Some(Relation::Reply(rep)) => (None, Some(rep.in_reply_to.event_id.to_string()), false),
+            _ => (None, None, false),
+        };
+
+        Some(IncomingMatrixEvent {
+            room_id: room_id.to_string(),
+            event_id: orig.event_id.to_string(),
+            sender_mxid: orig.sender.to_string(),
+            body: orig.content.body().to_string(),
+            formatted_body,
+            mentions,
+            timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
+            thread_root_id,
+            replaces_event_id: None,
+            in_reply_to_event_id,
+            is_falling_back,
+        })
+    } else {
+        None
+    }
+}
+
 async fn is_owner_member_of_room(
     client: &matrix_sdk::Client,
     room_id: &matrix_sdk::ruma::RoomId,

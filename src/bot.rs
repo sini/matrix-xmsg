@@ -150,18 +150,7 @@ pub fn format_expert_reply(reply_text: &str) -> Option<(String, bool)> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct IncomingMatrixEvent {
-    pub room_id: String,
-    pub event_id: String,
-    pub sender_mxid: String,
-    pub body: String,
-    pub formatted_body: Option<String>,
-    pub mentions: Option<Vec<String>>,
-    pub timestamp_ms: i64,
-    pub thread_root_id: Option<String>,
-    pub replaces_event_id: Option<String>,
-}
+pub use crate::matrix::IncomingMatrixEvent;
 
 pub async fn handle_incoming_event(
     event: &IncomingMatrixEvent,
@@ -195,14 +184,23 @@ pub async fn handle_incoming_event_with_claim(
 
     let (thread_root, claim_id, reaction_target_id, trigger_msg, is_addressed) =
         if let Some(ref orig_event_id) = event.replaces_event_id {
-            // M10 Rule 1: Replacement content must mention the bot
+            // M10 Rule 1: Replacement content must mention the bot or be a reply to the bot
             let is_mentioned = is_bot_mentioned(
                 &event.body,
                 event.formatted_body.as_deref(),
                 event.mentions.as_deref(),
                 &config.bot_mxid,
             );
-            if !is_mentioned {
+            let is_reply_to_bot = if let Some(ref in_reply_to) = event.in_reply_to_event_id {
+                if !event.is_falling_back {
+                    store.get_bot_message_thread(in_reply_to)?.is_some()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !is_mentioned && !is_reply_to_bot {
                 return Ok(BotOutcome::IgnoredNoMention);
             }
 
@@ -288,7 +286,17 @@ pub async fn handle_incoming_event_with_claim(
                 event.mentions.as_deref(),
                 &config.bot_mxid,
             );
-            let is_addressed = is_mentioned || is_thread_escalate || is_thread_deeper;
+            let is_reply_to_bot = if let Some(ref in_reply_to) = event.in_reply_to_event_id {
+                if !event.is_falling_back {
+                    store.get_bot_message_thread(in_reply_to)?.is_some()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let is_addressed =
+                is_mentioned || is_reply_to_bot || is_thread_escalate || is_thread_deeper;
 
             let is_engaged_thread = if let Some(ref root) = event.thread_root_id {
                 store.is_thread_engaged(root)?
@@ -636,69 +644,7 @@ pub async fn handle_incoming_event_with_claim(
     }
 }
 
-/// Extracts an `IncomingMatrixEvent` from a Matrix SDK `SyncRoomMessageEvent`.
-pub fn extract_incoming_event(
-    event: &matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent,
-    room_id: &matrix_sdk::ruma::RoomId,
-) -> Option<IncomingMatrixEvent> {
-    use matrix_sdk::ruma::events::room::message::{MessageType, Relation, SyncRoomMessageEvent};
-
-    if let SyncRoomMessageEvent::Original(orig) = event {
-        if let Some(Relation::Replacement(repl)) = &orig.content.relates_to {
-            let formatted_body = match &repl.new_content.msgtype {
-                MessageType::Text(t) => t.formatted.as_ref().map(|f| f.body.clone()),
-                MessageType::Notice(n) => n.formatted.as_ref().map(|f| f.body.clone()),
-                _ => None,
-            };
-            let mentions = repl
-                .new_content
-                .mentions
-                .as_ref()
-                .map(|m| m.user_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>());
-            let body = repl.new_content.msgtype.body().to_string();
-
-            return Some(IncomingMatrixEvent {
-                room_id: room_id.to_string(),
-                event_id: orig.event_id.to_string(),
-                sender_mxid: orig.sender.to_string(),
-                body,
-                formatted_body,
-                mentions,
-                timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
-                thread_root_id: None,
-                replaces_event_id: Some(repl.event_id.to_string()),
-            });
-        }
-
-        let formatted_body = match &orig.content.msgtype {
-            MessageType::Text(t) => t.formatted.as_ref().map(|f| f.body.clone()),
-            MessageType::Notice(n) => n.formatted.as_ref().map(|f| f.body.clone()),
-            _ => None,
-        };
-        let mentions = orig
-            .content
-            .mentions
-            .as_ref()
-            .map(|m| m.user_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>());
-        let thread_root_id = match &orig.content.relates_to {
-            Some(Relation::Thread(t)) => Some(t.event_id.to_string()),
-            _ => None,
-        };
-        Some(IncomingMatrixEvent {
-            room_id: room_id.to_string(),
-            event_id: orig.event_id.to_string(),
-            sender_mxid: orig.sender.to_string(),
-            body: orig.content.body().to_string(),
-            formatted_body,
-            mentions,
-            timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
-            thread_root_id,
-            replaces_event_id: None,
-        })
-    } else {
-        None
-    }
-}
+pub use crate::matrix::extract_incoming_event;
 
 /// Handles an incoming Matrix reaction event (M5a controls).
 /// Reactions ✅ (accept) and 🔍 (deeper) on a message the bot posted.
@@ -1030,7 +976,7 @@ pub fn register_event_handlers_full(
                         return;
                     }
 
-                    // N3 Gate 2: Mention / Command check (synchronous)
+                    // N3 Gate 2: Mention / Command / Reply check (synchronous)
                     let is_thread_escalate =
                         incoming.thread_root_id.is_some() && incoming.body.trim() == "!escalate";
                     let is_thread_deeper =
@@ -1041,7 +987,31 @@ pub fn register_event_handlers_full(
                         incoming.mentions.as_deref(),
                         &config.bot_mxid,
                     );
-                    if !is_thread_escalate && !is_thread_deeper && !is_mentioned {
+                    let is_reply_to_bot =
+                        if let Some(ref in_reply_to) = incoming.in_reply_to_event_id {
+                            if !incoming.is_falling_back {
+                                store
+                                    .get_bot_message_thread(in_reply_to)
+                                    .ok()
+                                    .flatten()
+                                    .is_some()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                    let is_engaged_thread = if let Some(ref root) = incoming.thread_root_id {
+                        store.is_thread_engaged(root).unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if !is_thread_escalate
+                        && !is_thread_deeper
+                        && !is_mentioned
+                        && !is_reply_to_bot
+                        && !is_engaged_thread
+                    {
                         return;
                     }
 

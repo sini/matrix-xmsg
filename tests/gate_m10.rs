@@ -131,6 +131,8 @@ async fn oracle_1_typo_fix_edit_triggers_once_with_edited_text() {
         timestamp_ms: 1000,
         thread_root_id: None,
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let orig_outcome = handle_incoming_event(&orig_event, &[], &config, &matrix, &xmsg, &store)
@@ -158,6 +160,8 @@ async fn oracle_1_typo_fix_edit_triggers_once_with_edited_text() {
         timestamp_ms: 2000,
         thread_root_id: None,
         replaces_event_id: Some("$orig_1".to_string()),
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let edit_outcome = handle_incoming_event(&edit_event, &[], &config, &matrix, &xmsg, &store)
@@ -211,6 +215,8 @@ async fn oracle_2_edit_to_already_relayed_event_is_ignored() {
         timestamp_ms: 1000,
         thread_root_id: None,
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let orig_outcome = handle_incoming_event(&orig_event, &[], &config, &matrix, &xmsg, &store)
@@ -233,6 +239,8 @@ async fn oracle_2_edit_to_already_relayed_event_is_ignored() {
         timestamp_ms: 2000,
         thread_root_id: None,
         replaces_event_id: Some("$orig_2".to_string()),
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let edit_outcome = handle_incoming_event(&edit_event, &[], &config, &matrix, &xmsg, &store)
@@ -285,6 +293,8 @@ async fn oracle_3_two_successive_mention_edits_relayed_exactly_once() {
         timestamp_ms: 1000,
         thread_root_id: None,
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
     let orig_outcome = handle_incoming_event(&orig_event, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -307,6 +317,8 @@ async fn oracle_3_two_successive_mention_edits_relayed_exactly_once() {
         timestamp_ms: 2000,
         thread_root_id: None,
         replaces_event_id: Some("$orig_3".to_string()),
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
     let outcome_1 = handle_incoming_event(&edit_1, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -324,6 +336,8 @@ async fn oracle_3_two_successive_mention_edits_relayed_exactly_once() {
         timestamp_ms: 3000,
         thread_root_id: None,
         replaces_event_id: Some("$orig_3".to_string()),
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
     let outcome_2 = handle_incoming_event(&edit_2, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -377,6 +391,8 @@ async fn oracle_4_edit_with_different_sender_is_dropped() {
         timestamp_ms: 1000,
         thread_root_id: None,
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
     let orig_outcome = handle_incoming_event(&orig_event, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -394,6 +410,8 @@ async fn oracle_4_edit_with_different_sender_is_dropped() {
         timestamp_ms: 2000,
         thread_root_id: None,
         replaces_event_id: Some("$orig_4".to_string()),
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let edit_outcome = handle_incoming_event(&edit_event, &[], &config, &matrix, &xmsg, &store)
@@ -443,6 +461,8 @@ async fn oracle_5_edit_failing_admission_is_dropped() {
         timestamp_ms: 1000,
         thread_root_id: None,
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
     let orig_outcome = handle_incoming_event(&orig_event, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -460,6 +480,8 @@ async fn oracle_5_edit_failing_admission_is_dropped() {
         timestamp_ms: 2000,
         thread_root_id: None,
         replaces_event_id: Some("$orig_5".to_string()),
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let edit_outcome = handle_incoming_event(&edit_event, &[], &config, &matrix, &xmsg, &store)
@@ -508,6 +530,8 @@ async fn oracle_6_original_event_fetched_from_matrix_when_not_in_store() {
         timestamp_ms: 2000,
         thread_root_id: None,
         replaces_event_id: Some("$orig_fetch".to_string()),
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let edit_outcome = handle_incoming_event(&edit_event, &[], &config, &matrix, &xmsg, &store)
@@ -542,6 +566,8 @@ async fn oracle_7_plain_non_edit_message_writes_nothing_to_store() {
         timestamp_ms: 1000,
         thread_root_id: None,
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)

@@ -185,6 +185,8 @@ async fn oracle_1_control_authorization() {
         timestamp_ms: 4000,
         thread_root_id: Some(thread_id.to_string()),
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
     let outcome = handle_incoming_event(&deeper_stranger, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -352,6 +354,8 @@ async fn oracle_5_admission_policy() {
         timestamp_ms: 1000,
         thread_root_id: None,
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     // 5A. Under default admission (trusted): 0 relays

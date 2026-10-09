@@ -156,6 +156,8 @@ async fn oracle_1_first_mention_in_existing_thread_bootstraps_with_room_and_thre
         timestamp_ms: 5000,
         thread_root_id: Some("$root".to_string()),
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let outcome = handle_incoming_event(&event, &history, &config, &matrix, &xmsg, &store)
@@ -234,6 +236,8 @@ async fn oracle_2_second_forward_within_live_window_is_delta_with_bystander_and_
         timestamp_ms: 4000,
         thread_root_id: Some("$root".to_string()),
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let outcome1 = handle_incoming_event(&event1, &history, &config, &matrix, &xmsg, &store)
@@ -268,6 +272,8 @@ async fn oracle_2_second_forward_within_live_window_is_delta_with_bystander_and_
         timestamp_ms: 5000,
         thread_root_id: Some("$root".to_string()),
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let outcome2 = handle_incoming_event(&event2, &history, &config, &matrix, &xmsg, &store)
@@ -347,6 +353,8 @@ async fn oracle_3_forward_after_session_live_secs_rebootstraps() {
         timestamp_ms: 10_000,
         thread_root_id: Some("$root".to_string()),
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     handle_incoming_event(&event1, &history, &config, &matrix, &xmsg, &store)
@@ -364,6 +372,8 @@ async fn oracle_3_forward_after_session_live_secs_rebootstraps() {
         timestamp_ms: 3_620_000,
         thread_root_id: Some("$root".to_string()),
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     handle_incoming_event(&event2, &history, &config, &matrix, &xmsg, &store)
@@ -416,6 +426,8 @@ async fn oracle_4_refused_send_does_not_advance_cursor() {
         timestamp_ms: 2000,
         thread_root_id: Some("$root".to_string()),
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let res = handle_incoming_event(&event, &history, &config, &matrix, &xmsg, &store).await;
@@ -691,6 +703,8 @@ async fn oracle_8_thread_with_public_history_delta_has_no_thread_tier_header() {
         timestamp_ms: 2000,
         thread_root_id: Some("$root".to_string()),
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let outcome1 = handle_incoming_event(&event1, &history, &config, &matrix, &xmsg, &store)
@@ -718,6 +732,8 @@ async fn oracle_8_thread_with_public_history_delta_has_no_thread_tier_header() {
         timestamp_ms: 3000,
         thread_root_id: Some("$root".to_string()),
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let outcome2 = handle_incoming_event(&event2, &history, &config, &matrix, &xmsg, &store)

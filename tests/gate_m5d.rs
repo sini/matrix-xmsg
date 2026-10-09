@@ -279,6 +279,8 @@ async fn oracle_4_public_admission_header_and_thread_tier() {
         timestamp_ms: 4000,
         thread_root_id: None,
         replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
     };
 
     let outcome = handle_incoming_event(&stranger_msg, &[], &config, &matrix, &xmsg, &store)

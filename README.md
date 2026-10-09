@@ -13,17 +13,22 @@
   - Top-level messages require an explicit `@`-mention (via `m.mentions.user_ids`, Matrix pills, or plain text) or in-thread control triggers (`!deeper`, `!escalate`).
   - An **engaged thread** is one whose root has a recorded asker or a bot message. Any admitted message in an engaged thread passes the mention gate without requiring a mention.
   - The envelope marks whether the trigger line addressed the bot (`addressed: true|false`). For unaddressed follow messages (`addressed: false`), a missing expert reply posts nothing (no timeout notice, no DM); addressed messages preserve existing timeout escalation notices.
+- **Replies to Bot Messages (M14):**
+  - A Matrix message replying to one of the bot's messages (`m.relates_to` carries `m.in_reply_to.event_id` naming an event previously sent by the bot) addresses the bot (`addressed: true`) identically to an explicit mention.
+  - Thread fallbacks (`is_falling_back: true`) added by Matrix clients to indicate the latest thread event do NOT count as replies to the bot (preventing every subsequent thread message after a bot post from reading as addressed).
+  - Top-level replies to bot messages address the bot; replies to messages from non-bot users do not address the bot.
+  - Downstream admission, size cap, rate limits, claims, ACK reactions (👀), and edit handling apply identically.
 - **Relay Acknowledgement & Late Answers (M9):**
   - **ACK Reaction (👀):** When an addressed message (`addressed: true`) is accepted by xmsg, the bot reacts to the event with 👀 (`m.reaction`) to signal work has begun. Unaddressed follows and dropped/refused messages receive no reaction.
   - **Late Answers & Deadline:** If the expert reply does not arrive within `answer_timeout_secs` (default 300s), an owner DM is sent, but the bot continues waiting up to `answer_deadline_secs` (default 3600s). If the reply arrives before the deadline, it is posted to the thread as normal. Past the deadline, the bot stops waiting and posts a user-facing timeout notice.
 - **Admission Modes:**
   - `trusted` (default): Messages from non-allowlisted senders are dropped **silently**. The bot never responds or sends an error notice, preventing oracle attacks where attackers probe for valid allowlisted usernames.
   - `public`: Any room member's top-level question is relayed to the expert session; in engaged threads, the original thread asker and trusted senders are admitted, while bystanders are silently ignored.
-- **Edit Mentions & De-duplication (M10, F3):**
+- **Edit Mentions & De-duplication (M10, F3, M14):**
   - Edits (`m.replace`) are ignored by default (F3) to prevent re-triggering questions that have already been answered or relayed.
   - An edit is handled as a trigger iff:
-    1. Its replacement content (`m.new_content`) mentions the bot (`is_bot_mentioned`),
-    2. The original event did not mention the bot, and
+    1. Its replacement content (`m.new_content`) mentions the bot (`is_bot_mentioned`) or turns the message into a reply to the bot,
+    2. The original event did not mention or reply to the bot, and
     3. The original event ID has never been relayed (claims are keyed on the original event ID, not the edit's).
   - The replacement content is evaluated against all standard gates (room allowlist, admission where the edit sender must match the original sender, size cap, rate limit, and backlog cutoff on the edit's own timestamp).
   - Thread placement, context history, and the relay acknowledgement reaction (👀) attach to the original event ID.
