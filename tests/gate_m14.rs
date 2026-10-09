@@ -58,6 +58,7 @@ fn test_config() -> Config {
         size_cap_bytes: 1024,
         answer_timeout_secs: 30,
         session_live_secs: 3600,
+        resync_byte_cap: 65536,
         db_path: PathBuf::from(":memory:"),
     }
 }

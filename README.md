@@ -52,6 +52,7 @@
   - `tier: "expert"` replies display `[expert review]` header and `expert review` in the metadata line.
   - Hint line: `Controls: ✅ accept · 🔍 deeper · !deeper`.
 - **Silent Decline (`{"silent": true}`):** If the agent determines the message requires no response, it replies with `{"silent": true}`. The bot posts no room message, sends no owner DM, redacts its original 👀 reaction, and reacts with 🫡 ("noted"). The bot's own reactions are filtered by the self-sender guard and never parsed as controls.
+- **Thread Resync (`{"resync": true}`) (M17):** If an agent session loses epistemic context (such as following harness auto-compaction), it may re-request a thread's full history by replying with `{"resync": true}`. The bot never posts this control to the Matrix room; instead, it responds with a bounded transcript envelope containing the full thread history and room background, throttled to at most once per thread per 60 seconds.
 - **Backward Compatibility:** Plain-text replies with no JSON structure render byte-identically to legacy outputs without confidence or control hint lines.
 
 ### 1.4 Context Framing: Bootstrap & Delta Contexts (M5d, M11)
@@ -80,12 +81,13 @@
     ```
   - XML escaping: `<request>`, `</request>`, `<context`, and `</context>` tags occurring inside user-supplied message text are escaped (`<\request`, `<\context`) prior to JSON serialization, preventing sandbox breakouts or fake block imitation.
 
-### 1.5 Svc Inbox & Reply Contract (M13)
+### 1.5 Svc Inbox & Reply Contract (M13, M17)
 
 - **The Bot as `svc:matrix-xmsg`:** On startup, the bot registers on xmsg's `register.sock` as `svc:matrix-xmsg`. Every forward is sent attested on `agent.sock` (`action: "send"`, `push_replies: true`), routing subsequent replies directly to the bot's service inbox.
 - **Posting Every Reply (No Deadline):** Every reply arriving in the service inbox is posted to the Matrix thread in order. An agent may follow up by replying again; each reply is posted.
 - **Silent Decline (`{"silent": true}`):** If an agent replies with `{"silent": true}`, the bot posts nothing to the room, redacts its original `👀` reaction, and reacts with `🫡`.
-- **Delivery & Ack Guarantees:** A reply is acknowledged (`ack`) on `register.sock` only after its Matrix notice post succeeds. Crashes or failures cause re-delivery rather than lost replies.
+- **Thread Resync & Compaction Recovery (`{"resync": true}`) (M17):** An agent session recovering from auto-compaction or context loss may re-request the thread's complete transcript by replying with `{"resync": true}`. The bot treats this as a control (never posted to Matrix) and replies on xmsg with a bootstrap-formatted transcript bounded by `resync_byte_cap` (dropping room background lines before thread lines). The thread cursor advances to the newest line sent with the requesting session ID. Resync requests are rate-limited to at most one per thread per 60 seconds (throttled requests receive `{"resync": "throttled", "retry_after": <s>}`); unknown messages receive `{"resync": "unknown"}`.
+- **Delivery & Ack Guarantees:** A reply is acknowledged (`ack`) on `register.sock` only after its Matrix notice post succeeds (or resync reply is dispatched). Crashes or failures cause re-delivery rather than lost replies.
 - **Answer Timeout:** If no reply arrives within `answer_timeout_secs`, the bot sends an owner DM notification once. This state is tracked in the SQLite store and survives bot restarts. (`answer_deadline_secs` is retired).
 - **Session Changes:** A forward's re-bootstrap envelope carries `supersedes="<delta message id>"` on its context block. The receiving agent should answer only the bootstrap and ignore the superseded message; the bot records both message IDs so a reply to either is attributed to the thread.
 
@@ -120,6 +122,7 @@ rate_limit_window_secs = 600
 size_cap_bytes = 4096
 answer_timeout_secs = 300
 session_live_secs = 3600
+resync_byte_cap = 65536
 db_path = "/var/lib/matrix-xmsg/matrix-xmsg.db"
 ```
 
@@ -188,6 +191,7 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
 | `sizeCapBytes`        | `uint`            | `4096`                         | Max body size of queries accepted.                                                                                                                                                                    |
 | `answerTimeoutSecs`   | `uint`            | `300`                          | Timeout before escalating to owner via DM.                                                                                                                                                            |
 | `sessionLiveSecs`     | `uint`            | `3600`                         | Duration in seconds before an idle thread/session context is re-bootstrapped.                                                                                                                         |
+| `resyncByteCap`       | `uint`            | `65536`                        | Maximum byte size of resync transcript payload.                                                                                                                                                       |
 | `dbPath`              | `path`            | `"${stateDir}/matrix-xmsg.db"` | Path to SQLite database (created mode `0600`).                                                                                                                                                        |
 | `dynamicUser`         | `bool`            | `false`                        | Must be false when accessing user-owned xmsg sockets.                                                                                                                                                 |
 | `user`                | `str`             | `"matrix-xmsg"`                | User owning the running daemon (matches xmsg peer UID).                                                                                                                                               |

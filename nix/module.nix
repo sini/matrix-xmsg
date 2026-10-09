@@ -22,6 +22,7 @@ let
     expert_ref = cfg.expertRef;
     history_n = cfg.historyN;
     history_byte_cap = cfg.historyByteCap;
+    resync_byte_cap = cfg.resyncByteCap;
     rate_limit_count = cfg.rateLimitCount;
     rate_limit_window_secs = cfg.rateLimitWindowSecs;
     size_cap_bytes = cfg.sizeCapBytes;
@@ -122,6 +123,12 @@ in
       type = lib.types.ints.unsigned;
       default = 12288;
       description = "Byte budget cap for message context history.";
+    };
+
+    resyncByteCap = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 65536;
+      description = "Maximum byte budget for thread resync transcripts.";
     };
 
     rateLimitCount = lib.mkOption {

@@ -26,6 +26,9 @@ pub enum BotOutcome {
     ControlDebounced,
     IgnoredEdit,
     IgnoredUnknownMessage,
+    Resynced,
+    ResyncThrottled,
+    ResyncUnknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,6 +615,131 @@ pub async fn handle_inbox_delivery<I: SvcInbox + ?Sized>(
     inbox: &mut I,
     now_secs: i64,
 ) -> Result<BotOutcome, AppError> {
+    let default_xmsg = crate::xmsg::create_xmsg_client(config);
+    handle_inbox_delivery_with_xmsg(
+        delivery,
+        config,
+        matrix,
+        store,
+        default_xmsg.as_ref(),
+        inbox,
+        now_secs,
+    )
+    .await
+}
+
+pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
+    delivery: &SvcDelivery,
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    xmsg: &dyn XmsgClient,
+    inbox: &mut I,
+    now_secs: i64,
+) -> Result<BotOutcome, AppError> {
+    let is_resync = if let Ok(val) = serde_json::from_str::<serde_json::Value>(delivery.text.trim())
+    {
+        val.get("resync").and_then(|v| v.as_bool()).unwrap_or(false)
+    } else {
+        false
+    };
+
+    if is_resync {
+        let orig_id = match parse_in_reply_to_id(&delivery.envelope)
+            .or_else(|| parse_in_reply_to_id(&delivery.text))
+        {
+            Some(id) => id.to_string(),
+            None => {
+                let _ = xmsg
+                    .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
+                    .await;
+                inbox.ack(&delivery.message_id).await?;
+                return Ok(BotOutcome::ResyncUnknown);
+            }
+        };
+
+        let forward = match store.get_forwarded_message(&orig_id)? {
+            Some(f) => f,
+            None => {
+                let _ = xmsg
+                    .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
+                    .await;
+                inbox.ack(&delivery.message_id).await?;
+                return Ok(BotOutcome::ResyncUnknown);
+            }
+        };
+
+        // Rate: at most one resync per thread per 60 s
+        if let Err(retry_after) =
+            store.check_and_record_thread_resync(&forward.thread_root_id, now_secs, 60)?
+        {
+            let reply_json = serde_json::json!({
+                "resync": "throttled",
+                "retry_after": retry_after
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::ResyncThrottled);
+        }
+
+        // Paged thread history fetch from root
+        let thread_history = matrix
+            .fetch_thread_history(&forward.room_id, &forward.thread_root_id)
+            .await?;
+
+        // Background room history
+        let room_history = matrix
+            .fetch_history(&forward.room_id, config.history_n)
+            .await?;
+        let root_idx_opt = room_history
+            .iter()
+            .position(|m| m.event_id == forward.thread_root_id);
+        let background_msgs: Vec<EventMessage> = match root_idx_opt {
+            Some(idx) => room_history[..idx]
+                .iter()
+                .filter(|m| m.thread_root_id.is_none())
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let transcript = crate::context::format_resync_transcript(
+            &forward.room_id,
+            &forward.thread_root_id,
+            &background_msgs,
+            &thread_history,
+            &config.trusted_mxids,
+            Some(&config.owner_mxid),
+            config.resync_byte_cap,
+        );
+
+        let send_resp = xmsg
+            .reply_message(&delivery.message_id, &transcript)
+            .await?;
+
+        // The thread's cursor (M16) then points at the newest line sent, with the asker's session id.
+        let newest_line_id = thread_history
+            .last()
+            .map(|m| m.event_id.as_str())
+            .unwrap_or(&forward.thread_root_id);
+
+        let asker_session_id = send_resp
+            .session_id
+            .as_deref()
+            .or((!delivery.from_name.is_empty()).then_some(delivery.from_name.as_str()));
+
+        store.set_thread_cursor(
+            &forward.thread_root_id,
+            newest_line_id,
+            now_secs,
+            asker_session_id,
+        )?;
+
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::Resynced);
+    }
+
     let orig_id = match parse_in_reply_to_id(&delivery.envelope)
         .or_else(|| parse_in_reply_to_id(&delivery.text))
     {
@@ -743,6 +871,7 @@ pub async fn run_inbox_loop<I: SvcInbox>(
     config: std::sync::Arc<Config>,
     matrix: std::sync::Arc<dyn MatrixClient>,
     store: std::sync::Arc<Store>,
+    xmsg: std::sync::Arc<dyn XmsgClient>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), AppError> {
     loop {
@@ -769,11 +898,12 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
-                        if let Err(e) = handle_inbox_delivery(
+                        if let Err(e) = handle_inbox_delivery_with_xmsg(
                             &delivery,
                             &config,
                             matrix.as_ref(),
                             store.as_ref(),
+                            xmsg.as_ref(),
                             &mut inbox,
                             now,
                         ).await {

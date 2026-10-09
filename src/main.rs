@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         matrix_client.inner(),
         config.clone(),
         matrix_client.clone(),
-        xmsg_client,
+        xmsg_client.clone(),
         store.clone(),
     );
 
@@ -105,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inbox_config = config.clone();
     let inbox_matrix = matrix_client.clone();
     let inbox_store = store.clone();
+    let inbox_xmsg = xmsg_client.clone();
     let inbox_shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
         if let Err(e) = matrix_xmsg::bot::run_inbox_loop(
@@ -112,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             inbox_config,
             inbox_matrix,
             inbox_store,
+            inbox_xmsg,
             inbox_shutdown_rx,
         )
         .await

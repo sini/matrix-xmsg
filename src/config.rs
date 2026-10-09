@@ -19,6 +19,10 @@ fn default_history_byte_cap() -> usize {
     12 * 1024
 }
 
+fn default_resync_byte_cap() -> usize {
+    65536
+}
+
 fn default_rate_limit_count() -> usize {
     10
 }
@@ -74,6 +78,9 @@ pub struct Config {
 
     #[serde(default = "default_history_byte_cap")]
     pub history_byte_cap: usize,
+
+    #[serde(default = "default_resync_byte_cap")]
+    pub resync_byte_cap: usize,
 
     #[serde(default = "default_rate_limit_count")]
     pub rate_limit_count: usize,
@@ -242,5 +249,19 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.session_live_secs, 3600);
+    }
+
+    #[test]
+    fn test_resync_byte_cap_default() {
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = []
+            owner_mxid = "@owner:example.org"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.resync_byte_cap, 65536);
     }
 }

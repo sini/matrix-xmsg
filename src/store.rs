@@ -124,7 +124,11 @@ impl Store {
                 timeout_dm_sent INTEGER NOT NULL DEFAULT 0,
                 reply_count INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_forwarded_messages_timeout ON forwarded_messages(addressed, reply_count, timeout_dm_sent, sent_at);",
+            CREATE INDEX IF NOT EXISTS idx_forwarded_messages_timeout ON forwarded_messages(addressed, reply_count, timeout_dm_sent, sent_at);
+            CREATE TABLE IF NOT EXISTS thread_resyncs (
+                thread_root_id TEXT PRIMARY KEY,
+                last_resync_at INTEGER NOT NULL
+            );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
 
@@ -618,6 +622,41 @@ impl Store {
         Ok(())
     }
 
+    /// Checks if a thread resync is allowed under the rate limit (at most one per 60s).
+    /// If allowed, records the new resync timestamp and returns Ok(Ok(())).
+    /// If throttled, returns Ok(Err(retry_after_secs)).
+    pub fn check_and_record_thread_resync(
+        &self,
+        thread_root_id: &str,
+        now: i64,
+        window_secs: u64,
+    ) -> Result<Result<(), u64>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT last_resync_at FROM thread_resyncs WHERE thread_root_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![thread_root_id], |row| row.get(0));
+        match res {
+            Ok(last_resync_at) => {
+                let elapsed = now.saturating_sub(last_resync_at);
+                if elapsed < window_secs as i64 {
+                    let retry_after = (window_secs as i64 - elapsed) as u64;
+                    return Ok(Err(retry_after));
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(AppError::Store(e.to_string())),
+        }
+
+        conn.execute(
+            "INSERT INTO thread_resyncs (thread_root_id, last_resync_at) VALUES (?1, ?2)
+             ON CONFLICT(thread_root_id) DO UPDATE SET last_resync_at = ?2",
+            params![thread_root_id, now],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(Ok(()))
+    }
+
     /// Returns the count of rows across all tables in the store.
     pub fn total_row_count(&self) -> Result<usize, AppError> {
         let conn = self.conn.lock().unwrap();
@@ -632,6 +671,7 @@ impl Store {
             "relayed_events",
             "thread_cursors",
             "forwarded_messages",
+            "thread_resyncs",
         ];
         let mut total = 0;
         for table in tables {
@@ -912,5 +952,35 @@ mod tests {
             swept_again.is_empty(),
             "Already marked timeout DM must not be returned again"
         );
+    }
+
+    #[test]
+    fn test_check_and_record_thread_resync() {
+        let store = Store::new_in_memory().unwrap();
+        let thread_id = "$root_resync_test";
+
+        // First resync succeeds
+        let res1 = store
+            .check_and_record_thread_resync(thread_id, 1000, 60)
+            .unwrap();
+        assert_eq!(res1, Ok(()));
+
+        // Immediate second resync within 60s is throttled (retry_after = 60 - 10 = 50s at t=1010)
+        let res2 = store
+            .check_and_record_thread_resync(thread_id, 1010, 60)
+            .unwrap();
+        assert_eq!(res2, Err(50));
+
+        // Resync after 60s window (at t=1060) succeeds
+        let res3 = store
+            .check_and_record_thread_resync(thread_id, 1060, 60)
+            .unwrap();
+        assert_eq!(res3, Ok(()));
+
+        // Different thread is independent
+        let res_diff = store
+            .check_and_record_thread_resync("$other_root", 1061, 60)
+            .unwrap();
+        assert_eq!(res_diff, Ok(()));
     }
 }

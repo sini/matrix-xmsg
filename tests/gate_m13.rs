@@ -190,6 +190,7 @@ fn test_config(socket_dir: &Path) -> Config {
         size_cap_bytes: 2048,
         answer_timeout_secs: 10,
         session_live_secs: 3600,
+        resync_byte_cap: 65536,
         db_path: PathBuf::from(":memory:"),
     }
 }

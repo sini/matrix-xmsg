@@ -305,6 +305,19 @@ pub trait XmsgClient: Send + Sync {
         from: &str,
         text: &str,
     ) -> Result<SendResponse, AppError>;
+
+    /// Sends a reply to a message via agent.sock (action: reply).
+    /// Returns the assigned ULID message_id and receiving session_id if available.
+    async fn reply_message(
+        &self,
+        _message_id: &str,
+        _text: &str,
+    ) -> Result<SendResponse, AppError> {
+        Ok(SendResponse::new(
+            "mock-reply-msg-id",
+            Some("mock-session".to_string()),
+        ))
+    }
 }
 
 pub struct UnixXmsgClient {
@@ -401,6 +414,87 @@ impl XmsgClient for UnixXmsgClient {
 
         Ok(SendResponse {
             message_id,
+            session_id,
+        })
+    }
+
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
+        let stream = tokio::net::UnixStream::connect(&self.agent_sock_path)
+            .await
+            .map_err(|e| {
+                AppError::Xmsg(format!(
+                    "Failed to connect to agent socket at {}: {e}",
+                    self.agent_sock_path.display()
+                ))
+            })?;
+
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = tokio::io::BufReader::new(read_half).lines();
+
+        let req = serde_json::json!({
+            "action": "reply",
+            "messageId": message_id,
+            "text": text,
+        });
+        let line = format!("{req}\n");
+        write_half.write_all(line.as_bytes()).await.map_err(|e| {
+            AppError::Xmsg(format!("Failed to write reply request to agent.sock: {e}"))
+        })?;
+        write_half.flush().await.map_err(|e| {
+            AppError::Xmsg(format!("Failed to flush reply request to agent.sock: {e}"))
+        })?;
+
+        let resp_line = lines
+            .next_line()
+            .await
+            .map_err(|e| {
+                AppError::Xmsg(format!(
+                    "Failed to read reply response from agent.sock: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                AppError::Xmsg("Agent socket closed before reply response".to_string())
+            })?;
+
+        let val: Value = serde_json::from_str(&resp_line).map_err(|e| {
+            AppError::Xmsg(format!(
+                "Invalid JSON in agent.sock reply response: {e}; raw: {resp_line}"
+            ))
+        })?;
+
+        let status = val.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        if status != "ok" {
+            let detail = val
+                .get("detail")
+                .and_then(|d| d.as_str())
+                .unwrap_or("reply failed");
+            return Err(AppError::Xmsg(format!("agent.sock reply failed: {detail}")));
+        }
+
+        let reply_obj = val.get("reply");
+        let pushed_message_id = reply_obj
+            .and_then(|r| {
+                r.get("pushedMessageId")
+                    .or_else(|| r.get("pushed_message_id"))
+            })
+            .or_else(|| reply_obj.and_then(|r| r.get("messageId").or_else(|| r.get("message_id"))))
+            .or_else(|| val.get("messageId").or_else(|| val.get("message_id")))
+            .and_then(|v| v.as_str())
+            .unwrap_or(message_id)
+            .to_string();
+
+        let session_id = reply_obj
+            .and_then(|r| {
+                r.get("sessionRef")
+                    .or_else(|| r.get("replierSessionId"))
+                    .or_else(|| r.get("sessionId"))
+            })
+            .or_else(|| val.get("sessionId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(SendResponse {
+            message_id: pushed_message_id,
             session_id,
         })
     }

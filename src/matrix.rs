@@ -50,6 +50,27 @@ pub trait MatrixClient: Send + Sync {
         Ok(None)
     }
 
+    /// Fetches a single page of thread relations for a given thread root.
+    /// Returns (events_in_page, next_batch_token).
+    async fn fetch_thread_relations_page(
+        &self,
+        _room_id: &str,
+        _thread_root_id: &str,
+        _from_token: Option<&str>,
+        _limit: usize,
+    ) -> Result<(Vec<EventMessage>, Option<String>), AppError> {
+        Ok((Vec::new(), None))
+    }
+
+    /// Fetches the full history of a thread from its root, paged.
+    async fn fetch_thread_history(
+        &self,
+        _room_id: &str,
+        _thread_root_id: &str,
+    ) -> Result<Vec<EventMessage>, AppError> {
+        Ok(Vec::new())
+    }
+
     /// Attaches the SQLite Store for DM room caching and state persistence.
     fn set_store(&self, _store: std::sync::Arc<crate::store::Store>) {}
 }
@@ -543,9 +564,102 @@ impl MatrixClient for MatrixSdkClient {
         }
     }
 
+    async fn fetch_thread_relations_page(
+        &self,
+        room_id: &str,
+        thread_root_id: &str,
+        from_token: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<EventMessage>, Option<String>), AppError> {
+        use matrix_sdk::room::{IncludeRelations, RelationsOptions};
+        use matrix_sdk::ruma::api::Direction;
+        use matrix_sdk::ruma::events::relation::RelationType;
+        use matrix_sdk::ruma::{EventId, RoomId, UInt};
+
+        let r_id = <&RoomId>::try_from(room_id)
+            .map_err(|e| AppError::Matrix(format!("Invalid room ID '{room_id}': {e}")))?;
+        let e_id = <&EventId>::try_from(thread_root_id).map_err(|e| {
+            AppError::Matrix(format!("Invalid thread root ID '{thread_root_id}': {e}"))
+        })?;
+
+        let room = match self.client.get_room(r_id) {
+            Some(r) => r,
+            None => return Ok((Vec::new(), None)),
+        };
+
+        let opts = RelationsOptions {
+            from: from_token.map(|s| s.to_string()),
+            dir: Direction::Forward,
+            limit: Some(UInt::new(limit as u64).unwrap_or(UInt::MAX)),
+            include_relations: IncludeRelations::RelationsOfType(RelationType::Thread),
+            recurse: false,
+        };
+
+        let relations = room
+            .relations(e_id.to_owned(), opts)
+            .await
+            .map_err(|e| AppError::Matrix(format!("Failed to fetch thread relations page: {e}")))?;
+
+        let mut events = Vec::new();
+        for timeline_event in relations.chunk {
+            if let Ok(sync_event) = timeline_event.raw().deserialize() {
+                if let Some(msg) = parse_timeline_event(sync_event) {
+                    events.push(msg);
+                }
+            }
+        }
+
+        let next_batch = relations.next_batch_token.or(relations.prev_batch_token);
+        Ok((events, next_batch))
+    }
+
+    async fn fetch_thread_history(
+        &self,
+        room_id: &str,
+        thread_root_id: &str,
+    ) -> Result<Vec<EventMessage>, AppError> {
+        fetch_paged_thread_history(self, room_id, thread_root_id).await
+    }
+
     fn set_store(&self, store: std::sync::Arc<crate::store::Store>) {
         self.set_store(store);
     }
+}
+
+/// Paged thread fetch helper: fetches root event and queries thread relations pages
+/// until all pages are retrieved.
+pub async fn fetch_paged_thread_history(
+    matrix: &dyn MatrixClient,
+    room_id: &str,
+    thread_root_id: &str,
+) -> Result<Vec<EventMessage>, AppError> {
+    let mut thread_events = Vec::new();
+
+    // 1. Fetch root event
+    if let Some(root_msg) = matrix.fetch_event(room_id, thread_root_id).await? {
+        thread_events.push(root_msg);
+    }
+
+    // 2. Page through relations
+    let mut from_token: Option<String> = None;
+    let page_limit = 20;
+
+    loop {
+        let (page, next_token) = matrix
+            .fetch_thread_relations_page(room_id, thread_root_id, from_token.as_deref(), page_limit)
+            .await?;
+
+        thread_events.extend(page);
+
+        match next_token {
+            Some(token) if from_token.as_deref() != Some(&token) => {
+                from_token = Some(token);
+            }
+            _ => break,
+        }
+    }
+
+    Ok(thread_events)
 }
 
 fn is_full_mxid_mentioned(event_body: &str, bot_mxid: &str) -> bool {
@@ -697,6 +811,8 @@ pub struct MockMatrixClient {
     pub redacted_events: Mutex<Vec<RedactedEvent>>,
     pub canned_history: Mutex<Vec<EventMessage>>,
     pub canned_events: Mutex<std::collections::HashMap<String, EventMessage>>,
+    pub canned_thread_relations: Mutex<std::collections::HashMap<String, Vec<EventMessage>>>,
+    pub canned_thread_page_size: Mutex<Option<usize>>,
 }
 
 #[async_trait]
@@ -777,6 +893,48 @@ impl MatrixClient for MockMatrixClient {
         }
         let events = self.canned_events.lock().unwrap();
         Ok(events.get(event_id).cloned())
+    }
+
+    async fn fetch_thread_relations_page(
+        &self,
+        _room_id: &str,
+        thread_root_id: &str,
+        from_token: Option<&str>,
+        default_limit: usize,
+    ) -> Result<(Vec<EventMessage>, Option<String>), AppError> {
+        let relations = self.canned_thread_relations.lock().unwrap();
+        let list = match relations.get(thread_root_id) {
+            Some(l) => l,
+            None => return Ok((Vec::new(), None)),
+        };
+
+        let page_size = self
+            .canned_thread_page_size
+            .lock()
+            .unwrap()
+            .unwrap_or(default_limit);
+        let start: usize = from_token.and_then(|t| t.parse().ok()).unwrap_or(0);
+        if start >= list.len() {
+            return Ok((Vec::new(), None));
+        }
+
+        let end = (start + page_size).min(list.len());
+        let page = list[start..end].to_vec();
+        let next_token = if end < list.len() {
+            Some(end.to_string())
+        } else {
+            None
+        };
+
+        Ok((page, next_token))
+    }
+
+    async fn fetch_thread_history(
+        &self,
+        room_id: &str,
+        thread_root_id: &str,
+    ) -> Result<Vec<EventMessage>, AppError> {
+        fetch_paged_thread_history(self, room_id, thread_root_id).await
     }
 }
 

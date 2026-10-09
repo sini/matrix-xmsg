@@ -78,6 +78,7 @@ fn test_config() -> Config {
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
+        resync_byte_cap: 65536,
         rate_limit_count: 3,
         rate_limit_window_secs: 60,
         size_cap_bytes: 200,
