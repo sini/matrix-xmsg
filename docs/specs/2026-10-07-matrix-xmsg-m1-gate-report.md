@@ -8,18 +8,18 @@
 
 ## 1. Evaluation Against Scope & Owner Rulings
 
-| Requirement | Spec Coverage | Verdict | Notes |
-|---|---|---|---|
-| **Public Room & Non-E2EE** | §1.3, §2.1 | PASS | No E2EE in v1; public rooms only |
-| **Silence Invariant on Non-Trusted** | §2.2 | PASS | Dropped silently with no error/rejection notice (anti-oracle) |
-| **Mention Detection** | §2.2 | PASS | Checks `m.mentions.user_ids`, pill HTML, and plain-text `@genie` |
-| **Sender Mapping Invariants** | §2.3 | PASS | No `:` or `/`, printable ASCII only, <= 64 chars, property-tested |
-| **Context History & Byte Cap** | §2.4 | PASS | N messages / byte cap; thread isolation for threaded triggers |
-| **XML Structure & Escaping** | §2.4 | PASS | Escapes `<request>`, `</request>`, `<context`, `</context>` in quoted lines |
-| **xmsg Client & Long-Poll** | §2.5 | PASS | POSTs message with mapped name; polls replies with timeout cap |
-| **Threading & Reply Format** | §2.5, §2.6 | PASS | Rooted at trigger; `m.notice` with `m.mentions` of asker |
-| **Escalation Hook** | §2.6 | PASS | DM hook to owner MXID on timeout, `!escalate`, or `[escalate]` marker |
-| **Matrix & xmsg Test Isolation** | §1.2, §3a | PASS | Trait abstractions for Matrix and xmsg; 100% offline tests |
+| Requirement                          | Spec Coverage | Verdict | Notes                                                                       |
+| ------------------------------------ | ------------- | ------- | --------------------------------------------------------------------------- |
+| **Public Room & Non-E2EE**           | §1.3, §2.1    | PASS    | No E2EE in v1; public rooms only                                            |
+| **Silence Invariant on Non-Trusted** | §2.2          | PASS    | Dropped silently with no error/rejection notice (anti-oracle)               |
+| **Mention Detection**                | §2.2          | PASS    | Checks `m.mentions.user_ids`, pill HTML, and plain-text `@genie`            |
+| **Sender Mapping Invariants**        | §2.3          | PASS    | No `:` or `/`, printable ASCII only, \<= 64 chars, property-tested          |
+| **Context History & Byte Cap**       | §2.4          | PASS    | N messages / byte cap; thread isolation for threaded triggers               |
+| **XML Structure & Escaping**         | §2.4          | PASS    | Escapes `<request>`, `</request>`, `<context`, `</context>` in quoted lines |
+| **xmsg Client & Long-Poll**          | §2.5          | PASS    | POSTs message with mapped name; polls replies with timeout cap              |
+| **Threading & Reply Format**         | §2.5, §2.6    | PASS    | Rooted at trigger; `m.notice` with `m.mentions` of asker                    |
+| **Escalation Hook**                  | §2.6          | PASS    | DM hook to owner MXID on timeout, `!escalate`, or `[escalate]` marker       |
+| **Matrix & xmsg Test Isolation**     | §1.2, §3a     | PASS    | Trait abstractions for Matrix and xmsg; 100% offline tests                  |
 
 ---
 
