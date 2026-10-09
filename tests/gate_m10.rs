@@ -5,7 +5,7 @@ use matrix_xmsg::context::EventMessage;
 use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::store::Store;
-use matrix_xmsg::xmsg::XmsgClient;
+use matrix_xmsg::xmsg::{SendResponse, XmsgClient};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,11 +40,11 @@ impl XmsgClient for TestXmsgMock {
         expert_ref: &str,
         from: &str,
         text: &str,
-    ) -> Result<String, AppError> {
+    ) -> Result<SendResponse, AppError> {
         let mut list = self.sent_payloads.lock().unwrap();
         list.push((expert_ref.to_string(), from.to_string(), text.to_string()));
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(format!("01MOCKMSG{id_num:06}"))
+        Ok(format!("01MOCKMSG{id_num:06}").into())
     }
 
     async fn wait_for_reply(

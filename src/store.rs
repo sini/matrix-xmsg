@@ -110,10 +110,15 @@ impl Store {
             CREATE TABLE IF NOT EXISTS thread_cursors (
                 thread_root_id TEXT PRIMARY KEY,
                 cursor_event_id TEXT NOT NULL,
-                forwarded_at INTEGER NOT NULL
+                forwarded_at INTEGER NOT NULL,
+                session_id TEXT
             );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
+
+        // Migration: add session_id column to thread_cursors if not present
+        let _ = conn.execute("ALTER TABLE thread_cursors ADD COLUMN session_id TEXT;", []);
+
         Ok(())
     }
 
@@ -413,19 +418,20 @@ impl Store {
         Ok(())
     }
 
-    /// Retrieves the thread cursor (last forwarded event ID and timestamp) for a thread root.
+    /// Retrieves the thread cursor (last forwarded event ID, timestamp, and optional session ID) for a thread root.
     pub fn get_thread_cursor(
         &self,
         thread_root_id: &str,
     ) -> Result<Option<ThreadCursor>, AppError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT cursor_event_id, forwarded_at FROM thread_cursors WHERE thread_root_id = ?1")
+            .prepare("SELECT cursor_event_id, forwarded_at, session_id FROM thread_cursors WHERE thread_root_id = ?1")
             .map_err(|e| AppError::Store(e.to_string()))?;
         let res = stmt.query_row(params![thread_root_id], |row| {
             Ok(ThreadCursor {
                 cursor_event_id: row.get(0)?,
                 forwarded_at: row.get(1)?,
+                session_id: row.get(2)?,
             })
         });
         match res {
@@ -441,12 +447,13 @@ impl Store {
         thread_root_id: &str,
         cursor_event_id: &str,
         now: i64,
+        session_id: Option<&str>,
     ) -> Result<(), AppError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO thread_cursors (thread_root_id, cursor_event_id, forwarded_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(thread_root_id) DO UPDATE SET cursor_event_id = ?2, forwarded_at = ?3",
-            params![thread_root_id, cursor_event_id, now],
+            "INSERT INTO thread_cursors (thread_root_id, cursor_event_id, forwarded_at, session_id) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(thread_root_id) DO UPDATE SET cursor_event_id = ?2, forwarded_at = ?3, session_id = ?4",
+            params![thread_root_id, cursor_event_id, now, session_id],
         )
         .map_err(|e| AppError::Store(e.to_string()))?;
         Ok(())
@@ -482,6 +489,7 @@ impl Store {
 pub struct ThreadCursor {
     pub cursor_event_id: String,
     pub forwarded_at: i64,
+    pub session_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -600,15 +608,46 @@ mod tests {
         let store = Store::new_in_memory().unwrap();
         assert_eq!(store.get_thread_cursor("$root_1").unwrap(), None);
 
-        store.set_thread_cursor("$root_1", "$ev_1", 1000).unwrap();
+        store
+            .set_thread_cursor("$root_1", "$ev_1", 1000, Some("sess_1"))
+            .unwrap();
         let cursor = store.get_thread_cursor("$root_1").unwrap().unwrap();
         assert_eq!(cursor.cursor_event_id, "$ev_1");
         assert_eq!(cursor.forwarded_at, 1000);
+        assert_eq!(cursor.session_id.as_deref(), Some("sess_1"));
 
-        // Update cursor
-        store.set_thread_cursor("$root_1", "$ev_2", 2000).unwrap();
+        // Update cursor with new session
+        store
+            .set_thread_cursor("$root_1", "$ev_2", 2000, Some("sess_2"))
+            .unwrap();
         let updated = store.get_thread_cursor("$root_1").unwrap().unwrap();
         assert_eq!(updated.cursor_event_id, "$ev_2");
         assert_eq!(updated.forwarded_at, 2000);
+        assert_eq!(updated.session_id.as_deref(), Some("sess_2"));
+    }
+
+    #[test]
+    fn test_thread_cursor_migration_from_unversioned() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Create table without session_id column (pre-M16)
+        conn.execute_batch(
+            "CREATE TABLE thread_cursors (
+                thread_root_id TEXT PRIMARY KEY,
+                cursor_event_id TEXT NOT NULL,
+                forwarded_at INTEGER NOT NULL
+            );
+            INSERT INTO thread_cursors VALUES ('$root_old', '$ev_old', 500);",
+        )
+        .unwrap();
+
+        let store = Store {
+            conn: Mutex::new(conn),
+        };
+        store.init_schema().unwrap();
+
+        let cursor = store.get_thread_cursor("$root_old").unwrap().unwrap();
+        assert_eq!(cursor.cursor_event_id, "$ev_old");
+        assert_eq!(cursor.forwarded_at, 500);
+        assert_eq!(cursor.session_id, None);
     }
 }

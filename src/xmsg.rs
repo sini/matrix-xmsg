@@ -9,16 +9,49 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendResponse {
+    pub message_id: String,
+    pub session_id: Option<String>,
+}
+
+impl SendResponse {
+    pub fn new(message_id: impl Into<String>, session_id: Option<String>) -> Self {
+        Self {
+            message_id: message_id.into(),
+            session_id,
+        }
+    }
+}
+
+impl From<String> for SendResponse {
+    fn from(message_id: String) -> Self {
+        Self {
+            message_id,
+            session_id: Some("mock-session".to_string()),
+        }
+    }
+}
+
+impl From<&str> for SendResponse {
+    fn from(message_id: &str) -> Self {
+        Self {
+            message_id: message_id.to_string(),
+            session_id: Some("mock-session".to_string()),
+        }
+    }
+}
+
 #[async_trait]
 pub trait XmsgClient: Send + Sync {
     /// Injects a message into the expert session inbox via POST /v1/sessions/{expert}/messages.
-    /// Returns the assigned ULID message_id.
+    /// Returns the assigned ULID message_id and receiving session_id if available.
     async fn send_message(
         &self,
         expert_ref: &str,
         from: &str,
         text: &str,
-    ) -> Result<String, AppError>;
+    ) -> Result<SendResponse, AppError>;
 
     /// Long-polls /v1/messages/{id}/replies until a reply arrives or timeout expires.
     async fn wait_for_reply(&self, message_id: &str, timeout_secs: u64)
@@ -53,7 +86,7 @@ impl XmsgClient for UnixXmsgClient {
         expert_ref: &str,
         from: &str,
         text: &str,
-    ) -> Result<String, AppError> {
+    ) -> Result<SendResponse, AppError> {
         let path_and_query = format!("/v1/sessions/{expert_ref}/messages");
         let payload = serde_json::to_vec(&serde_json::json!({
             "from": from,
@@ -80,9 +113,18 @@ impl XmsgClient for UnixXmsgClient {
         let message_id = json["messageId"]
             .as_str()
             .or_else(|| json["message_id"].as_str())
-            .ok_or_else(|| AppError::Xmsg("Missing messageId in response".to_string()))?;
+            .ok_or_else(|| AppError::Xmsg("Missing messageId in response".to_string()))?
+            .to_string();
 
-        Ok(message_id.to_string())
+        let session_id = json["sessionId"]
+            .as_str()
+            .or_else(|| json["session_id"].as_str())
+            .map(|s| s.to_string());
+
+        Ok(SendResponse {
+            message_id,
+            session_id,
+        })
     }
 
     async fn wait_for_reply(
@@ -162,7 +204,7 @@ impl XmsgClient for HttpXmsgClient {
         expert_ref: &str,
         from: &str,
         text: &str,
-    ) -> Result<String, AppError> {
+    ) -> Result<SendResponse, AppError> {
         match self {
             Self::Tcp { client, base_url } => {
                 let url = format!("{base_url}/v1/sessions/{expert_ref}/messages");
@@ -191,9 +233,18 @@ impl XmsgClient for HttpXmsgClient {
                 let message_id = json["messageId"]
                     .as_str()
                     .or_else(|| json["message_id"].as_str())
-                    .ok_or_else(|| AppError::Xmsg("Missing messageId in response".to_string()))?;
+                    .ok_or_else(|| AppError::Xmsg("Missing messageId in response".to_string()))?
+                    .to_string();
 
-                Ok(message_id.to_string())
+                let session_id = json["sessionId"]
+                    .as_str()
+                    .or_else(|| json["session_id"].as_str())
+                    .map(|s| s.to_string());
+
+                Ok(SendResponse {
+                    message_id,
+                    session_id,
+                })
             }
             Self::Unix(unix) => unix.send_message(expert_ref, from, text).await,
         }

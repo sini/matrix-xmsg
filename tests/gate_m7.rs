@@ -217,12 +217,12 @@ async fn oracle_1_send_reaches_socket_stub() {
     config.xmsg_socket = Some(socket_path.clone());
 
     let client = create_xmsg_client(&config);
-    let msg_id = client
+    let resp = client
         .send_message("claude", "matrix_alice", "hello unix expert")
         .await
         .expect("send_message over unix socket must succeed");
 
-    assert_eq!(msg_id, "01M7MSGTEST0000000000000000");
+    assert_eq!(resp.message_id, "01M7MSGTEST0000000000000000");
 
     let reqs = server.recorded_requests().await;
     assert_eq!(reqs.len(), 1, "Expected exactly 1 request to unix stub");
@@ -461,14 +461,14 @@ async fn oracle_4_tcp_path_unchanged() {
     assert_eq!(config.xmsg_endpoint(), XmsgEndpoint::Tcp(mock_server.uri()));
 
     let client = create_xmsg_client(&config);
-    let msg_id = client
+    let resp = client
         .send_message("claude", "matrix_alice", "hello tcp")
         .await
         .expect("send_message over TCP must succeed");
-    assert_eq!(msg_id, "01M7TCPMESSAGEID");
+    assert_eq!(resp.message_id, "01M7TCPMESSAGEID");
 
     let reply = client
-        .wait_for_reply("01M7TCPMESSAGEID", 5)
+        .wait_for_reply(&resp.message_id, 5)
         .await
         .expect("wait_for_reply over TCP must succeed");
     assert_eq!(reply, "TCP response");

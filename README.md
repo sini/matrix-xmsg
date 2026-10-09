@@ -59,6 +59,7 @@
 - **Bootstrap vs. Delta per Root:**
   - A top-level trigger is its own root. The bot records in SQLite (`thread_cursors`) the cursor (last forwarded event ID) and timestamp of the forward per thread root.
   - A forward is a **`BOOTSTRAP`** when the root has no recorded cursor or the last forward is older than `session_live_secs` (default `3600`, 1 hour live window). Otherwise, it is a **`DELTA`**.
+  - If a delta forward reaches a receiving session whose `sessionId` differs from the cursor's recorded session (e.g. after expert session restart), the bot immediately sends a bootstrap to that session with `supersedes="<delta message id>"` on its context block, and advances the cursor to the new session id once the bootstrap succeeds; rows lacking a session id re-bootstrap once. The agent should answer only the bootstrap and ignore the superseded message; the bot records both message IDs against the thread so replies to either are attributed to the thread.
   - On a failed send (`xmsg` refused), the cursor does not advance, ensuring subsequent forwards re-carry context.
 - **Two Blocks for Threaded Bootstrap:**
   - When a threaded trigger is bootstrapped, it carries:

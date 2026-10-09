@@ -453,13 +453,13 @@ pub async fn handle_incoming_event_with_claim(
     let cursor_opt = store.get_thread_cursor(&thread_root)?;
     let mode = match cursor_opt {
         None => ContextMode::Bootstrap,
-        Some(cursor) => {
+        Some(ref cursor) => {
             let elapsed = now_secs.saturating_sub(cursor.forwarded_at);
             if elapsed >= config.session_live_secs as i64 {
                 ContextMode::Bootstrap
             } else {
                 ContextMode::Delta {
-                    cursor_event_id: Some(cursor.cursor_event_id),
+                    cursor_event_id: Some(cursor.cursor_event_id.clone()),
                 }
             }
         }
@@ -475,7 +475,7 @@ pub async fn handle_incoming_event_with_claim(
         config.history_n,
         config.history_byte_cap,
         is_addressed,
-        mode,
+        mode.clone(),
     );
 
     // Record relay claim in SQLite
@@ -483,12 +483,60 @@ pub async fn handle_incoming_event_with_claim(
 
     // 8. Send to xmsg Expert Inbox
     let mapped_sender = map_sender_mxid(&event.sender_mxid);
-    let message_id = xmsg
+    let send_resp = xmsg
         .send_message(&config.expert_ref, &mapped_sender, &envelope)
         .await?;
+    let mut message_id = send_resp.message_id;
+    let mut session_id = send_resp.session_id;
 
-    // Rule 1 & Rule 3 & Rule 5: Advance cursor only after send_message succeeds
-    store.set_thread_cursor(&thread_root, &trigger_msg.event_id, now_secs)?;
+    let delta_message_id = message_id.clone();
+    let mut rebootstrap_message_id: Option<String> = None;
+
+    // M16: If forward was sent as Delta, check if the receiving session differs from the cursor's session.
+    // If different (including pre-migration rows with no session id), immediately send one bootstrap to the same ref.
+    if matches!(mode, ContextMode::Delta { .. }) {
+        let cursor_sess = cursor_opt.as_ref().and_then(|c| c.session_id.as_deref());
+        let new_sess = session_id.as_deref();
+        let session_changed = match (cursor_sess, new_sess) {
+            (Some(c), Some(n)) => c != n,
+            // A missing cursor session id is treated as different, so existing rows re-bootstrap once.
+            (None, _) => true,
+            (Some(_), None) => true,
+        };
+
+        if session_changed {
+            let bootstrap_envelope = build_envelope(
+                &event.room_id,
+                &thread_root,
+                &trigger_msg,
+                room_history,
+                &config.trusted_mxids,
+                Some(&config.owner_mxid),
+                config.history_n,
+                config.history_byte_cap,
+                is_addressed,
+                ContextMode::Rebootstrap {
+                    supersedes: delta_message_id.clone(),
+                },
+            );
+
+            let boot_resp = xmsg
+                .send_message(&config.expert_ref, &mapped_sender, &bootstrap_envelope)
+                .await?;
+
+            rebootstrap_message_id = Some(boot_resp.message_id.clone());
+            message_id = boot_resp.message_id;
+            session_id = boot_resp.session_id.or(session_id);
+        }
+    }
+
+    // Rule 1 & Rule 3 & Rule 5 & M16: Advance cursor with the new session id
+    store.set_thread_cursor(
+        &thread_root,
+        &trigger_msg.event_id,
+        now_secs,
+        session_id.as_deref(),
+    )?;
 
     let mut ack_reaction_id: Option<String> = None;
     if is_addressed {
@@ -509,8 +557,11 @@ pub async fn handle_incoming_event_with_claim(
         }
     }
 
-    // Record mapping in SQLite
-    store.record_thread_message(&thread_root, &message_id, now_secs)?;
+    // Record mapping in SQLite: record both message ids against the thread
+    store.record_thread_message(&thread_root, &delta_message_id, now_secs)?;
+    if let Some(ref r_msg_id) = rebootstrap_message_id {
+        store.record_thread_message(&thread_root, r_msg_id, now_secs)?;
+    }
     store.record_thread_asker(&thread_root, &event.sender_mxid)?;
 
     // 9. Long-poll for Expert Reply
