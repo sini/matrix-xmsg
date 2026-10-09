@@ -37,14 +37,6 @@ impl XmsgClient for TestXmsgMock {
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(format!("01MOCKMSG{id_num:06}").into())
     }
-
-    async fn wait_for_reply(
-        &self,
-        _message_id: &str,
-        _timeout_secs: u64,
-    ) -> Result<String, AppError> {
-        Ok("ok".to_string())
-    }
 }
 
 fn test_config() -> Config {
@@ -59,8 +51,7 @@ fn test_config() -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:7787".to_string(),
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -68,7 +59,6 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 500,
         answer_timeout_secs: 30,
-        answer_deadline_secs: 3600,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
@@ -287,7 +277,7 @@ async fn oracle_4_public_admission_header_and_thread_tier() {
         .await
         .unwrap();
 
-    assert_eq!(outcome, BotOutcome::Replied);
+    assert_eq!(outcome, BotOutcome::Forwarded);
 
     let sent = xmsg.sent_payloads.lock().unwrap();
     assert_eq!(sent.len(), 1);

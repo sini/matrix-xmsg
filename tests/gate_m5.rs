@@ -12,19 +12,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+#[derive(Default)]
 struct TestXmsgMock {
-    canned_reply: Mutex<Result<String, AppError>>,
     sent_payloads: Mutex<Vec<(String, String, String)>>, // (expert, from, text)
     send_counter: AtomicUsize,
 }
 
 impl TestXmsgMock {
     fn new() -> Self {
-        Self {
-            canned_reply: Mutex::new(Ok("canned".to_string())),
-            sent_payloads: Mutex::new(Vec::new()),
-            send_counter: AtomicUsize::new(0),
-        }
+        Self::default()
     }
 }
 
@@ -41,19 +37,6 @@ impl XmsgClient for TestXmsgMock {
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(format!("01MOCKMSG{id_num:06}").into())
     }
-
-    async fn wait_for_reply(
-        &self,
-        _message_id: &str,
-        _timeout_secs: u64,
-    ) -> Result<String, AppError> {
-        let guard = self.canned_reply.lock().unwrap();
-        match &*guard {
-            Ok(s) => Ok(s.clone()),
-            Err(AppError::Timeout(t)) => Err(AppError::Timeout(*t)),
-            Err(e) => Err(AppError::Xmsg(e.to_string())),
-        }
-    }
 }
 
 fn test_config() -> Config {
@@ -68,8 +51,7 @@ fn test_config() -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:7787".to_string(),
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -77,7 +59,6 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 500,
         answer_timeout_secs: 30,
-        answer_deadline_secs: 3600,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
@@ -403,7 +384,7 @@ async fn oracle_5_admission_policy() {
         .await
         .unwrap();
 
-        assert_eq!(outcome, BotOutcome::Replied);
+        assert_eq!(outcome, BotOutcome::Forwarded);
         assert_eq!(
             xmsg.sent_payloads.lock().unwrap().len(),
             1,

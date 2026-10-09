@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use matrix_xmsg::bot::{handle_incoming_event, BotOutcome, IncomingMatrixEvent};
+use matrix_xmsg::bot::{
+    handle_incoming_event, sweep_answer_timeouts, BotOutcome, IncomingMatrixEvent,
+};
 use matrix_xmsg::config::{Admission, Config};
 use matrix_xmsg::context::RelayedLine;
 use matrix_xmsg::error::AppError;
@@ -10,28 +12,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+#[derive(Default)]
 struct TestXmsgMock {
-    canned_reply: Mutex<Result<String, AppError>>,
     sent_payloads: Mutex<Vec<(String, String, String)>>, // (expert, from, text)
     send_counter: AtomicUsize,
-}
-
-impl TestXmsgMock {
-    fn with_reply(reply: &str) -> Self {
-        Self {
-            canned_reply: Mutex::new(Ok(reply.to_string())),
-            sent_payloads: Mutex::new(Vec::new()),
-            send_counter: AtomicUsize::new(0),
-        }
-    }
-
-    fn with_timeout(timeout_secs: u64) -> Self {
-        Self {
-            canned_reply: Mutex::new(Err(AppError::Timeout(timeout_secs))),
-            sent_payloads: Mutex::new(Vec::new()),
-            send_counter: AtomicUsize::new(0),
-        }
-    }
 }
 
 #[async_trait]
@@ -47,19 +31,6 @@ impl XmsgClient for TestXmsgMock {
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(format!("01MOCKMSG{id_num:06}").into())
     }
-
-    async fn wait_for_reply(
-        &self,
-        _message_id: &str,
-        _timeout_secs: u64,
-    ) -> Result<String, AppError> {
-        let guard = self.canned_reply.lock().unwrap();
-        match &*guard {
-            Ok(s) => Ok(s.clone()),
-            Err(AppError::Timeout(t)) => Err(AppError::Timeout(*t)),
-            Err(e) => Err(AppError::Xmsg(e.to_string())),
-        }
-    }
 }
 
 fn test_config() -> Config {
@@ -74,8 +45,7 @@ fn test_config() -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:7787".to_string(),
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -83,7 +53,6 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 1024,
         answer_timeout_secs: 30,
-        answer_deadline_secs: 3600,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
@@ -127,7 +96,7 @@ fn parse_relayed_lines(envelope: &str, block_tag: &str) -> Vec<RelayedLine> {
 async fn oracle_1_engaged_thread_unmentioned_asker_forwarded_unaddressed() {
     let config = test_config();
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::with_reply("Here is the answer");
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     // Setup engaged thread: record asker
@@ -154,7 +123,7 @@ async fn oracle_1_engaged_thread_unmentioned_asker_forwarded_unaddressed() {
         .await
         .unwrap();
 
-    assert_eq!(outcome, BotOutcome::Replied);
+    assert_eq!(outcome, BotOutcome::Forwarded);
 
     let sent = xmsg.sent_payloads.lock().unwrap();
     assert_eq!(sent.len(), 1, "Message must be forwarded to xmsg");
@@ -179,7 +148,7 @@ async fn oracle_1_engaged_thread_unmentioned_asker_forwarded_unaddressed() {
 async fn oracle_2_non_engaged_thread_and_top_level_unmentioned_dropped() {
     let config = test_config();
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::with_reply("unused");
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     // 1. Unmentioned message in a non-engaged thread
@@ -250,7 +219,7 @@ async fn oracle_3_engaged_thread_public_admission_bystander_refused() {
     // trusted_mxids has @alice:example.org and @trusted:example.org, but NOT @asker or @bystander
 
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::with_reply("Reply text");
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     let thread_root = "$thread_root_pub";
@@ -307,7 +276,7 @@ async fn oracle_3_engaged_thread_public_admission_bystander_refused() {
             .unwrap();
     assert_eq!(
         outcome_trusted,
-        BotOutcome::Replied,
+        BotOutcome::Forwarded,
         "Trusted sender follow must be admitted and forwarded"
     );
     assert_eq!(
@@ -333,9 +302,9 @@ async fn oracle_4_unaddressed_timeout_silent_addressed_escalates() {
         .record_thread_asker(thread_root, "@alice:example.org")
         .unwrap();
 
-    // 1. Unaddressed forward that times out -> posts NOTHING
+    // 1. Unaddressed forward that times out -> sends NOTHING to owner
     let matrix_unaddressed = MockMatrixClient::default();
-    let xmsg_timeout = TestXmsgMock::with_timeout(30);
+    let xmsg_mock = TestXmsgMock::default();
 
     let unaddressed_event = IncomingMatrixEvent {
         room_id: "!support:example.org".to_string(),
@@ -356,7 +325,7 @@ async fn oracle_4_unaddressed_timeout_silent_addressed_escalates() {
         &[],
         &config,
         &matrix_unaddressed,
-        &xmsg_timeout,
+        &xmsg_mock,
         &store,
     )
     .await
@@ -364,19 +333,28 @@ async fn oracle_4_unaddressed_timeout_silent_addressed_escalates() {
 
     assert_eq!(
         outcome_unaddressed,
-        BotOutcome::TimedOutSilent,
-        "Unaddressed follow timeout must be TimedOutSilent"
+        BotOutcome::Forwarded,
+        "Unaddressed follow forwarded"
+    );
+
+    // Advance time past answer_timeout_secs (30s) and sweep timeouts
+    let swept = sweep_answer_timeouts(&config, &matrix_unaddressed, &store, 14 + 35)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept, 0,
+        "Unaddressed message must not be swept for timeout"
     );
     assert!(
         matrix_unaddressed.sent_notices.lock().unwrap().is_empty(),
-        "Must not post timeout notice for unaddressed message"
+        "Must not post notice for unaddressed message"
     );
     assert!(
         matrix_unaddressed.sent_dms.lock().unwrap().is_empty(),
         "Must not send DM for unaddressed message"
     );
 
-    // 2. Addressed message that times out -> posts timeout notice & DM
+    // 2. Addressed message that times out -> sends owner DM
     let matrix_addressed = MockMatrixClient::default();
     let addressed_event = IncomingMatrixEvent {
         room_id: "!support:example.org".to_string(),
@@ -397,7 +375,7 @@ async fn oracle_4_unaddressed_timeout_silent_addressed_escalates() {
         &[],
         &config,
         &matrix_addressed,
-        &xmsg_timeout,
+        &xmsg_mock,
         &store,
     )
     .await
@@ -405,14 +383,15 @@ async fn oracle_4_unaddressed_timeout_silent_addressed_escalates() {
 
     assert_eq!(
         outcome_addressed,
-        BotOutcome::TimedOutAndEscalated,
-        "Addressed message timeout must be TimedOutAndEscalated"
+        BotOutcome::Forwarded,
+        "Addressed message forwarded"
     );
-    assert_eq!(
-        matrix_addressed.sent_notices.lock().unwrap().len(),
-        1,
-        "Must post timeout notice for addressed message"
-    );
+
+    // Advance time past answer_timeout_secs (30s) and sweep timeouts
+    let swept = sweep_answer_timeouts(&config, &matrix_addressed, &store, 15 + 35)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1, "Addressed message must be swept for timeout");
     assert_eq!(
         matrix_addressed.sent_dms.lock().unwrap().len(),
         1,
@@ -429,7 +408,7 @@ async fn oracle_4_unaddressed_timeout_silent_addressed_escalates() {
 async fn oracle_5_mention_in_engaged_thread_yields_addressed_true() {
     let config = test_config();
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::with_reply("Reply to mentioned query");
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     let thread_root = "$thread_root_mentioned";
@@ -455,7 +434,7 @@ async fn oracle_5_mention_in_engaged_thread_yields_addressed_true() {
         .await
         .unwrap();
 
-    assert_eq!(outcome, BotOutcome::Replied);
+    assert_eq!(outcome, BotOutcome::Forwarded);
 
     let sent = xmsg.sent_payloads.lock().unwrap();
     assert_eq!(sent.len(), 1);

@@ -3,8 +3,8 @@ use crate::context::{build_envelope, ContextMode, EventMessage};
 use crate::error::AppError;
 use crate::matrix::{is_bot_mentioned, MatrixClient};
 use crate::sender_map::map_sender_mxid;
-use crate::store::Store;
-use crate::xmsg::XmsgClient;
+use crate::store::{ForwardedMessageRecord, Store};
+use crate::xmsg::{parse_in_reply_to_id, SvcDelivery, SvcInbox, XmsgClient};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BotOutcome {
@@ -15,6 +15,7 @@ pub enum BotOutcome {
     SizeCapRefusal,
     RateLimitRefusal,
     EscalatedUserRequest,
+    Forwarded,
     Replied,
     RepliedAndEscalated,
     TimedOutAndEscalated,
@@ -24,6 +25,7 @@ pub enum BotOutcome {
     ControlEmitted,
     ControlDebounced,
     IgnoredEdit,
+    IgnoredUnknownMessage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,7 +172,7 @@ pub async fn handle_incoming_event_with_claim(
     matrix: &dyn MatrixClient,
     xmsg: &dyn XmsgClient,
     store: &Store,
-    claimed: Option<&std::sync::atomic::AtomicBool>,
+    _claimed: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BotOutcome, AppError> {
     // 0. Self-Sender Gate: Drop silently if sender is the bot itself (F8)
     if event.sender_mxid == config.bot_mxid {
@@ -486,10 +488,8 @@ pub async fn handle_incoming_event_with_claim(
     let send_resp = xmsg
         .send_message(&config.expert_ref, &mapped_sender, &envelope)
         .await?;
-    let mut message_id = send_resp.message_id;
+    let delta_message_id = send_resp.message_id;
     let mut session_id = send_resp.session_id;
-
-    let delta_message_id = message_id.clone();
     let mut rebootstrap_message_id: Option<String> = None;
 
     // M16: If forward was sent as Delta, check if the receiving session differs from the cursor's session.
@@ -524,8 +524,7 @@ pub async fn handle_incoming_event_with_claim(
                 .send_message(&config.expert_ref, &mapped_sender, &bootstrap_envelope)
                 .await?;
 
-            rebootstrap_message_id = Some(boot_resp.message_id.clone());
-            message_id = boot_resp.message_id;
+            rebootstrap_message_id = Some(boot_resp.message_id);
             session_id = boot_resp.session_id.or(session_id);
         }
     }
@@ -564,135 +563,233 @@ pub async fn handle_incoming_event_with_claim(
     }
     store.record_thread_asker(&thread_root, &event.sender_mxid)?;
 
-    // 9. Long-poll for Expert Reply
-    let first_timeout = config.answer_timeout_secs.min(config.answer_deadline_secs);
-    let first_res = xmsg.wait_for_reply(&message_id, first_timeout).await;
+    // Record forwarded message for inbox reply routing and timeout tracking:
+    // Both delta and rebootstrap message IDs are recorded so a reply to EITHER is attributed to the thread.
+    let delta_forward_rec = ForwardedMessageRecord {
+        message_id: delta_message_id.clone(),
+        room_id: event.room_id.clone(),
+        thread_root_id: thread_root.clone(),
+        event_id: reaction_target_id.clone(),
+        sender_mxid: event.sender_mxid.clone(),
+        addressed: is_addressed,
+        sent_at: now_secs,
+        ack_reaction_id: ack_reaction_id.clone(),
+        timeout_dm_sent: false,
+        reply_count: 0,
+    };
+    store.record_forwarded_message(&delta_forward_rec)?;
 
-    let final_res = match first_res {
-        Ok(reply) => Ok(reply),
-        Err(AppError::Timeout(_)) => {
-            if is_addressed {
-                let dm_text = format!(
-                    "[matrix-xmsg] Answer timeout in room {} thread {} for message {}",
-                    event.room_id, thread_root, message_id
-                );
-                matrix.send_dm(&config.owner_mxid, &dm_text).await?;
-            }
+    if let Some(ref r_msg_id) = rebootstrap_message_id {
+        let boot_forward_rec = ForwardedMessageRecord {
+            message_id: r_msg_id.clone(),
+            room_id: event.room_id.clone(),
+            thread_root_id: thread_root.clone(),
+            event_id: reaction_target_id.clone(),
+            sender_mxid: event.sender_mxid.clone(),
+            addressed: is_addressed,
+            sent_at: now_secs,
+            ack_reaction_id,
+            timeout_dm_sent: false,
+            reply_count: 0,
+        };
+        store.record_forwarded_message(&boot_forward_rec)?;
+    }
 
-            let remaining = config.answer_deadline_secs.saturating_sub(first_timeout);
-            if remaining > 0 {
-                xmsg.wait_for_reply(&message_id, remaining).await
-            } else {
-                Err(AppError::Timeout(config.answer_deadline_secs))
-            }
+    Ok(BotOutcome::Forwarded)
+}
+
+/// Handles a delivery from the xmsg service inbox.
+///
+/// Looks up the forwarded message, renders the expert reply, posts to Matrix,
+/// records the bot message, and acknowledges the delivery on the service inbox.
+/// A delivery is acked ONLY after Matrix posting succeeds, so a failure/crash
+/// re-delivers rather than losing the reply.
+pub async fn handle_inbox_delivery<I: SvcInbox + ?Sized>(
+    delivery: &SvcDelivery,
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    inbox: &mut I,
+    now_secs: i64,
+) -> Result<BotOutcome, AppError> {
+    let orig_id = match parse_in_reply_to_id(&delivery.envelope)
+        .or_else(|| parse_in_reply_to_id(&delivery.text))
+    {
+        Some(id) => id.to_string(),
+        None => {
+            tracing::warn!(
+                "Delivery {} has no in-reply-to message id, acking and ignoring",
+                delivery.message_id
+            );
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::IgnoredUnknownMessage);
         }
-        Err(e) => Err(e),
     };
 
-    match final_res {
-        Ok(reply_text) => {
-            // R2: Atomic claim before posting reply
-            if let Some(flag) = claimed {
-                if flag
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                    )
-                    .is_err()
-                {
-                    return Ok(BotOutcome::AbortedByRestart);
-                }
-            }
-            match format_expert_reply(&reply_text) {
-                None => {
-                    // Declined ({"silent": true})
-                    if let Some(ref r_id) = ack_reaction_id {
-                        if let Err(e) = matrix.redact_event(&event.room_id, r_id, None).await {
-                            tracing::warn!("Failed to redact ack reaction {}: {}", r_id, e);
-                        }
+    let forward = match store.get_forwarded_message(&orig_id)? {
+        Some(f) => f,
+        None => {
+            tracing::warn!(
+                "Delivery {} refers to unknown forward message_id {}, acking and ignoring",
+                delivery.message_id,
+                orig_id
+            );
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::IgnoredUnknownMessage);
+        }
+    };
+
+    match format_expert_reply(&delivery.text) {
+        None => {
+            // Declined ({"silent": true})
+            if forward.reply_count == 0 {
+                if let Some(ref r_id) = forward.ack_reaction_id {
+                    if let Err(e) = matrix.redact_event(&forward.room_id, r_id, None).await {
+                        tracing::warn!("Failed to redact ack reaction {}: {}", r_id, e);
                     }
-                    if is_addressed {
-                        if let Err(e) = matrix
-                            .send_reaction(&event.room_id, &reaction_target_id, "🫡")
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to send decline reaction for event {}: {}",
-                                reaction_target_id,
-                                e
-                            );
-                        }
-                    }
-                    Ok(BotOutcome::Declined)
                 }
-                Some((rendered_reply, is_escalate)) => {
-                    if is_escalate {
-                        let dm_text = format!(
-                            "[matrix-xmsg] Expert requested escalation in room {} thread {} for message {}",
-                            event.room_id, thread_root, message_id
+                if forward.addressed {
+                    if let Err(e) = matrix
+                        .send_reaction(&forward.room_id, &forward.event_id, "🫡")
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to send decline reaction for event {}: {}",
+                            forward.event_id,
+                            e
                         );
-                        matrix.send_dm(&config.owner_mxid, &dm_text).await?;
+                    }
+                }
+            }
+            store.increment_reply_count(&orig_id)?;
+            inbox.ack(&delivery.message_id).await?;
+            Ok(BotOutcome::Declined)
+        }
+        Some((rendered_reply, is_escalate)) => {
+            if is_escalate {
+                let dm_text = format!(
+                    "[matrix-xmsg] Expert requested escalation in room {} thread {} for message {}",
+                    forward.room_id, forward.thread_root_id, orig_id
+                );
+                matrix.send_dm(&config.owner_mxid, &dm_text).await?;
 
-                        let sent_ev_id = matrix
-                            .send_notice(
-                                &event.room_id,
-                                Some(&thread_root),
-                                &rendered_reply,
-                                Some(&event.sender_mxid),
-                            )
-                            .await?;
-                        let _ = store.record_bot_message(&sent_ev_id, &thread_root, now_secs);
-                        Ok(BotOutcome::RepliedAndEscalated)
-                    } else {
-                        let sent_ev_id = matrix
-                            .send_notice(
-                                &event.room_id,
-                                Some(&thread_root),
-                                &rendered_reply,
-                                Some(&event.sender_mxid),
-                            )
-                            .await?;
-                        let _ = store.record_bot_message(&sent_ev_id, &thread_root, now_secs);
-                        Ok(BotOutcome::Replied)
+                let sent_ev_id = matrix
+                    .send_notice(
+                        &forward.room_id,
+                        Some(&forward.thread_root_id),
+                        &rendered_reply,
+                        Some(&forward.sender_mxid),
+                    )
+                    .await?;
+                let _ = store.record_bot_message(&sent_ev_id, &forward.thread_root_id, now_secs);
+                store.increment_reply_count(&orig_id)?;
+                inbox.ack(&delivery.message_id).await?;
+                Ok(BotOutcome::RepliedAndEscalated)
+            } else {
+                let sent_ev_id = matrix
+                    .send_notice(
+                        &forward.room_id,
+                        Some(&forward.thread_root_id),
+                        &rendered_reply,
+                        Some(&forward.sender_mxid),
+                    )
+                    .await?;
+                let _ = store.record_bot_message(&sent_ev_id, &forward.thread_root_id, now_secs);
+                store.increment_reply_count(&orig_id)?;
+                inbox.ack(&delivery.message_id).await?;
+                Ok(BotOutcome::Replied)
+            }
+        }
+    }
+}
+
+/// Sweeps unanswered addressed forwarded messages and sends an owner DM for any
+/// that exceeded answer_timeout_secs without a reply.
+/// Sets timeout_dm_sent in the store so restarts do not duplicate the notification.
+pub async fn sweep_answer_timeouts(
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    now_secs: i64,
+) -> Result<usize, AppError> {
+    let timed_out =
+        store.get_unanswered_timed_out_messages(config.answer_timeout_secs, now_secs)?;
+    let count = timed_out.len();
+    for msg in timed_out {
+        let dm_text = format!(
+            "[matrix-xmsg] Answer timeout in room {} thread {} for message {}",
+            msg.room_id, msg.thread_root_id, msg.message_id
+        );
+        match matrix.send_dm(&config.owner_mxid, &dm_text).await {
+            Ok(_) => {
+                store.mark_timeout_dm_sent(&msg.message_id)?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to send answer timeout DM to {} for message {}: {}",
+                    config.owner_mxid,
+                    msg.message_id,
+                    e
+                );
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Runs the service inbox poll loop until shutdown signal is received.
+pub async fn run_inbox_loop<I: SvcInbox>(
+    mut inbox: I,
+    config: std::sync::Arc<Config>,
+    matrix: std::sync::Arc<dyn MatrixClient>,
+    store: std::sync::Arc<Store>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), AppError> {
+    loop {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        if let Err(e) =
+            sweep_answer_timeouts(&config, matrix.as_ref(), store.as_ref(), now_secs).await
+        {
+            tracing::warn!("Failed sweeping answer timeouts: {e}");
+        }
+
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                tracing::info!("Inbox loop received shutdown signal");
+                break;
+            }
+            poll_res = inbox.poll(5) => {
+                match poll_res {
+                    Ok(Some(delivery)) => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        if let Err(e) = handle_inbox_delivery(
+                            &delivery,
+                            &config,
+                            matrix.as_ref(),
+                            store.as_ref(),
+                            &mut inbox,
+                            now,
+                        ).await {
+                            tracing::error!("Error handling inbox delivery {}: {e}", delivery.message_id);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("Error polling svc inbox: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                 }
             }
         }
-        Err(AppError::Timeout(_)) => {
-            if !is_addressed {
-                return Ok(BotOutcome::TimedOutSilent);
-            }
-            // R2: Atomic claim before posting timeout notice
-            if let Some(flag) = claimed {
-                if flag
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                    )
-                    .is_err()
-                {
-                    return Ok(BotOutcome::AbortedByRestart);
-                }
-            }
-
-            let notice = "The expert has not answered; a human has been notified.";
-            let sent_ev_id = matrix
-                .send_notice(
-                    &event.room_id,
-                    Some(&thread_root),
-                    notice,
-                    Some(&event.sender_mxid),
-                )
-                .await?;
-            let _ = store.record_bot_message(&sent_ev_id, &thread_root, now_secs);
-            Ok(BotOutcome::TimedOutAndEscalated)
-        }
-        Err(e) => Err(e),
     }
+    Ok(())
 }
 
 pub use crate::matrix::extract_incoming_event;

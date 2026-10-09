@@ -1,176 +1,160 @@
-use matrix_xmsg::bot::{handle_incoming_event, BotOutcome, IncomingMatrixEvent};
-use matrix_xmsg::config::{Admission, Config, XmsgEndpoint};
+use matrix_xmsg::bot::{
+    handle_inbox_delivery, handle_incoming_event, BotOutcome, IncomingMatrixEvent,
+};
+use matrix_xmsg::config::{Admission, Config};
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::store::Store;
-use matrix_xmsg::xmsg::create_xmsg_client;
-use std::collections::HashMap;
+use matrix_xmsg::xmsg::{create_xmsg_client, register_svc, SvcInbox, UnixXmsgClient};
+use serde_json::Value;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
-#[derive(Clone, Debug)]
-pub struct RecordedRequest {
-    pub method: String,
-    pub path: String,
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-}
-
-pub struct StubUnixServer {
-    pub socket_path: PathBuf,
-    pub requests: Arc<Mutex<Vec<RecordedRequest>>>,
+pub struct MockXmsgSockets {
+    pub dir: PathBuf,
+    pub recorded_sends: Arc<Mutex<Vec<Value>>>,
+    pub recorded_acks: Arc<Mutex<Vec<String>>>,
+    pub queued_deliveries: Arc<Mutex<VecDeque<Value>>>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-impl StubUnixServer {
-    pub async fn start(socket_path: &Path) -> Self {
-        let _ = std::fs::remove_file(socket_path);
-        let listener = UnixListener::bind(socket_path).unwrap_or_else(|e| {
-            panic!(
-                "Failed to bind unix socket at {}: {e}",
-                socket_path.display()
-            )
-        });
+impl MockXmsgSockets {
+    pub async fn start(dir: &Path) -> Self {
+        let register_sock_path = dir.join("register.sock");
+        let agent_sock_path = dir.join("agent.sock");
+        let _ = std::fs::remove_file(&register_sock_path);
+        let _ = std::fs::remove_file(&agent_sock_path);
 
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let reqs_clone = Arc::clone(&requests);
+        let reg_listener = UnixListener::bind(&register_sock_path).expect("bind register.sock");
+        let agent_listener = UnixListener::bind(&agent_sock_path).expect("bind agent.sock");
+
+        let recorded_sends = Arc::new(Mutex::new(Vec::new()));
+        let recorded_acks = Arc::new(Mutex::new(Vec::new()));
+        let queued_deliveries = Arc::new(Mutex::new(VecDeque::new()));
+
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+        let sends_clone = Arc::clone(&recorded_sends);
+        let acks_clone = Arc::clone(&recorded_acks);
+        let deliveries_clone = Arc::clone(&queued_deliveries);
+
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut shutdown_rx => {
-                        break;
-                    }
-                    accept_res = listener.accept() => {
-                        match accept_res {
-                            Ok((mut stream, _)) => {
-                                let reqs = Arc::clone(&reqs_clone);
+            tokio::select! {
+                _ = &mut shutdown_rx => {}
+                _ = async {
+                    let agent_task = {
+                        let sends = Arc::clone(&sends_clone);
+                        tokio::spawn(async move {
+                            while let Ok((stream, _)) = agent_listener.accept().await {
+                                let (r, mut w) = stream.into_split();
+                                let mut lines = tokio::io::BufReader::new(r).lines();
+                                let sends = Arc::clone(&sends);
                                 tokio::spawn(async move {
-                                    let mut buf = Vec::new();
-                                    let mut temp_buf = [0u8; 1024];
-
-                                    // Read until end of headers (\r\n\r\n)
-                                    let header_end = loop {
-                                        let n = match stream.read(&mut temp_buf).await {
-                                            Ok(0) => return,
-                                            Ok(n) => n,
-                                            Err(_) => return,
-                                        };
-                                        buf.extend_from_slice(&temp_buf[..n]);
-                                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                            break pos;
-                                        }
-                                    };
-
-                                    let header_str = match std::str::from_utf8(&buf[..header_end]) {
-                                        Ok(s) => s,
-                                        Err(_) => return,
-                                    };
-
-                                    let mut lines = header_str.lines();
-                                    let req_line = match lines.next() {
-                                        Some(l) => l,
-                                        None => return,
-                                    };
-                                    let mut parts = req_line.split_whitespace();
-                                    let method = parts.next().unwrap_or("").to_string();
-                                    let path = parts.next().unwrap_or("").to_string();
-
-                                    let mut headers = HashMap::new();
-                                    let mut content_length = 0usize;
-                                    for line in lines {
-                                        if let Some((k, v)) = line.split_once(':') {
-                                            let key = k.trim().to_lowercase();
-                                            let val = v.trim().to_string();
-                                            if key == "content-length" {
-                                                content_length = val.parse().unwrap_or(0);
+                                    while let Ok(Some(line)) = lines.next_line().await {
+                                        if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                                            sends.lock().await.push(val.clone());
+                                            let action = val.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                                            if action == "send" {
+                                                let resp = serde_json::json!({
+                                                    "status": "ok",
+                                                    "message_id": "01M7MSGTEST0000000000000000",
+                                                });
+                                                let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
+                                                let _ = w.flush().await;
                                             }
-                                            headers.insert(key, val);
                                         }
-                                    }
-
-                                    let mut body = buf[header_end + 4..].to_vec();
-                                    while body.len() < content_length {
-                                        let n = match stream.read(&mut temp_buf).await {
-                                            Ok(0) => break,
-                                            Ok(n) => n,
-                                            Err(_) => break,
-                                        };
-                                        body.extend_from_slice(&temp_buf[..n]);
-                                    }
-
-                                    reqs.lock().await.push(RecordedRequest {
-                                        method: method.clone(),
-                                        path: path.clone(),
-                                        headers,
-                                        body,
-                                    });
-
-                                    // Respond
-                                    if method == "POST" && path.starts_with("/v1/sessions/") {
-                                        let resp_body = r#"{"messageId":"01M7MSGTEST0000000000000000"}"#;
-                                        let resp = format!(
-                                            "HTTP/1.1 200 OK\r\n\
-                                             Content-Type: application/json\r\n\
-                                             Content-Length: {}\r\n\
-                                             Connection: close\r\n\
-                                             \r\n\
-                                             {}",
-                                            resp_body.len(),
-                                            resp_body
-                                        );
-                                        let _ = stream.write_all(resp.as_bytes()).await;
-                                        let _ = stream.flush().await;
-                                    } else if method == "GET" && path.starts_with("/v1/messages/") {
-                                        let resp_body = r#"[{"seq":1,"body":"Expert answer received over unix domain socket"}]"#;
-                                        let resp = format!(
-                                            "HTTP/1.1 200 OK\r\n\
-                                             Content-Type: application/json\r\n\
-                                             Content-Length: {}\r\n\
-                                             Connection: close\r\n\
-                                             \r\n\
-                                             {}",
-                                            resp_body.len(),
-                                            resp_body
-                                        );
-                                        let _ = stream.write_all(resp.as_bytes()).await;
-                                        let _ = stream.flush().await;
-                                    } else {
-                                        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                                        let _ = stream.write_all(resp.as_bytes()).await;
-                                        let _ = stream.flush().await;
                                     }
                                 });
                             }
-                            Err(_) => break,
-                        }
-                    }
-                }
+                        })
+                    };
+
+                    let reg_task = {
+                        let acks = Arc::clone(&acks_clone);
+                        let deliveries = Arc::clone(&deliveries_clone);
+                        tokio::spawn(async move {
+                            while let Ok((stream, _)) = reg_listener.accept().await {
+                                let (r, mut w) = stream.into_split();
+                                let mut lines = tokio::io::BufReader::new(r).lines();
+                                let acks = Arc::clone(&acks);
+                                let deliveries = Arc::clone(&deliveries);
+                                tokio::spawn(async move {
+                                    // First line is register
+                                    if let Ok(Some(line)) = lines.next_line().await {
+                                        if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                                            if val.get("harness").and_then(|h| h.as_str()) == Some("svc") {
+                                                let resp = serde_json::json!({
+                                                    "status": "ok",
+                                                    "sessionId": "matrix-xmsg",
+                                                });
+                                                let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
+                                                let _ = w.flush().await;
+                                            }
+                                        }
+                                    }
+
+                                    // Next lines are poll / ack
+                                    while let Ok(Some(line)) = lines.next_line().await {
+                                        if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                                            let action = val.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                                            if action == "poll" {
+                                                let delivery = deliveries.lock().await.pop_front();
+                                                let resp = match delivery {
+                                                    Some(d) => d,
+                                                    None => serde_json::json!({
+                                                        "status": "ok",
+                                                        "action": "timeout",
+                                                    }),
+                                                };
+                                                let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
+                                                let _ = w.flush().await;
+                                            } else if action == "ack" {
+                                                if let Some(msg_id) = val.get("messageId").and_then(|m| m.as_str()) {
+                                                    acks.lock().await.push(msg_id.to_string());
+                                                }
+                                                let resp = serde_json::json!({
+                                                    "status": "ok",
+                                                });
+                                                let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
+                                                let _ = w.flush().await;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        })
+                    };
+
+                    let _ = tokio::join!(agent_task, reg_task);
+                } => {}
             }
         });
 
         Self {
-            socket_path: socket_path.to_path_buf(),
-            requests,
+            dir: dir.to_path_buf(),
+            recorded_sends,
+            recorded_acks,
+            queued_deliveries,
             shutdown_tx: Some(shutdown_tx),
         }
     }
 
-    pub async fn recorded_requests(&self) -> Vec<RecordedRequest> {
-        self.requests.lock().await.clone()
+    pub async fn queue_delivery(&self, delivery: Value) {
+        self.queued_deliveries.lock().await.push_back(delivery);
     }
 }
 
-impl Drop for StubUnixServer {
+impl Drop for MockXmsgSockets {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(self.dir.join("register.sock"));
+        let _ = std::fs::remove_file(self.dir.join("agent.sock"));
     }
 }
 
@@ -186,8 +170,7 @@ fn test_config() -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:1".to_string(), // Unreachable TCP port ensures fallback fails
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -195,7 +178,6 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 2048,
         answer_timeout_secs: 10,
-        answer_deadline_secs: 3600,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
@@ -203,18 +185,17 @@ fn test_config() -> Config {
 
 // ---------------------------------------------------------------------------
 // Oracle 1:
-// With xmsgSocket set, a send reaches the socket stub with expected path,
-// method and body.
-// Mutant: fall back to TCP => RED.
+// With xmsgSocket set, a send reaches the agent.sock stub with expected
+// action, ref, text, and push_replies=true.
+// Mutant: fall back or send without push_replies => RED.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn oracle_1_send_reaches_socket_stub() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_path = tmp.path().join("xmsg.sock");
-    let server = StubUnixServer::start(&socket_path).await;
+    let server = MockXmsgSockets::start(tmp.path()).await;
 
     let mut config = test_config();
-    config.xmsg_socket = Some(socket_path.clone());
+    config.xmsg_socket = tmp.path().to_path_buf();
 
     let client = create_xmsg_client(&config);
     let resp = client
@@ -224,30 +205,31 @@ async fn oracle_1_send_reaches_socket_stub() {
 
     assert_eq!(resp.message_id, "01M7MSGTEST0000000000000000");
 
-    let reqs = server.recorded_requests().await;
-    assert_eq!(reqs.len(), 1, "Expected exactly 1 request to unix stub");
-    let req = &reqs[0];
-    assert_eq!(req.method, "POST");
-    assert_eq!(req.path, "/v1/sessions/claude/messages");
-    let body_json: serde_json::Value = serde_json::from_slice(&req.body).expect("Valid JSON body");
-    assert_eq!(body_json["from"], "matrix_alice");
-    assert_eq!(body_json["text"], "hello unix expert");
+    let sends = server.recorded_sends.lock().await.clone();
+    assert_eq!(
+        sends.len(),
+        1,
+        "Expected exactly 1 request to agent.sock stub"
+    );
+    let req = &sends[0];
+    assert_eq!(req["action"], "send");
+    assert_eq!(req["ref"], "claude");
+    assert_eq!(req["text"], "hello unix expert");
+    assert_eq!(req["push_replies"], true);
 }
 
 // ---------------------------------------------------------------------------
 // Oracle 2:
-// The reply long-poll works over the socket (the stub returns a reply,
-// and the bot posts it).
-// Mutant: break the unix connector for GET => RED.
+// The reply is delivered via svc inbox on register.sock, bot posts it to Matrix,
+// and acks the message id on register.sock.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn oracle_2_reply_long_poll_and_bot_posts_reply() {
+async fn oracle_2_reply_delivered_via_svc_inbox_and_bot_posts_reply() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_path = tmp.path().join("xmsg.sock");
-    let server = StubUnixServer::start(&socket_path).await;
+    let server = MockXmsgSockets::start(tmp.path()).await;
 
     let mut config = test_config();
-    config.xmsg_socket = Some(socket_path.clone());
+    config.xmsg_socket = tmp.path().to_path_buf();
 
     let xmsg = create_xmsg_client(&config);
     let matrix = MockMatrixClient::default();
@@ -271,7 +253,36 @@ async fn oracle_2_reply_long_poll_and_bot_posts_reply() {
         .await
         .expect("handle_incoming_event should succeed");
 
-    assert_eq!(outcome, BotOutcome::Replied);
+    assert_eq!(outcome, BotOutcome::Forwarded);
+
+    // Queue delivery into register.sock
+    server
+        .queue_delivery(serde_json::json!({
+            "status": "ok",
+            "action": "deliver",
+            "messageId": "01M7REPLYID",
+            "fromName": "claude",
+            "text": "Expert answer received over unix domain socket",
+            "envelope": "[xmsg] reply to message_id=01M7MSGTEST0000000000000000 — message_id=01M7REPLYID\nExpert answer received over unix domain socket"
+        }))
+        .await;
+
+    // Connect to register.sock as svc:matrix-xmsg
+    let mut inbox = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
+        .await
+        .expect("register_svc must succeed");
+
+    let delivery = inbox
+        .poll(1)
+        .await
+        .expect("poll must succeed")
+        .expect("must receive delivery");
+
+    assert_eq!(delivery.message_id, "01M7REPLYID");
+
+    handle_inbox_delivery(&delivery, &config, &matrix, &store, &mut inbox, 1000)
+        .await
+        .expect("handle_inbox_delivery must succeed");
 
     {
         let sent = matrix.sent_notices.lock().unwrap();
@@ -286,31 +297,18 @@ async fn oracle_2_reply_long_poll_and_bot_posts_reply() {
         );
     }
 
-    let reqs = server.recorded_requests().await;
-    assert!(reqs.len() >= 2, "Expected at least POST and GET requests");
-    assert_eq!(reqs[0].method, "POST");
-    assert_eq!(reqs[0].path, "/v1/sessions/claude/messages");
-    assert_eq!(reqs[1].method, "GET");
-    assert!(
-        reqs[1]
-            .path
-            .starts_with("/v1/messages/01M7MSGTEST0000000000000000/replies"),
-        "GET request path was: {}",
-        reqs[1].path
-    );
+    let acks = server.recorded_acks.lock().await.clone();
+    assert_eq!(acks, vec!["01M7REPLYID".to_string()]);
 }
 
 // ---------------------------------------------------------------------------
 // Oracle 3:
-// Module eval: both xmsgUrl and xmsgSocket set => an assertion failure;
-// a socket with DynamicUser => an assertion failure.
+// Module eval: a socket with DynamicUser => an assertion failure.
+// Valid non-dynamic user configuration passes.
 // Mutant: drop the assertion => RED.
 // ---------------------------------------------------------------------------
 #[test]
 fn oracle_3_module_eval_assertions() {
-    // When running inside a Nix build sandbox, nix binary is not present in PATH.
-    // In that environment, the check is guaranteed by ci/tests/m7_module.nix
-    // evaluated under nix flake check ./ci.
     let which_nix = Command::new("which")
         .arg("nix")
         .output()
@@ -366,10 +364,8 @@ fn oracle_3_module_eval_assertions() {
       });
       failedMsgs = eval: map (a: a.message) (builtins.filter (a: !a.assertion) eval.config.assertions);
     in {
-      both = failedMsgs (eval { xmsgUrl = "http://127.0.0.1:7787"; xmsgSocket = "/run/xmsg.sock"; dynamicUser = false; });
-      dynamicUserWithSocket = failedMsgs (eval { xmsgSocket = "/run/xmsg.sock"; dynamicUser = true; });
-      validSocket = failedMsgs (eval { xmsgSocket = "/run/xmsg.sock"; dynamicUser = false; });
-      validUrl = failedMsgs (eval { xmsgUrl = "http://127.0.0.1:7787"; dynamicUser = true; });
+      dynamicUserWithSocket = failedMsgs (eval { xmsgSocket = "/run/xmsg"; dynamicUser = true; });
+      validSocket = failedMsgs (eval { xmsgSocket = "/run/xmsg"; dynamicUser = false; });
     }
     "#;
 
@@ -387,16 +383,6 @@ fn oracle_3_module_eval_assertions() {
     let val: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("Failed to parse json");
 
-    let both_msgs = val["both"].as_array().expect("both array");
-    assert!(
-        both_msgs.iter().any(|m| m
-            .as_str()
-            .unwrap_or("")
-            .contains("exactly one of services.matrix-xmsg.xmsgUrl or services.matrix-xmsg.xmsgSocket must be set")),
-        "Expected exactly one assertion failure when both xmsgUrl and xmsgSocket are set, got: {:?}",
-        both_msgs
-    );
-
     let dyn_user_msgs = val["dynamicUserWithSocket"]
         .as_array()
         .expect("dynamicUserWithSocket array");
@@ -405,7 +391,7 @@ fn oracle_3_module_eval_assertions() {
             .as_str()
             .unwrap_or("")
             .contains("when xmsgSocket is configured, dynamicUser must be false")),
-        "Expected dynamicUser assertion failure when xmsgSocket is set with dynamicUser, got: {:?}",
+        "Expected dynamicUser assertion failure when dynamicUser=true, got: {:?}",
         dyn_user_msgs
     );
 
@@ -415,61 +401,29 @@ fn oracle_3_module_eval_assertions() {
         "Expected valid socket config to pass with no failed assertions, got: {:?}",
         valid_socket
     );
-
-    let valid_url = val["validUrl"].as_array().expect("validUrl array");
-    assert!(
-        valid_url.is_empty(),
-        "Expected valid url config to pass with no failed assertions, got: {:?}",
-        valid_url
-    );
 }
 
 // ---------------------------------------------------------------------------
 // Oracle 4:
-// The TCP path is unchanged (the existing tests stay green).
+// Unix domain socket configuration verifies paths for register.sock and agent.sock.
 // ---------------------------------------------------------------------------
-#[tokio::test]
-async fn oracle_4_tcp_path_unchanged() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1/sessions/claude/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "messageId": "01M7TCPMESSAGEID"
-        })))
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(wiremock::matchers::path_regex(r"^/v1/messages/.*/replies"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {
-                "seq": 1,
-                "body": "TCP response"
-            }
-        ])))
-        .mount(&mock_server)
-        .await;
-
+#[test]
+fn oracle_4_unix_socket_paths_configured() {
     let mut config = test_config();
-    config.xmsg_url = mock_server.uri();
-    config.xmsg_socket = None;
+    config.xmsg_socket = PathBuf::from("/run/user/1000/xmsg");
 
-    assert_eq!(config.xmsg_endpoint(), XmsgEndpoint::Tcp(mock_server.uri()));
+    assert_eq!(
+        config.xmsg_register_socket(),
+        PathBuf::from("/run/user/1000/xmsg/register.sock")
+    );
+    assert_eq!(
+        config.xmsg_agent_socket(),
+        PathBuf::from("/run/user/1000/xmsg/agent.sock")
+    );
 
-    let client = create_xmsg_client(&config);
-    let resp = client
-        .send_message("claude", "matrix_alice", "hello tcp")
-        .await
-        .expect("send_message over TCP must succeed");
-    assert_eq!(resp.message_id, "01M7TCPMESSAGEID");
-
-    let reply = client
-        .wait_for_reply(&resp.message_id, 5)
-        .await
-        .expect("wait_for_reply over TCP must succeed");
-    assert_eq!(reply, "TCP response");
+    let client = UnixXmsgClient::new(config.xmsg_agent_socket());
+    assert_eq!(
+        client.agent_sock_path(),
+        Path::new("/run/user/1000/xmsg/agent.sock")
+    );
 }

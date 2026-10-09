@@ -1,5 +1,6 @@
 { lib, inputs, ... }:
 let
+  pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux;
   matrixModule = inputs.matrix-xmsg.nixosModules.default;
   baseModule = {
     options = {
@@ -8,7 +9,31 @@ let
         default = [ ];
       };
       users.users = lib.mkOption {
-        type = lib.types.attrs;
+        type = lib.types.attrsOf (
+          lib.types.submodule {
+            options = {
+              home = lib.mkOption {
+                type = lib.types.str;
+              };
+              isNormalUser = lib.mkOption {
+                type = lib.types.bool;
+                default = false;
+              };
+              isSystemUser = lib.mkOption {
+                type = lib.types.bool;
+                default = false;
+              };
+              group = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+              };
+              description = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+              };
+            };
+          }
+        );
         default = { };
       };
       users.groups = lib.mkOption {
@@ -16,7 +41,28 @@ let
         default = { };
       };
       systemd.services = lib.mkOption {
-        type = lib.types.attrs;
+        type = lib.types.attrsOf (
+          lib.types.submodule {
+            options = {
+              description = lib.mkOption {
+                type = lib.types.str;
+                default = "";
+              };
+              after = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+              };
+              wantedBy = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+              };
+              serviceConfig = lib.mkOption {
+                type = lib.types.attrsOf lib.types.unspecified;
+                default = { };
+              };
+            };
+          }
+        );
         default = { };
       };
     };
@@ -26,12 +72,16 @@ let
     serviceCfg:
     let
       res = lib.evalModules {
+        specialArgs = {
+          inherit pkgs;
+        };
         modules = [
           baseModule
           matrixModule
           {
             services.matrix-xmsg = {
               enable = true;
+              package = inputs.matrix-xmsg.packages.x86_64-linux.default;
               homeserverUrl = "http://localhost:8008";
               botMxid = "@bot:local";
               accessTokenFile = "/run/token";
@@ -47,18 +97,6 @@ let
 in
 {
   flake.tests.m7-module = {
-    test-oracle3-both-url-and-socket-assertion = {
-      expr =
-        builtins.elem
-          "services.matrix-xmsg: exactly one of services.matrix-xmsg.xmsgUrl or services.matrix-xmsg.xmsgSocket must be set."
-          (evalConfig {
-            xmsgUrl = "http://127.0.0.1:7787";
-            xmsgSocket = "/run/xmsg.sock";
-            dynamicUser = false;
-          });
-      expected = true;
-    };
-
     test-oracle3-socket-with-dynamic-user-assertion = {
       expr =
         builtins.elem
@@ -78,11 +116,47 @@ in
       expected = [ ];
     };
 
-    test-oracle3-valid-url-passes = {
-      expr = evalConfig {
-        xmsgUrl = "http://127.0.0.1:7787";
+    test-existing-user-no-collision-preserves-home =
+      let
+        res = lib.evalModules {
+          specialArgs = {
+            inherit pkgs;
+          };
+          modules = [
+            baseModule
+            matrixModule
+            {
+              users.users.alice = {
+                isNormalUser = true;
+                home = "/home/alice";
+              };
+              services.matrix-xmsg = {
+                enable = true;
+                package = inputs.matrix-xmsg.packages.x86_64-linux.default;
+                homeserverUrl = "http://localhost:8008";
+                botMxid = "@bot:local";
+                accessTokenFile = "/run/token";
+                rooms = [ "!room:local" ];
+                ownerMxid = "@owner:local";
+                user = "alice";
+                dynamicUser = false;
+                xmsgSocket = "/run/user/1000/xmsg";
+              };
+            }
+          ];
+        };
+      in
+      {
+        expr = {
+          home = res.config.users.users.alice.home;
+          user = res.config.systemd.services.matrix-xmsg.serviceConfig.User;
+          hasGroup = res.config.systemd.services.matrix-xmsg.serviceConfig ? Group;
+        };
+        expected = {
+          home = "/home/alice";
+          user = "alice";
+          hasGroup = false;
+        };
       };
-      expected = [ ];
-    };
   };
 }

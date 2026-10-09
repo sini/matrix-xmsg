@@ -80,7 +80,16 @@
     ```
   - XML escaping: `<request>`, `</request>`, `<context`, and `</context>` tags occurring inside user-supplied message text are escaped (`<\request`, `<\context`) prior to JSON serialization, preventing sandbox breakouts or fake block imitation.
 
-### 1.5 Strict ASCII Sender Mapping
+### 1.5 Svc Inbox & Reply Contract (M13)
+
+- **The Bot as `svc:matrix-xmsg`:** On startup, the bot registers on xmsg's `register.sock` as `svc:matrix-xmsg`. Every forward is sent attested on `agent.sock` (`action: "send"`, `push_replies: true`), routing subsequent replies directly to the bot's service inbox.
+- **Posting Every Reply (No Deadline):** Every reply arriving in the service inbox is posted to the Matrix thread in order. An agent may follow up by replying again; each reply is posted.
+- **Silent Decline (`{"silent": true}`):** If an agent replies with `{"silent": true}`, the bot posts nothing to the room, redacts its original `👀` reaction, and reacts with `🫡`.
+- **Delivery & Ack Guarantees:** A reply is acknowledged (`ack`) on `register.sock` only after its Matrix notice post succeeds. Crashes or failures cause re-delivery rather than lost replies.
+- **Answer Timeout:** If no reply arrives within `answer_timeout_secs`, the bot sends an owner DM notification once. This state is tracked in the SQLite store and survives bot restarts. (`answer_deadline_secs` is retired).
+- **Session Changes:** A forward's re-bootstrap envelope carries `supersedes="<delta message id>"` on its context block. The receiving agent should answer only the bootstrap and ignore the superseded message; the bot records both message IDs so a reply to either is attributed to the thread.
+
+### 1.6 Strict ASCII Sender Mapping
 
 Matrix IDs (`@alice:example.org`) are converted to sanitized ASCII identifiers (`matrix alice at example.org`):
 
@@ -102,7 +111,7 @@ rooms = ["!support:example.org"]
 trusted_mxids = ["@alice:example.org", "@bob:example.org"]
 owner_mxid = "@owner:example.org"
 admission = "trusted" # "trusted" (default) or "public"
-xmsg_url = "http://127.0.0.1:7787"
+xmsg_socket = "/run/user/1000/xmsg"
 expert_ref = "claude"
 history_n = 30
 history_byte_cap = 12288
@@ -110,7 +119,6 @@ rate_limit_count = 10
 rate_limit_window_secs = 600
 size_cap_bytes = 4096
 answer_timeout_secs = 300
-answer_deadline_secs = 3600
 session_live_secs = 3600
 db_path = "/var/lib/matrix-xmsg/matrix-xmsg.db"
 ```
@@ -140,8 +148,10 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
     rooms = [ "!general:json64.dev" ];
     trustedMxids = [ "@owner:json64.dev" ];
     ownerMxid = "@owner:json64.dev";
-    xmsgUrl = "http://127.0.0.1:7787";
+    xmsgSocket = "/run/user/1000/xmsg";
     expertRef = "claude";
+    dynamicUser = false;
+    user = "sini";
   };
 }
 ```
@@ -158,61 +168,43 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
 
 ### 3.3 Module Options Reference
 
-| Option                | Type          | Default                        | Description                                                                                        |
-| --------------------- | ------------- | ------------------------------ | -------------------------------------------------------------------------------------------------- |
-| `enable`              | `bool`        | `false`                        | Enable the matrix-xmsg daemon.                                                                     |
-| `package`             | `package`     | `matrix-xmsg`                  | Package to run.                                                                                    |
-| `homeserverUrl`       | `str`         | *(required)*                   | Base URL of the Matrix homeserver.                                                                 |
-| `botMxid`             | `str`         | *(required)*                   | Full Matrix user ID of the bot (`@name:server`).                                                   |
-| `accessTokenFile`     | `path`        | *(required)*                   | Path to file containing the Matrix access token.                                                   |
-| `rooms`               | `listOf str`  | `[]`                           | Room IDs (`!id:server`) monitored by the bot. Aliases (`#alias:server`) are rejected at eval time. |
-| `trustedMxids`        | `listOf str`  | `[]`                           | Allowlist of user Matrix IDs permitted to interact with the bot.                                   |
-| `ownerMxid`           | `str`         | *(required)*                   | Owner Matrix ID for escalations and direct notices.                                                |
-| `stateDir`            | `path`        | `"/var/lib/matrix-xmsg"`       | State directory for persistent store and database.                                                 |
-| `xmsgUrl`             | `str`         | `"http://127.0.0.1:7787"`      | HTTP bridge URL to xmsg server.                                                                    |
-| `xmsgSocket`          | `nullOr path` | `null`                         | Optional agent socket path (evaluated; see attestation below).                                     |
-| `expertRef`           | `str`         | `"claude"`                     | Session name/ref in xmsg to route queries to.                                                      |
-| `historyN`            | `uint`        | `30`                           | Number of context messages fetched from timeline.                                                  |
-| `historyByteCap`      | `uint`        | `12288`                        | Maximum byte size of context history window.                                                       |
-| `rateLimitCount`      | `uint`        | `10`                           | Max queries permitted per user per window.                                                         |
-| `rateLimitWindowSecs` | `uint`        | `600`                          | Sliding window duration in seconds.                                                                |
-| `sizeCapBytes`        | `uint`        | `4096`                         | Max body size of queries accepted.                                                                 |
-| `answerTimeoutSecs`   | `uint`        | `300`                          | Timeout before escalating to owner.                                                                |
-| `answerDeadlineSecs`  | `uint`        | `3600`                         | Deadline in seconds to wait for late answers before giving up.                                     |
-| `sessionLiveSecs`     | `uint`        | `3600`                         | Duration in seconds before an idle thread/session context is re-bootstrapped.                      |
-| `dbPath`              | `path`        | `"${stateDir}/matrix-xmsg.db"` | Path to SQLite database (created mode `0600`).                                                     |
-| `dynamicUser`         | `bool`        | `true`                         | Whether to allocate an ephemeral systemd DynamicUser.                                              |
-| `user`                | `str`         | `"matrix-xmsg"`                | Static user when `dynamicUser = false`.                                                            |
-| `group`               | `str`         | `"matrix-xmsg"`                | Static group when `dynamicUser = false`.                                                           |
+| Option                | Type              | Default                        | Description                                                                                                                                                                                           |
+| --------------------- | ----------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enable`              | `bool`            | `false`                        | Enable the matrix-xmsg daemon.                                                                                                                                                                        |
+| `package`             | `package`         | `matrix-xmsg`                  | Package to run.                                                                                                                                                                                       |
+| `homeserverUrl`       | `str`             | *(required)*                   | Base URL of the Matrix homeserver.                                                                                                                                                                    |
+| `botMxid`             | `str`             | *(required)*                   | Full Matrix user ID of the bot (`@name:server`).                                                                                                                                                      |
+| `accessTokenFile`     | `path`            | *(required)*                   | Path to file containing the Matrix access token.                                                                                                                                                      |
+| `rooms`               | `listOf str`      | `[]`                           | Room IDs (`!id:server`) monitored by the bot. Aliases (`#alias:server`) are rejected at eval time.                                                                                                    |
+| `trustedMxids`        | `listOf str`      | `[]`                           | Allowlist of user Matrix IDs permitted to interact with the bot.                                                                                                                                      |
+| `ownerMxid`           | `str`             | *(required)*                   | Owner Matrix ID for escalations and direct notices.                                                                                                                                                   |
+| `stateDir`            | `path`            | `"/var/lib/matrix-xmsg"`       | State directory for persistent store and database.                                                                                                                                                    |
+| `xmsgSocket`          | `either path str` | `"/run/user/1000/xmsg"`        | Path to xmsg runtime directory containing register.sock and agent.sock.                                                                                                                               |
+| `expertRef`           | `str`             | `"claude"`                     | Session name/ref in xmsg to route queries to.                                                                                                                                                         |
+| `historyN`            | `uint`            | `30`                           | Number of context messages fetched from timeline.                                                                                                                                                     |
+| `historyByteCap`      | `uint`            | `12288`                        | Maximum byte size of context history window.                                                                                                                                                          |
+| `rateLimitCount`      | `uint`            | `10`                           | Max queries permitted per user per window.                                                                                                                                                            |
+| `rateLimitWindowSecs` | `uint`            | `600`                          | Sliding window duration in seconds.                                                                                                                                                                   |
+| `sizeCapBytes`        | `uint`            | `4096`                         | Max body size of queries accepted.                                                                                                                                                                    |
+| `answerTimeoutSecs`   | `uint`            | `300`                          | Timeout before escalating to owner via DM.                                                                                                                                                            |
+| `sessionLiveSecs`     | `uint`            | `3600`                         | Duration in seconds before an idle thread/session context is re-bootstrapped.                                                                                                                         |
+| `dbPath`              | `path`            | `"${stateDir}/matrix-xmsg.db"` | Path to SQLite database (created mode `0600`).                                                                                                                                                        |
+| `dynamicUser`         | `bool`            | `false`                        | Must be false when accessing user-owned xmsg sockets.                                                                                                                                                 |
+| `user`                | `str`             | `"matrix-xmsg"`                | User owning the running daemon (matches xmsg peer UID).                                                                                                                                               |
+| `group`               | `nullOr str`      | `null`                         | Dedicated system group (used when dynamicUser is false). When null and user is matrix-xmsg, defaults to matrix-xmsg. For any other user, systemd uses the user's primary group unless explicitly set. |
 
 ### 3.4 Systemd Hardening & Lifetime Guarantees
 
-- **Strict Isolation:** `DynamicUser = true`, `ProtectSystem = strict`, `ProtectHome = true`, `PrivateTmp = true`, `PrivateDevices = true`, `ProtectKernelTunables = true`, `ProtectControlGroups = true`, `NoNewPrivileges = true`, `RestrictNamespaces = true`, `RestrictAddressFamilies = AF_INET AF_INET6 AF_UNIX`, `UMask = 0077`.
+- **Strict Isolation:** `ProtectSystem = strict`, `ProtectHome = true`, `PrivateTmp = true`, `PrivateDevices = true`, `ProtectKernelTunables = true`, `ProtectControlGroups = true`, `NoNewPrivileges = true`, `RestrictNamespaces = true`, `RestrictAddressFamilies = AF_INET AF_INET6 AF_UNIX`, `UMask = 0077`.
 - **State Persistence:** `StateDirectory = "matrix-xmsg"` provisions `/var/lib/matrix-xmsg` owned by the service user. The SQLite database is created mode `0600` via `Store::new`.
 - **Bounded Shutdown:** `TimeoutStopSec = 60` provides generous margin above the 5-second in-flight drain and 5-second shutdown notice bounds.
+- **Boot Synchronization & Failure Retry:** The systemd unit sets `Restart = "on-failure"` with `RestartSec = "5s"`. Because `/run/user/1000` exists only under the user's lingering user manager session, registration on `register.sock` can fail at early system boot before the user session initializes. When registration fails, the bot logs the failure and exits non-zero (`std::process::exit(1)`), causing systemd to automatically retry every 5 seconds until `register.sock` becomes available.
 
-### 3.5 xmsg Attestation Evaluation
+### 3.5 xmsg Attestation & Svc Harness
 
-`xmsg` operates two incoming interfaces:
+The bot runs as a non-DynamicUser service (e.g. `user = "sini"`), connecting directly to xmsg's runtime directory (`xmsgSocket`, typically `/run/user/1000/xmsg`). When `user` is set to an existing host account (anything other than the default `"matrix-xmsg"`), the module does not declare `users.users` or `users.groups`, avoiding collision with the user's existing home directory and attributes, and defaults `serviceConfig.Group` to the user's primary group unless `group` is explicitly specified.
 
-1. **HTTP Bridge (`xmsgUrl`, default `http://127.0.0.1:7787`):**
-   Used by `matrix-xmsg`. Accepts `POST /v1/sessions/{expert}/messages`. Senders are tagged as `from@host_label`. This interface requires network reachability to localhost and does not enforce process UID checks.
-2. **Attested Unix Domain Socket (`agent.sock`):**
-   `xmsg` creates `agent.sock` mode `0600` inside `$XDG_RUNTIME_DIR/xmsg/` (mode `0700`), owned by the desktop session UID (e.g. UID 1000). On connection, it checks `stream.peer_cred()` (`peer_uid == my_uid`), followed by an ancestor process tree walk to find a registered Claude, Antigravity, or Pi session PID.
-
-**System Service Attestation Finding:**
-A systemd system service (`matrix-xmsg.service`) running under a system user or `DynamicUser` **cannot** connect to `agent.sock` under existing `xmsg` rules due to:
-
-- DAC permissions (`0600` / `0700` owned by desktop user UID).
-- Strict peer UID check (`peer_uid != my_uid` rejection).
-- PPID ancestor walk terminating at PID 1 (`systemd`), matching no known LLM harness.
-
-**Minimal Proposed `xmsg`-side Evolution:**
-To support attested daemon bridges like `matrix-xmsg` over Unix sockets in the future:
-
-1. Provide a group-accessible socket (`mode 0660`, e.g. group `xmsg`).
-2. Accept peer UIDs belonging to the trusted socket group or authorized via credential token.
-3. Add a `bridge` harness identity in `resolve_caller_session` that verifies the caller executable path or systemd unit cgroup and generates an attested badge `xmsg@host · bridge:matrix-xmsg`.
+On startup, the bot registers on `register.sock` as `svc:matrix-xmsg`. xmsg verifies the caller's peer UID and validates the executable against `--svc-exe matrix-xmsg=<path>`. Forwards are sent attested on `agent.sock` (`push_replies: true`), routing subsequent replies directly into the bot's service inbox loop.
 
 ---
 

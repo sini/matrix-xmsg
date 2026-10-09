@@ -55,14 +55,6 @@ impl XmsgClient for MockSessionClient {
             session_id: sess,
         })
     }
-
-    async fn wait_for_reply(
-        &self,
-        _message_id: &str,
-        _timeout_secs: u64,
-    ) -> Result<String, AppError> {
-        Ok("Expert canned response".to_string())
-    }
 }
 
 fn test_config() -> Config {
@@ -77,8 +69,7 @@ fn test_config() -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:7787".to_string(),
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -86,7 +77,6 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 1024,
         answer_timeout_secs: 10,
-        answer_deadline_secs: 60,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }

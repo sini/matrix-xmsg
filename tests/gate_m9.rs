@@ -8,31 +8,19 @@ use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::store::Store;
 use matrix_xmsg::xmsg::{SendResponse, XmsgClient};
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
 
+#[derive(Default)]
 struct TestXmsgMock {
-    canned_replies: Mutex<VecDeque<Result<String, AppError>>>,
     sent_payloads: Mutex<Vec<(String, String, String)>>,
     send_counter: AtomicUsize,
-    poll_calls: Mutex<Vec<(String, u64)>>,
 }
 
 impl TestXmsgMock {
-    fn new(replies: Vec<Result<String, AppError>>) -> Self {
-        Self {
-            canned_replies: Mutex::new(VecDeque::from(replies)),
-            sent_payloads: Mutex::new(Vec::new()),
-            send_counter: AtomicUsize::new(0),
-            poll_calls: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn with_reply(reply: &str) -> Self {
-        Self::new(vec![Ok(reply.to_string())])
+    fn with_reply(_reply: &str) -> Self {
+        Self::default()
     }
 }
 
@@ -49,22 +37,25 @@ impl XmsgClient for TestXmsgMock {
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(format!("01MOCKMSG{id_num:06}").into())
     }
+}
 
-    async fn wait_for_reply(
-        &self,
-        message_id: &str,
-        timeout_secs: u64,
-    ) -> Result<String, AppError> {
-        self.poll_calls
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), timeout_secs));
-        let mut guard = self.canned_replies.lock().unwrap();
-        if let Some(res) = guard.pop_front() {
-            res
-        } else {
-            Err(AppError::Timeout(timeout_secs))
-        }
+#[derive(Default)]
+struct TestInboxMock {
+    acked: Vec<String>,
+}
+
+#[async_trait]
+impl matrix_xmsg::xmsg::SvcInbox for TestInboxMock {
+    async fn poll(
+        &mut self,
+        _wait_secs: u64,
+    ) -> Result<Option<matrix_xmsg::xmsg::SvcDelivery>, AppError> {
+        Ok(None)
+    }
+
+    async fn ack(&mut self, message_id: &str) -> Result<(), AppError> {
+        self.acked.push(message_id.to_string());
+        Ok(())
     }
 }
 
@@ -80,8 +71,7 @@ fn test_config() -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:7787".to_string(),
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -89,7 +79,6 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 1024,
         answer_timeout_secs: 10,
-        answer_deadline_secs: 60,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
@@ -125,7 +114,7 @@ async fn oracle_1_addressed_accepted_gets_eye_reaction() {
         .await
         .unwrap();
 
-    assert_eq!(outcome, BotOutcome::Replied);
+    assert_eq!(outcome, BotOutcome::Forwarded);
 
     let reactions = matrix.sent_reactions.lock().unwrap();
     assert_eq!(
@@ -147,10 +136,7 @@ async fn oracle_1_addressed_accepted_gets_eye_reaction() {
 async fn oracle_2_unaddressed_and_dropped_get_no_reaction() {
     let config = test_config();
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::new(vec![
-        Ok("init reply".to_string()),
-        Ok("follow reply".to_string()),
-    ]);
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     // 1. Establish engaged thread via initial addressed question
@@ -167,9 +153,10 @@ async fn oracle_2_unaddressed_and_dropped_get_no_reaction() {
         in_reply_to_event_id: None,
         is_falling_back: false,
     };
-    handle_incoming_event(&init_event, &[], &config, &matrix, &xmsg, &store)
+    let init_outcome = handle_incoming_event(&init_event, &[], &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
+    assert_eq!(init_outcome, BotOutcome::Forwarded);
 
     // Clear reactions from initial question
     matrix.sent_reactions.lock().unwrap().clear();
@@ -191,7 +178,7 @@ async fn oracle_2_unaddressed_and_dropped_get_no_reaction() {
     let follow_outcome = handle_incoming_event(&follow_event, &[], &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(follow_outcome, BotOutcome::Replied);
+    assert_eq!(follow_outcome, BotOutcome::Forwarded);
 
     let reactions_after_follow = matrix.sent_reactions.lock().unwrap().clone();
     assert_eq!(
@@ -229,22 +216,17 @@ async fn oracle_2_unaddressed_and_dropped_get_no_reaction() {
 
 // ---------------------------------------------------------------------------
 // Oracle 3:
-// A reply arriving after answer_timeout_secs but before answer_deadline_secs
-// is posted in the thread, and the owner DM was still sent at the timeout.
+// A reply arriving after answer_timeout_secs is posted in the thread,
+// and the owner DM was still sent at the timeout.
 // Mutant: stop waiting at the timeout (today) => RED.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn oracle_3_late_answer_posted_and_owner_dmed() {
     let mut config = test_config();
     config.answer_timeout_secs = 5;
-    config.answer_deadline_secs = 30;
 
     let matrix = MockMatrixClient::default();
-    // First poll times out at answer_timeout_secs; second poll before deadline succeeds
-    let xmsg = TestXmsgMock::new(vec![
-        Err(AppError::Timeout(5)),
-        Ok("Late answer arrived before deadline.".to_string()),
-    ]);
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     let event = IncomingMatrixEvent {
@@ -265,19 +247,47 @@ async fn oracle_3_late_answer_posted_and_owner_dmed() {
         .await
         .unwrap();
 
-    assert_eq!(outcome, BotOutcome::Replied);
+    assert_eq!(outcome, BotOutcome::Forwarded);
+
+    // Timeout sweep sends owner DM at answer_timeout_secs
+    let swept = matrix_xmsg::bot::sweep_answer_timeouts(&config, &matrix, &store, 1 + 10)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1);
 
     // Verify owner DM was sent at timeout
-    let dms = matrix.sent_dms.lock().unwrap();
-    assert_eq!(dms.len(), 1, "owner DM must be sent at answer_timeout_secs");
-    assert_eq!(dms[0].user_id, "@owner:example.org");
-    assert!(
-        dms[0]
-            .body
-            .contains("Answer timeout in room !support:example.org"),
-        "DM body must indicate answer timeout: {}",
-        dms[0].body
-    );
+    {
+        let dms = matrix.sent_dms.lock().unwrap();
+        assert_eq!(dms.len(), 1, "owner DM must be sent at answer_timeout_secs");
+        assert_eq!(dms[0].user_id, "@owner:example.org");
+        assert!(
+            dms[0]
+                .body
+                .contains("Answer timeout in room !support:example.org"),
+            "DM body must indicate answer timeout: {}",
+            dms[0].body
+        );
+    }
+
+    // Late answer arrives in inbox and is posted in thread
+    let delivery = matrix_xmsg::xmsg::SvcDelivery {
+        message_id: "01M4LATE".to_string(),
+        from_name: "claude".to_string(),
+        text: "Late answer arrived before deadline.".to_string(),
+        envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4LATE; reply with the xmsg reply tool\n\nLate answer arrived before deadline.".to_string(),
+    };
+    let mut inbox = TestInboxMock::default();
+    let reply_outcome = matrix_xmsg::bot::handle_inbox_delivery(
+        &delivery,
+        &config,
+        &matrix,
+        &store,
+        &mut inbox,
+        1 + 20,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply_outcome, BotOutcome::Replied);
 
     // Verify the late answer was posted in the thread
     let notices = matrix.sent_notices.lock().unwrap();
@@ -289,23 +299,20 @@ async fn oracle_3_late_answer_posted_and_owner_dmed() {
 
 // ---------------------------------------------------------------------------
 // Oracle 4:
-// A reply after the deadline is not posted.
-// Mutant: wait forever => RED (bounded by test timeout).
+// In M13, deadline is retired. Late replies are always posted.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn oracle_4_reply_past_deadline_not_posted() {
+async fn oracle_4_late_reply_always_posted_no_deadline() {
     let mut config = test_config();
     config.answer_timeout_secs = 5;
-    config.answer_deadline_secs = 20;
 
     let matrix = MockMatrixClient::default();
-    // Both polls time out (at answer_timeout_secs and past answer_deadline_secs)
-    let xmsg = TestXmsgMock::new(vec![Err(AppError::Timeout(5)), Err(AppError::Timeout(15))]);
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     let event = IncomingMatrixEvent {
         room_id: "!support:example.org".to_string(),
-        event_id: "$ev_deadline_1".to_string(),
+        event_id: "$ev_late_2".to_string(),
         sender_mxid: "@alice:example.org".to_string(),
         body: "@genie:example.org question that completely times out".to_string(),
         formatted_body: None,
@@ -317,34 +324,40 @@ async fn oracle_4_reply_past_deadline_not_posted() {
         is_falling_back: false,
     };
 
-    // Bound test execution to ensure mutant (wait forever) times out
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(2),
-        handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store),
+    let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
+        .await
+        .unwrap();
+    assert_eq!(outcome, BotOutcome::Forwarded);
+
+    // Timeout sweep at +10s sends owner DM
+    let swept = matrix_xmsg::bot::sweep_answer_timeouts(&config, &matrix, &store, 1 + 10)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1);
+
+    // Reply arrives long after former deadline (+7200s)
+    let delivery = matrix_xmsg::xmsg::SvcDelivery {
+        message_id: "01M4VERYLATE".to_string(),
+        from_name: "claude".to_string(),
+        text: "Late reply is posted with no deadline.".to_string(),
+        envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4VERYLATE; reply with the xmsg reply tool\n\nLate reply is posted with no deadline.".to_string(),
+    };
+    let mut inbox = TestInboxMock::default();
+    let reply_outcome = matrix_xmsg::bot::handle_inbox_delivery(
+        &delivery,
+        &config,
+        &matrix,
+        &store,
+        &mut inbox,
+        1 + 7200,
     )
     .await
-    .expect("must not wait forever")
     .unwrap();
-
-    assert_eq!(outcome, BotOutcome::TimedOutAndEscalated);
+    assert_eq!(reply_outcome, BotOutcome::Replied);
 
     let notices = matrix.sent_notices.lock().unwrap();
-    assert_eq!(
-        notices.len(),
-        1,
-        "must post timeout notice when deadline expires"
-    );
-    assert!(
-        notices[0]
-            .body
-            .contains("The expert has not answered; a human has been notified."),
-        "notice must be timeout notice, not an expert reply: {}",
-        notices[0].body
-    );
-
-    // Verify exactly 1 owner DM was sent
-    let dms = matrix.sent_dms.lock().unwrap();
-    assert_eq!(dms.len(), 1, "exactly 1 owner DM must be sent");
+    assert_eq!(notices.len(), 1, "reply must be posted with no deadline");
+    assert_eq!(notices[0].body, "Late reply is posted with no deadline.");
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +371,7 @@ async fn oracle_4_reply_past_deadline_not_posted() {
 async fn oracle_5_silent_decline_redacts_eye_and_salutes() {
     let config = test_config();
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::with_reply(r#"{"silent": true}"#);
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     let event = IncomingMatrixEvent {
@@ -379,7 +392,38 @@ async fn oracle_5_silent_decline_redacts_eye_and_salutes() {
         .await
         .unwrap();
 
-    assert_eq!(outcome, BotOutcome::Declined);
+    assert_eq!(outcome, BotOutcome::Forwarded);
+
+    // Initial reaction is 👀
+    {
+        let reactions = matrix.sent_reactions.lock().unwrap();
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].key, "👀");
+        assert_eq!(reactions[0].event_id, "$ev_decline_1");
+    }
+
+    // Inbox delivery with silent: true arrives
+    let delivery = matrix_xmsg::xmsg::SvcDelivery {
+        message_id: "01M4DECLINE".to_string(),
+        from_name: "claude".to_string(),
+        text: r#"{"silent": true}"#.to_string(),
+        envelope: r#"[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4DECLINE; reply with the xmsg reply tool
+
+{"silent": true}"#.to_string(),
+    };
+    let mut inbox = TestInboxMock::default();
+    let decline_outcome = matrix_xmsg::bot::handle_inbox_delivery(
+        &delivery,
+        &config,
+        &matrix,
+        &store,
+        &mut inbox,
+        1000 / 1000 + 1,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(decline_outcome, BotOutcome::Declined);
 
     // 1. Posts no message in the room
     assert_eq!(

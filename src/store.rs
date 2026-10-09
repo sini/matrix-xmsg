@@ -112,7 +112,19 @@ impl Store {
                 cursor_event_id TEXT NOT NULL,
                 forwarded_at INTEGER NOT NULL,
                 session_id TEXT
-            );",
+            );CREATE TABLE IF NOT EXISTS forwarded_messages (
+                message_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                thread_root_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                sender_mxid TEXT NOT NULL,
+                addressed INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL,
+                ack_reaction_id TEXT,
+                timeout_dm_sent INTEGER NOT NULL DEFAULT 0,
+                reply_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_forwarded_messages_timeout ON forwarded_messages(addressed, reply_count, timeout_dm_sent, sent_at);",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
 
@@ -459,6 +471,153 @@ impl Store {
         Ok(())
     }
 
+    /// Records a forwarded Matrix message in forwarded_messages.
+    pub fn record_forwarded_message(
+        &self,
+        record: &ForwardedMessageRecord,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO forwarded_messages (
+                message_id, room_id, thread_root_id, event_id, sender_mxid,
+                addressed, sent_at, ack_reaction_id, timeout_dm_sent, reply_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.message_id,
+                record.room_id,
+                record.thread_root_id,
+                record.event_id,
+                record.sender_mxid,
+                if record.addressed { 1 } else { 0 },
+                record.sent_at,
+                record.ack_reaction_id,
+                if record.timeout_dm_sent { 1 } else { 0 },
+                record.reply_count,
+            ],
+        )
+        .map_err(|e| {
+            AppError::Store(format!(
+                "Failed to record forwarded message {}: {e}",
+                record.message_id
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Retrieves a forwarded message record by xmsg message_id.
+    pub fn get_forwarded_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<ForwardedMessageRecord>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT message_id, room_id, thread_root_id, event_id, sender_mxid,
+                        addressed, sent_at, ack_reaction_id, timeout_dm_sent, reply_count
+                 FROM forwarded_messages WHERE message_id = ?1",
+            )
+            .map_err(|e| AppError::Store(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(params![message_id])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+
+        if let Some(row) = rows.next().map_err(|e| AppError::Store(e.to_string()))? {
+            let addressed_int: i64 = row.get(5).map_err(|e| AppError::Store(e.to_string()))?;
+            let timeout_dm_int: i64 = row.get(8).map_err(|e| AppError::Store(e.to_string()))?;
+            let reply_count_int: i64 = row.get(9).map_err(|e| AppError::Store(e.to_string()))?;
+
+            Ok(Some(ForwardedMessageRecord {
+                message_id: row.get(0).map_err(|e| AppError::Store(e.to_string()))?,
+                room_id: row.get(1).map_err(|e| AppError::Store(e.to_string()))?,
+                thread_root_id: row.get(2).map_err(|e| AppError::Store(e.to_string()))?,
+                event_id: row.get(3).map_err(|e| AppError::Store(e.to_string()))?,
+                sender_mxid: row.get(4).map_err(|e| AppError::Store(e.to_string()))?,
+                addressed: addressed_int != 0,
+                sent_at: row.get(6).map_err(|e| AppError::Store(e.to_string()))?,
+                ack_reaction_id: row.get(7).map_err(|e| AppError::Store(e.to_string()))?,
+                timeout_dm_sent: timeout_dm_int != 0,
+                reply_count: reply_count_int as u32,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Increments the reply count for a forwarded message.
+    pub fn increment_reply_count(&self, message_id: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE forwarded_messages SET reply_count = reply_count + 1 WHERE message_id = ?1",
+            params![message_id],
+        )
+        .map_err(|e| {
+            AppError::Store(format!(
+                "Failed to increment reply count for {message_id}: {e}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Retrieves addressed, unanswered forwarded messages whose sent_at exceeds answer_timeout_secs.
+    pub fn get_unanswered_timed_out_messages(
+        &self,
+        timeout_secs: u64,
+        now_secs: i64,
+    ) -> Result<Vec<ForwardedMessageRecord>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = now_secs.saturating_sub(timeout_secs as i64);
+        let mut stmt = conn
+            .prepare(
+                "SELECT message_id, room_id, thread_root_id, event_id, sender_mxid,
+                        addressed, sent_at, ack_reaction_id, timeout_dm_sent, reply_count
+                 FROM forwarded_messages
+                 WHERE addressed = 1 AND reply_count = 0 AND timeout_dm_sent = 0 AND sent_at <= ?1
+                 ORDER BY sent_at ASC",
+            )
+            .map_err(|e| AppError::Store(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(params![cutoff])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| AppError::Store(e.to_string()))? {
+            let addressed_int: i64 = row.get(5).map_err(|e| AppError::Store(e.to_string()))?;
+            let timeout_dm_int: i64 = row.get(8).map_err(|e| AppError::Store(e.to_string()))?;
+            let reply_count_int: i64 = row.get(9).map_err(|e| AppError::Store(e.to_string()))?;
+
+            results.push(ForwardedMessageRecord {
+                message_id: row.get(0).map_err(|e| AppError::Store(e.to_string()))?,
+                room_id: row.get(1).map_err(|e| AppError::Store(e.to_string()))?,
+                thread_root_id: row.get(2).map_err(|e| AppError::Store(e.to_string()))?,
+                event_id: row.get(3).map_err(|e| AppError::Store(e.to_string()))?,
+                sender_mxid: row.get(4).map_err(|e| AppError::Store(e.to_string()))?,
+                addressed: addressed_int != 0,
+                sent_at: row.get(6).map_err(|e| AppError::Store(e.to_string()))?,
+                ack_reaction_id: row.get(7).map_err(|e| AppError::Store(e.to_string()))?,
+                timeout_dm_sent: timeout_dm_int != 0,
+                reply_count: reply_count_int as u32,
+            });
+        }
+        Ok(results)
+    }
+
+    /// Marks the timeout DM as sent for a message.
+    pub fn mark_timeout_dm_sent(&self, message_id: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE forwarded_messages SET timeout_dm_sent = 1 WHERE message_id = ?1",
+            params![message_id],
+        )
+        .map_err(|e| {
+            AppError::Store(format!(
+                "Failed to mark timeout DM sent for {message_id}: {e}"
+            ))
+        })?;
+        Ok(())
+    }
+
     /// Returns the count of rows across all tables in the store.
     pub fn total_row_count(&self) -> Result<usize, AppError> {
         let conn = self.conn.lock().unwrap();
@@ -472,6 +631,7 @@ impl Store {
             "control_events",
             "relayed_events",
             "thread_cursors",
+            "forwarded_messages",
         ];
         let mut total = 0;
         for table in tables {
@@ -490,6 +650,20 @@ pub struct ThreadCursor {
     pub cursor_event_id: String,
     pub forwarded_at: i64,
     pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardedMessageRecord {
+    pub message_id: String,
+    pub room_id: String,
+    pub thread_root_id: String,
+    pub event_id: String,
+    pub sender_mxid: String,
+    pub addressed: bool,
+    pub sent_at: i64,
+    pub ack_reaction_id: Option<String>,
+    pub timeout_dm_sent: bool,
+    pub reply_count: u32,
 }
 
 #[cfg(test)]
@@ -649,5 +823,94 @@ mod tests {
         assert_eq!(cursor.cursor_event_id, "$ev_old");
         assert_eq!(cursor.forwarded_at, 500);
         assert_eq!(cursor.session_id, None);
+    }
+
+    #[test]
+    fn test_forwarded_messages_storage() {
+        let store = Store::new_in_memory().unwrap();
+        assert_eq!(store.get_forwarded_message("01MSG1").unwrap(), None);
+
+        let rec = ForwardedMessageRecord {
+            message_id: "01MSG1".to_string(),
+            room_id: "!room1:example.org".to_string(),
+            thread_root_id: "$root1".to_string(),
+            event_id: "$ev1".to_string(),
+            sender_mxid: "@alice:example.org".to_string(),
+            addressed: true,
+            sent_at: 1000,
+            ack_reaction_id: Some("$ack1".to_string()),
+            timeout_dm_sent: false,
+            reply_count: 0,
+        };
+        store.record_forwarded_message(&rec).unwrap();
+
+        let fetched = store.get_forwarded_message("01MSG1").unwrap().unwrap();
+        assert_eq!(fetched, rec);
+
+        // Increment reply count
+        store.increment_reply_count("01MSG1").unwrap();
+        let fetched2 = store.get_forwarded_message("01MSG1").unwrap().unwrap();
+        assert_eq!(fetched2.reply_count, 1);
+    }
+
+    #[test]
+    fn test_unanswered_timeout_sweep() {
+        let store = Store::new_in_memory().unwrap();
+        let rec1 = ForwardedMessageRecord {
+            message_id: "01MSG1".to_string(),
+            room_id: "!room:example.org".to_string(),
+            thread_root_id: "$root1".to_string(),
+            event_id: "$ev1".to_string(),
+            sender_mxid: "@alice:example.org".to_string(),
+            addressed: true,
+            sent_at: 1000,
+            ack_reaction_id: None,
+            timeout_dm_sent: false,
+            reply_count: 0,
+        };
+        let rec_unaddressed = ForwardedMessageRecord {
+            message_id: "01MSG2".to_string(),
+            room_id: "!room:example.org".to_string(),
+            thread_root_id: "$root2".to_string(),
+            event_id: "$ev2".to_string(),
+            sender_mxid: "@bob:example.org".to_string(),
+            addressed: false,
+            sent_at: 1000,
+            ack_reaction_id: None,
+            timeout_dm_sent: false,
+            reply_count: 0,
+        };
+        let rec_replied = ForwardedMessageRecord {
+            message_id: "01MSG3".to_string(),
+            room_id: "!room:example.org".to_string(),
+            thread_root_id: "$root3".to_string(),
+            event_id: "$ev3".to_string(),
+            sender_mxid: "@carol:example.org".to_string(),
+            addressed: true,
+            sent_at: 1000,
+            ack_reaction_id: None,
+            timeout_dm_sent: false,
+            reply_count: 1,
+        };
+        store.record_forwarded_message(&rec1).unwrap();
+        store.record_forwarded_message(&rec_unaddressed).unwrap();
+        store.record_forwarded_message(&rec_replied).unwrap();
+
+        // At t=1200 (timeout 300s): not yet timed out
+        let timed_out_early = store.get_unanswered_timed_out_messages(300, 1200).unwrap();
+        assert!(timed_out_early.is_empty());
+
+        // At t=1300: rec1 is timed out (addressed, 0 replies, no DM sent)
+        let timed_out = store.get_unanswered_timed_out_messages(300, 1300).unwrap();
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0].message_id, "01MSG1");
+
+        // Mark timeout DM sent
+        store.mark_timeout_dm_sent("01MSG1").unwrap();
+        let swept_again = store.get_unanswered_timed_out_messages(300, 1300).unwrap();
+        assert!(
+            swept_again.is_empty(),
+            "Already marked timeout DM must not be returned again"
+        );
     }
 }

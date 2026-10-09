@@ -1,37 +1,32 @@
 use async_trait::async_trait;
-use matrix_xmsg::bot::{handle_incoming_event, BotOutcome, IncomingMatrixEvent};
+use matrix_xmsg::bot::{
+    handle_inbox_delivery, handle_incoming_event, sweep_answer_timeouts, BotOutcome,
+    IncomingMatrixEvent,
+};
 use matrix_xmsg::config::Config;
 use matrix_xmsg::context::{escape_xml_blocks, EventMessage};
 use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::sender_map::map_sender_mxid;
 use matrix_xmsg::store::Store;
-use matrix_xmsg::xmsg::{SendResponse, XmsgClient};
+use matrix_xmsg::xmsg::{SendResponse, SvcDelivery, SvcInbox, XmsgClient};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+#[derive(Default)]
 struct TestXmsgMock {
-    canned_reply: Mutex<Result<String, AppError>>,
     sent_payloads: Mutex<Vec<(String, String, String)>>, // (expert, from, text)
     send_counter: AtomicUsize,
 }
 
 impl TestXmsgMock {
-    fn with_reply(reply: &str) -> Self {
-        Self {
-            canned_reply: Mutex::new(Ok(reply.to_string())),
-            sent_payloads: Mutex::new(Vec::new()),
-            send_counter: AtomicUsize::new(0),
-        }
+    fn with_reply(_reply: &str) -> Self {
+        Self::default()
     }
 
-    fn with_timeout(timeout_secs: u64) -> Self {
-        Self {
-            canned_reply: Mutex::new(Err(AppError::Timeout(timeout_secs))),
-            sent_payloads: Mutex::new(Vec::new()),
-            send_counter: AtomicUsize::new(0),
-        }
+    fn with_timeout(_timeout_secs: u64) -> Self {
+        Self::default()
     }
 }
 
@@ -48,18 +43,22 @@ impl XmsgClient for TestXmsgMock {
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(format!("01MOCKMSG{id_num:06}").into())
     }
+}
 
-    async fn wait_for_reply(
-        &self,
-        _message_id: &str,
-        _timeout_secs: u64,
-    ) -> Result<String, AppError> {
-        let guard = self.canned_reply.lock().unwrap();
-        match &*guard {
-            Ok(s) => Ok(s.clone()),
-            Err(AppError::Timeout(t)) => Err(AppError::Timeout(*t)),
-            Err(e) => Err(AppError::Xmsg(e.to_string())),
-        }
+#[derive(Default)]
+struct TestInboxMock {
+    acked: Vec<String>,
+}
+
+#[async_trait]
+impl SvcInbox for TestInboxMock {
+    async fn poll(&mut self, _wait_secs: u64) -> Result<Option<SvcDelivery>, AppError> {
+        Ok(None)
+    }
+
+    async fn ack(&mut self, message_id: &str) -> Result<(), AppError> {
+        self.acked.push(message_id.to_string());
+        Ok(())
     }
 }
 
@@ -75,8 +74,7 @@ fn test_config() -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: matrix_xmsg::config::Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:7787".to_string(),
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -84,7 +82,6 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 200,
         answer_timeout_secs: 30,
-        answer_deadline_secs: 3600,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
@@ -221,7 +218,22 @@ async fn test_allowlisted_mention_triggers_and_replies_in_thread() {
     let outcome = handle_incoming_event(&event, &history, &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome, BotOutcome::Replied);
+    assert_eq!(outcome, BotOutcome::Forwarded);
+
+    // Feed delivery to inbox
+    let mut inbox = TestInboxMock::default();
+    let delivery = SvcDelivery {
+        message_id: "01M4REPLY".to_string(),
+        from_name: "claude".to_string(),
+        text: "To configure logging, set RUST_LOG=info in your environment.".to_string(),
+        envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4REPLY; reply with the xmsg reply tool\n\nTo configure logging, set RUST_LOG=info in your environment.".to_string(),
+    };
+    let deliv_outcome =
+        handle_inbox_delivery(&delivery, &config, &matrix, &store, &mut inbox, 2000)
+            .await
+            .unwrap();
+    assert_eq!(deliv_outcome, BotOutcome::Replied);
+    assert_eq!(inbox.acked, vec!["01M4REPLY"]);
 
     // Verify xmsg received the structured envelope
     let xmsg_calls = xmsg.sent_payloads.lock().unwrap();
@@ -327,7 +339,7 @@ async fn test_history_window_and_thread_isolation() {
     let outcome = handle_incoming_event(&event, &history, &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome, BotOutcome::Replied);
+    assert_eq!(outcome, BotOutcome::Forwarded);
 
     let xmsg_calls = xmsg.sent_payloads.lock().unwrap();
     let envelope = &xmsg_calls[0].2;
@@ -417,7 +429,7 @@ async fn test_rate_limit_refusal() {
         )
         .await
         .unwrap(),
-        BotOutcome::Replied
+        BotOutcome::Forwarded
     );
     assert_eq!(
         handle_incoming_event(
@@ -430,7 +442,7 @@ async fn test_rate_limit_refusal() {
         )
         .await
         .unwrap(),
-        BotOutcome::Replied
+        BotOutcome::Forwarded
     );
 
     // 3rd call within window fails with RateLimitRefusal
@@ -447,9 +459,9 @@ async fn test_rate_limit_refusal() {
     assert_eq!(outcome, BotOutcome::RateLimitRefusal);
 
     let notices = matrix.sent_notices.lock().unwrap();
-    assert_eq!(notices.len(), 3);
+    assert_eq!(notices.len(), 1);
     assert_eq!(
-        notices[2].body,
+        notices[0].body,
         "Rate limit exceeded. Please wait before asking another question."
     );
 }
@@ -492,15 +504,13 @@ async fn test_answer_timeout_escalation() {
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome, BotOutcome::TimedOutAndEscalated);
+    assert_eq!(outcome, BotOutcome::Forwarded);
 
-    // In-thread timeout notice
-    let notices = matrix.sent_notices.lock().unwrap();
-    assert_eq!(notices.len(), 1);
-    assert_eq!(
-        notices[0].body,
-        "The expert has not answered; a human has been notified."
-    );
+    // Timeout sweeper runs after answer_timeout_secs (30s)
+    let swept = sweep_answer_timeouts(&config, &matrix, &store, 100 + 35)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1);
 
     // Owner DM sent
     let dms = matrix.sent_dms.lock().unwrap();
@@ -516,7 +526,7 @@ async fn test_answer_timeout_escalation() {
 async fn test_expert_escalate_marker() {
     let config = test_config();
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::with_reply("I am unsure about this server configuration. [escalate]");
+    let xmsg = TestXmsgMock::with_reply("unused");
     let store = Store::new_in_memory().unwrap();
 
     let event = IncomingMatrixEvent {
@@ -536,7 +546,21 @@ async fn test_expert_escalate_marker() {
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome, BotOutcome::RepliedAndEscalated);
+    assert_eq!(outcome, BotOutcome::Forwarded);
+
+    // Feed delivery to inbox
+    let mut inbox = TestInboxMock::default();
+    let delivery = SvcDelivery {
+        message_id: "01M4ESC".to_string(),
+        from_name: "claude".to_string(),
+        text: "I am unsure about this server configuration. [escalate]".to_string(),
+        envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4ESC; reply with the xmsg reply tool\n\nI am unsure about this server configuration. [escalate]".to_string(),
+    };
+    let deliv_outcome =
+        handle_inbox_delivery(&delivery, &config, &matrix, &store, &mut inbox, 2000)
+            .await
+            .unwrap();
+    assert_eq!(deliv_outcome, BotOutcome::RepliedAndEscalated);
 
     // In-thread reply (with [escalate] stripped)
     let notices = matrix.sent_notices.lock().unwrap();

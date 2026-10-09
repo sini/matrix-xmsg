@@ -76,6 +76,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
+    let register_sock = config.xmsg_register_socket();
+    let svc_inbox = match matrix_xmsg::xmsg::register_svc(&register_sock, "matrix-xmsg").await {
+        Ok(inbox) => inbox,
+        Err(e) => {
+            error!(
+                "Failed to register on xmsg register.sock at {}: {e}",
+                register_sock.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    info!("Registered on xmsg as {}", svc_inbox.session_id());
+
     let xmsg_client = matrix_xmsg::xmsg::create_xmsg_client(&config);
 
     let tracker = matrix_xmsg::bot::register_event_handlers(
@@ -88,6 +101,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     let shutdown_tx_ctrl_c = shutdown_tx.clone();
+
+    let inbox_config = config.clone();
+    let inbox_matrix = matrix_client.clone();
+    let inbox_store = store.clone();
+    let inbox_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        if let Err(e) = matrix_xmsg::bot::run_inbox_loop(
+            svc_inbox,
+            inbox_config,
+            inbox_matrix,
+            inbox_store,
+            inbox_shutdown_rx,
+        )
+        .await
+        {
+            error!("Fatal inbox loop error: {e}");
+        }
+    });
 
     tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {

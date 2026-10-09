@@ -10,34 +10,25 @@ let
   cfg = config.services.matrix-xmsg;
 
   # Format config.toml matching matrix_xmsg::config::Config
-  configToml = (pkgs.formats.toml { }).generate "matrix-xmsg-config.toml" (
-    {
-      homeserver_url = cfg.homeserverUrl;
-      bot_mxid = cfg.botMxid;
-      # Systemd LoadCredential mounts the secret at /run/credentials/matrix-xmsg.service/access-token
-      access_token_file = "/run/credentials/matrix-xmsg.service/access-token";
-      rooms = cfg.rooms;
-      trusted_mxids = cfg.trustedMxids;
-      owner_mxid = cfg.ownerMxid;
-      expert_ref = cfg.expertRef;
-      history_n = cfg.historyN;
-      history_byte_cap = cfg.historyByteCap;
-      rate_limit_count = cfg.rateLimitCount;
-      rate_limit_window_secs = cfg.rateLimitWindowSecs;
-      size_cap_bytes = cfg.sizeCapBytes;
-      answer_timeout_secs = cfg.answerTimeoutSecs;
-      answer_deadline_secs = cfg.answerDeadlineSecs;
-      session_live_secs = cfg.sessionLiveSecs;
-      db_path = cfg.dbPath;
-    }
-    // lib.optionalAttrs (cfg.xmsgUrl != null) {
-      xmsg_url = cfg.xmsgUrl;
-    }
-    // lib.optionalAttrs (cfg.xmsgSocket != null) {
-      xmsg_url = "unix://${toString cfg.xmsgSocket}";
-      xmsg_socket = toString cfg.xmsgSocket;
-    }
-  );
+  configToml = (pkgs.formats.toml { }).generate "matrix-xmsg-config.toml" {
+    homeserver_url = cfg.homeserverUrl;
+    bot_mxid = cfg.botMxid;
+    # Systemd LoadCredential mounts the secret at /run/credentials/matrix-xmsg.service/access-token
+    access_token_file = "/run/credentials/matrix-xmsg.service/access-token";
+    rooms = cfg.rooms;
+    trusted_mxids = cfg.trustedMxids;
+    owner_mxid = cfg.ownerMxid;
+    xmsg_socket = toString cfg.xmsgSocket;
+    expert_ref = cfg.expertRef;
+    history_n = cfg.historyN;
+    history_byte_cap = cfg.historyByteCap;
+    rate_limit_count = cfg.rateLimitCount;
+    rate_limit_window_secs = cfg.rateLimitWindowSecs;
+    size_cap_bytes = cfg.sizeCapBytes;
+    answer_timeout_secs = cfg.answerTimeoutSecs;
+    session_live_secs = cfg.sessionLiveSecs;
+    db_path = cfg.dbPath;
+  };
 in
 {
   options.services.matrix-xmsg = {
@@ -101,22 +92,17 @@ in
       description = "Directory for matrix-xmsg persistent state and SQLite database.";
     };
 
-    xmsgUrl = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "http://127.0.0.1:7787";
-      description = "HTTP URL of the xmsg daemon bridge.";
-    };
-
     xmsgSocket = lib.mkOption {
-      type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
-      default = null;
-      example = "/run/user/1000/xmsg/http.sock";
+      type = lib.types.either lib.types.path lib.types.str;
+      default = "/run/user/1000/xmsg";
+      example = "/run/user/1000/xmsg";
       description = ''
-        Optional path to the xmsg agent Unix domain socket.
-        The socket's UID check requires that the bot run as the socket's owner.
-        Therefore, when xmsgSocket is configured, services.matrix-xmsg.dynamicUser
-        must be false, and services.matrix-xmsg.user must be configured to the socket's owning user.
+        Path to the xmsg runtime directory containing register.sock and agent.sock.
+        The bot connects to register.sock as svc:matrix-xmsg and sends forwards on agent.sock.
+        Because svc attests the peer UID, services.matrix-xmsg.dynamicUser must be false,
+        and services.matrix-xmsg.user must be configured to the runtime directory's owning user.
+        Note: The xmsg daemon instance must pass `--svc-exe matrix-xmsg=<this package's binary>`
+        to authorize the service registration.
       '';
     };
 
@@ -162,12 +148,6 @@ in
       description = "Timeout in seconds to wait for an expert reply before escalating.";
     };
 
-    answerDeadlineSecs = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 3600;
-      description = "Deadline in seconds to wait for late answers before giving up.";
-    };
-
     sessionLiveSecs = lib.mkOption {
       type = lib.types.ints.unsigned;
       default = 3600;
@@ -187,9 +167,9 @@ in
     };
 
     group = lib.mkOption {
-      type = lib.types.str;
-      default = "matrix-xmsg";
-      description = "Dedicated system group (used when dynamicUser is false).";
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Dedicated system group (used when dynamicUser is false). When null and user is matrix-xmsg, defaults to matrix-xmsg. For any other user, systemd uses the user's primary group unless explicitly set.";
     };
 
     dynamicUser = lib.mkOption {
@@ -209,27 +189,26 @@ in
         '';
       }
       {
-        assertion = (cfg.xmsgUrl != null) != (cfg.xmsgSocket != null);
-        message = "services.matrix-xmsg: exactly one of services.matrix-xmsg.xmsgUrl or services.matrix-xmsg.xmsgSocket must be set.";
-      }
-      {
-        assertion = cfg.xmsgSocket != null -> !cfg.dynamicUser;
+        assertion = !cfg.dynamicUser;
         message = "services.matrix-xmsg: when xmsgSocket is configured, dynamicUser must be false because the socket's UID check requires running as the socket's owner. Configure services.matrix-xmsg.user to the socket's owning user.";
       }
     ];
 
-    users.users = lib.mkIf (!cfg.dynamicUser) {
-      ${cfg.user} = {
+    users.users = lib.mkIf (!cfg.dynamicUser && cfg.user == "matrix-xmsg") {
+      matrix-xmsg = {
         isSystemUser = true;
-        group = cfg.group;
+        group = if cfg.group != null then cfg.group else "matrix-xmsg";
         description = "matrix-xmsg service daemon user";
         home = cfg.stateDir;
       };
     };
 
-    users.groups = lib.mkIf (!cfg.dynamicUser) {
-      ${cfg.group} = { };
-    };
+    users.groups =
+      lib.mkIf
+        (!cfg.dynamicUser && cfg.user == "matrix-xmsg" && (cfg.group == null || cfg.group == "matrix-xmsg"))
+        {
+          matrix-xmsg = { };
+        };
 
     systemd.services.matrix-xmsg = {
       description = "matrix-xmsg Matrix bot backed by xmsg agent";
@@ -244,7 +223,9 @@ in
         # User and Directory isolation
         DynamicUser = cfg.dynamicUser;
         User = lib.mkIf (!cfg.dynamicUser) cfg.user;
-        Group = lib.mkIf (!cfg.dynamicUser) cfg.group;
+        Group = lib.mkIf (!cfg.dynamicUser && (cfg.user == "matrix-xmsg" || cfg.group != null)) (
+          if cfg.group != null then cfg.group else "matrix-xmsg"
+        );
         StateDirectory = "matrix-xmsg";
         RuntimeDirectory = "matrix-xmsg";
         WorkingDirectory = cfg.stateDir;

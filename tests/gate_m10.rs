@@ -6,30 +6,19 @@ use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::store::Store;
 use matrix_xmsg::xmsg::{SendResponse, XmsgClient};
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+#[derive(Default)]
 struct TestXmsgMock {
-    canned_replies: Mutex<VecDeque<Result<String, AppError>>>,
     sent_payloads: Mutex<Vec<(String, String, String)>>,
     send_counter: AtomicUsize,
-    poll_calls: Mutex<Vec<(String, u64)>>,
 }
 
 impl TestXmsgMock {
-    fn new(replies: Vec<Result<String, AppError>>) -> Self {
-        Self {
-            canned_replies: Mutex::new(VecDeque::from(replies)),
-            sent_payloads: Mutex::new(Vec::new()),
-            send_counter: AtomicUsize::new(0),
-            poll_calls: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn with_reply(reply: &str) -> Self {
-        Self::new(vec![Ok(reply.to_string())])
+    fn with_reply(_reply: &str) -> Self {
+        Self::default()
     }
 }
 
@@ -46,23 +35,6 @@ impl XmsgClient for TestXmsgMock {
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(format!("01MOCKMSG{id_num:06}").into())
     }
-
-    async fn wait_for_reply(
-        &self,
-        message_id: &str,
-        timeout_secs: u64,
-    ) -> Result<String, AppError> {
-        self.poll_calls
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), timeout_secs));
-        let mut guard = self.canned_replies.lock().unwrap();
-        if let Some(res) = guard.pop_front() {
-            res
-        } else {
-            Err(AppError::Timeout(timeout_secs))
-        }
-    }
 }
 
 fn test_config() -> Config {
@@ -77,8 +49,7 @@ fn test_config() -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:7787".to_string(),
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -86,7 +57,6 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 1024,
         answer_timeout_secs: 10,
-        answer_deadline_secs: 60,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
@@ -167,7 +137,7 @@ async fn oracle_1_typo_fix_edit_triggers_once_with_edited_text() {
     let edit_outcome = handle_incoming_event(&edit_event, &[], &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(edit_outcome, BotOutcome::Replied);
+    assert_eq!(edit_outcome, BotOutcome::Forwarded);
 
     let sent = xmsg.sent_payloads.lock().unwrap();
     assert_eq!(sent.len(), 1, "Must be relayed exactly once");
@@ -222,7 +192,7 @@ async fn oracle_2_edit_to_already_relayed_event_is_ignored() {
     let orig_outcome = handle_incoming_event(&orig_event, &[], &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(orig_outcome, BotOutcome::Replied);
+    assert_eq!(orig_outcome, BotOutcome::Forwarded);
     assert_eq!(xmsg.sent_payloads.lock().unwrap().len(), 1);
 
     // Clear sent payloads to observe edit outcome cleanly
@@ -263,10 +233,7 @@ async fn oracle_2_edit_to_already_relayed_event_is_ignored() {
 async fn oracle_3_two_successive_mention_edits_relayed_exactly_once() {
     let config = test_config();
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::new(vec![
-        Ok("Reply to first edit".to_string()),
-        Ok("Reply to second edit".to_string()),
-    ]);
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     let orig_msg = EventMessage {
@@ -323,7 +290,7 @@ async fn oracle_3_two_successive_mention_edits_relayed_exactly_once() {
     let outcome_1 = handle_incoming_event(&edit_1, &[], &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome_1, BotOutcome::Replied);
+    assert_eq!(outcome_1, BotOutcome::Forwarded);
 
     // 3. Second edit: also mentions bot
     let edit_2 = IncomingMatrixEvent {
@@ -537,7 +504,7 @@ async fn oracle_6_original_event_fetched_from_matrix_when_not_in_store() {
     let edit_outcome = handle_incoming_event(&edit_event, &[], &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(edit_outcome, BotOutcome::Replied);
+    assert_eq!(edit_outcome, BotOutcome::Forwarded);
     assert_eq!(xmsg.sent_payloads.lock().unwrap().len(), 1);
 }
 

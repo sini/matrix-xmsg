@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn default_xmsg_url() -> String {
-    "http://127.0.0.1:7787".to_string()
+fn default_xmsg_socket() -> PathBuf {
+    PathBuf::from("/run/user/1000/xmsg")
 }
 
 fn default_expert_ref() -> String {
@@ -35,10 +35,6 @@ fn default_answer_timeout_secs() -> u64 {
     300
 }
 
-fn default_answer_deadline_secs() -> u64 {
-    3600
-}
-
 fn default_session_live_secs() -> u64 {
     3600
 }
@@ -55,12 +51,6 @@ pub enum Admission {
     Public,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum XmsgEndpoint {
-    Tcp(String),
-    Unix(PathBuf),
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub homeserver_url: String,
@@ -73,11 +63,8 @@ pub struct Config {
     #[serde(default)]
     pub admission: Admission,
 
-    #[serde(default = "default_xmsg_url")]
-    pub xmsg_url: String,
-
-    #[serde(default)]
-    pub xmsg_socket: Option<PathBuf>,
+    #[serde(default = "default_xmsg_socket")]
+    pub xmsg_socket: PathBuf,
 
     #[serde(default = "default_expert_ref")]
     pub expert_ref: String,
@@ -99,9 +86,6 @@ pub struct Config {
 
     #[serde(default = "default_answer_timeout_secs")]
     pub answer_timeout_secs: u64,
-
-    #[serde(default = "default_answer_deadline_secs")]
-    pub answer_deadline_secs: u64,
 
     #[serde(default = "default_session_live_secs")]
     pub session_live_secs: u64,
@@ -144,14 +128,12 @@ impl Config {
         self.owner_mxid == user_mxid || self.trusted_mxids.iter().any(|u| u == user_mxid)
     }
 
-    pub fn xmsg_endpoint(&self) -> XmsgEndpoint {
-        if let Some(ref sock) = self.xmsg_socket {
-            XmsgEndpoint::Unix(sock.clone())
-        } else if let Some(path) = self.xmsg_url.strip_prefix("unix://") {
-            XmsgEndpoint::Unix(PathBuf::from(path))
-        } else {
-            XmsgEndpoint::Tcp(self.xmsg_url.clone())
-        }
+    pub fn xmsg_register_socket(&self) -> PathBuf {
+        self.xmsg_socket.join("register.sock")
+    }
+
+    pub fn xmsg_agent_socket(&self) -> PathBuf {
+        self.xmsg_socket.join("agent.sock")
     }
 }
 
@@ -214,14 +196,19 @@ mod tests {
             owner_mxid = "@owner:example.org"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.xmsg_socket, PathBuf::from("/run/user/1000/xmsg"));
         assert_eq!(
-            cfg.xmsg_endpoint(),
-            XmsgEndpoint::Tcp("http://127.0.0.1:7787".to_string())
+            cfg.xmsg_register_socket(),
+            PathBuf::from("/run/user/1000/xmsg/register.sock")
+        );
+        assert_eq!(
+            cfg.xmsg_agent_socket(),
+            PathBuf::from("/run/user/1000/xmsg/agent.sock")
         );
     }
 
     #[test]
-    fn test_xmsg_endpoint_unix_url() {
+    fn test_xmsg_socket_custom() {
         let toml_str = r#"
             homeserver_url = "https://matrix.example.org"
             bot_mxid = "@genie:example.org"
@@ -229,45 +216,18 @@ mod tests {
             rooms = ["!room:example.org"]
             trusted_mxids = []
             owner_mxid = "@owner:example.org"
-            xmsg_url = "unix:///run/user/1000/xmsg/http.sock"
+            xmsg_socket = "/tmp/test-xmsg"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.xmsg_socket, PathBuf::from("/tmp/test-xmsg"));
         assert_eq!(
-            cfg.xmsg_endpoint(),
-            XmsgEndpoint::Unix(PathBuf::from("/run/user/1000/xmsg/http.sock"))
+            cfg.xmsg_register_socket(),
+            PathBuf::from("/tmp/test-xmsg/register.sock")
         );
-    }
-
-    #[test]
-    fn test_xmsg_endpoint_xmsg_socket() {
-        let toml_str = r#"
-            homeserver_url = "https://matrix.example.org"
-            bot_mxid = "@genie:example.org"
-            access_token_file = "/tmp/token"
-            rooms = ["!room:example.org"]
-            trusted_mxids = []
-            owner_mxid = "@owner:example.org"
-            xmsg_socket = "/run/user/1000/xmsg/http.sock"
-        "#;
-        let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(
-            cfg.xmsg_endpoint(),
-            XmsgEndpoint::Unix(PathBuf::from("/run/user/1000/xmsg/http.sock"))
+            cfg.xmsg_agent_socket(),
+            PathBuf::from("/tmp/test-xmsg/agent.sock")
         );
-    }
-
-    #[test]
-    fn test_answer_deadline_default() {
-        let toml_str = r#"
-            homeserver_url = "https://matrix.example.org"
-            bot_mxid = "@genie:example.org"
-            access_token_file = "/tmp/token"
-            rooms = ["!room:example.org"]
-            trusted_mxids = []
-            owner_mxid = "@owner:example.org"
-        "#;
-        let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.answer_deadline_secs, 3600);
     }
 
     #[test]

@@ -15,25 +15,22 @@ use wiremock::matchers::{method, path, path_regex, query_param, query_param_is_m
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 struct TestXmsgMock {
-    canned_reply: Mutex<Result<String, AppError>>,
     sent_payloads: Mutex<Vec<(String, String, String)>>,
     send_counter: AtomicUsize,
     delay: Duration,
 }
 
 impl TestXmsgMock {
-    fn with_reply(reply: &str) -> Self {
+    fn with_reply(_reply: &str) -> Self {
         Self {
-            canned_reply: Mutex::new(Ok(reply.to_string())),
             sent_payloads: Mutex::new(Vec::new()),
             send_counter: AtomicUsize::new(0),
             delay: Duration::from_millis(0),
         }
     }
 
-    fn with_timeout(timeout_secs: u64) -> Self {
+    fn with_timeout(_timeout_secs: u64) -> Self {
         Self {
-            canned_reply: Mutex::new(Err(AppError::Timeout(timeout_secs))),
             sent_payloads: Mutex::new(Vec::new()),
             send_counter: AtomicUsize::new(0),
             delay: Duration::from_millis(0),
@@ -42,7 +39,6 @@ impl TestXmsgMock {
 
     fn with_delay(delay: Duration) -> Self {
         Self {
-            canned_reply: Mutex::new(Ok("delayed_answer".to_string())),
             sent_payloads: Mutex::new(Vec::new()),
             send_counter: AtomicUsize::new(0),
             delay,
@@ -58,26 +54,33 @@ impl XmsgClient for TestXmsgMock {
         from: &str,
         text: &str,
     ) -> Result<SendResponse, AppError> {
+        if self.delay > Duration::from_millis(0) {
+            tokio::time::sleep(self.delay).await;
+        }
         let mut list = self.sent_payloads.lock().unwrap();
         list.push((expert_ref.to_string(), from.to_string(), text.to_string()));
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(format!("01MOCKMSG{id_num:06}").into())
     }
+}
 
-    async fn wait_for_reply(
-        &self,
-        _message_id: &str,
-        _timeout_secs: u64,
-    ) -> Result<String, AppError> {
-        if self.delay > Duration::from_millis(0) {
-            tokio::time::sleep(self.delay).await;
-        }
-        let guard = self.canned_reply.lock().unwrap();
-        match &*guard {
-            Ok(s) => Ok(s.clone()),
-            Err(AppError::Timeout(t)) => Err(AppError::Timeout(*t)),
-            Err(e) => Err(AppError::Xmsg(e.to_string())),
-        }
+#[derive(Default)]
+struct TestInboxMock {
+    acked: Vec<String>,
+}
+
+#[async_trait]
+impl matrix_xmsg::xmsg::SvcInbox for TestInboxMock {
+    async fn poll(
+        &mut self,
+        _wait_secs: u64,
+    ) -> Result<Option<matrix_xmsg::xmsg::SvcDelivery>, AppError> {
+        Ok(None)
+    }
+
+    async fn ack(&mut self, message_id: &str) -> Result<(), AppError> {
+        self.acked.push(message_id.to_string());
+        Ok(())
     }
 }
 
@@ -93,8 +96,7 @@ fn test_config(homeserver_url: &str) -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: matrix_xmsg::config::Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:7787".to_string(),
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -102,7 +104,6 @@ fn test_config(homeserver_url: &str) -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 2048,
         answer_timeout_secs: 10,
-        answer_deadline_secs: 3600,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
@@ -302,24 +303,45 @@ async fn test_sdk_full_sync_and_threaded_reply_loop() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let sent = xmsg.sent_payloads.lock().unwrap();
-    assert_eq!(
-        sent.len(),
-        1,
-        "xmsg must receive exactly 1 message for the live event"
-    );
-    let (expert_ref, from, text) = &sent[0];
-    assert_eq!(expert_ref, "claude");
-    assert_eq!(from, "matrix alice at example.org");
-    assert!(text.contains("<request>"));
-    assert!(text.contains("can you explain the cluster architecture?"));
-    assert!(text.contains("<context"));
-    assert!(text.contains("System upgraded yesterday."));
+    {
+        let sent = xmsg.sent_payloads.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            1,
+            "xmsg must receive exactly 1 message for the live event"
+        );
+        let (expert_ref, from, text) = &sent[0];
+        assert_eq!(expert_ref, "claude");
+        assert_eq!(from, "matrix alice at example.org");
+        assert!(text.contains("<request>"));
+        assert!(text.contains("can you explain the cluster architecture?"));
+        assert!(text.contains("<context"));
+        assert!(text.contains("System upgraded yesterday."));
+    }
 
     // Verify thread mapping recorded in SQLite store
     let mapped = store.get_thread_messages(trigger_event_id).unwrap();
     assert_eq!(mapped.len(), 1);
     assert_eq!(mapped[0], "01MOCKMSG000001");
+
+    // Simulate inbox delivery (M13 inbox loop reply path)
+    let delivery = matrix_xmsg::xmsg::SvcDelivery {
+        message_id: "01DELIVERY001".to_string(),
+        envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01DELIVERY001; reply with the xmsg reply tool\n\nThe cluster runs k3s with Cilium and Envoy Gateway.".to_string(),
+        text: "The cluster runs k3s with Cilium and Envoy Gateway.".to_string(),
+        from_name: "claude".to_string(),
+    };
+    let mut inbox = TestInboxMock::default();
+    matrix_xmsg::bot::handle_inbox_delivery(
+        &delivery,
+        &config,
+        sdk_client.as_ref(),
+        &store,
+        &mut inbox,
+        live_ts() / 1000 + 10,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -557,7 +579,7 @@ async fn test_sdk_answer_timeout_escalation() {
         .mount(&mock_server)
         .await;
 
-    // Mock notice to room ("expert has not answered...") + DM to owner
+    // Mock DM to owner (M13 sends owner DM on timeout sweep)
     Mock::given(method("PUT"))
         .and(path_regex(
             r"^/_matrix/client/v3/rooms/.*/send/m\.room\.message/.*$",
@@ -565,7 +587,7 @@ async fn test_sdk_answer_timeout_escalation() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "event_id": "$sent_ev"
         })))
-        .expect(2)
+        .expect(1)
         .mount(&mock_server)
         .await;
 
@@ -593,6 +615,17 @@ async fn test_sdk_answer_timeout_escalation() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Simulate timeout sweep (M13 answer_timeout_secs sweep)
+    let swept = matrix_xmsg::bot::sweep_answer_timeouts(
+        &config,
+        sdk_client.as_ref(),
+        &store,
+        live_ts() / 1000 + 100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(swept, 1, "Must sweep 1 timed out message");
 }
 
 // P1: Backlog prevention & restart replay prevention (F1)
@@ -945,6 +978,25 @@ async fn test_p4_reply_body_is_threaded_and_mentions_asker() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Simulate inbox delivery (M13 inbox loop reply path)
+    let delivery = matrix_xmsg::xmsg::SvcDelivery {
+        message_id: "01DELIVERY002".to_string(),
+        envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01DELIVERY002; reply with the xmsg reply tool\n\nanswer".to_string(),
+        text: "answer".to_string(),
+        from_name: "claude".to_string(),
+    };
+    let mut inbox = TestInboxMock::default();
+    matrix_xmsg::bot::handle_inbox_delivery(
+        &delivery,
+        &config,
+        client.as_ref(),
+        &store,
+        &mut inbox,
+        live_ts() / 1000 + 10,
+    )
+    .await
+    .unwrap();
+
     let reqs = mock_server.received_requests().await.unwrap();
     let puts: Vec<serde_json::Value> = reqs
         .iter()
@@ -1204,7 +1256,7 @@ async fn test_n1_shutdown_drains_inflight_questions() {
 
     Mock::given(method("PUT"))
         .and(path_regex(
-            r"^/_matrix/client/v3/rooms/.*/send/m\.room\.message/.*$",
+            r"^/_matrix/client/v3/rooms/.*/send/m\.reaction/.*$",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$resp_1"})))
         .expect(1)
@@ -2002,7 +2054,7 @@ async fn test_n1_double_post() {
             .await
             .unwrap(),
     );
-    let xmsg = Arc::new(TestXmsgMock::with_reply("THE-EXPERT-ANSWER"));
+    let xmsg = Arc::new(TestXmsgMock::with_delay(Duration::from_millis(400)));
 
     let tracker = register_event_handlers(
         sdk.inner(),

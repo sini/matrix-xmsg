@@ -6,36 +6,24 @@ use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::store::Store;
 use matrix_xmsg::xmsg::{SendResponse, XmsgClient};
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+#[derive(Default)]
 struct TestXmsgMock {
-    canned_replies: Mutex<VecDeque<Result<String, AppError>>>,
     sent_payloads: Mutex<Vec<(String, String, String)>>,
     send_counter: AtomicUsize,
-    poll_calls: Mutex<Vec<(String, u64)>>,
     send_error: Mutex<Option<String>>,
 }
 
 impl TestXmsgMock {
-    fn new(replies: Vec<Result<String, AppError>>) -> Self {
-        Self {
-            canned_replies: Mutex::new(VecDeque::from(replies)),
-            sent_payloads: Mutex::new(Vec::new()),
-            send_counter: AtomicUsize::new(0),
-            poll_calls: Mutex::new(Vec::new()),
-            send_error: Mutex::new(None),
-        }
-    }
-
-    fn with_reply(reply: &str) -> Self {
-        Self::new(vec![Ok(reply.to_string())])
+    fn with_reply(_reply: &str) -> Self {
+        Self::default()
     }
 
     fn with_send_error(err: &str) -> Self {
-        let mock = Self::new(vec![]);
+        let mock = Self::default();
         *mock.send_error.lock().unwrap() = Some(err.to_string());
         mock
     }
@@ -57,23 +45,6 @@ impl XmsgClient for TestXmsgMock {
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(format!("01MOCKMSG{id_num:06}").into())
     }
-
-    async fn wait_for_reply(
-        &self,
-        message_id: &str,
-        timeout_secs: u64,
-    ) -> Result<String, AppError> {
-        self.poll_calls
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), timeout_secs));
-        let mut guard = self.canned_replies.lock().unwrap();
-        if let Some(res) = guard.pop_front() {
-            res
-        } else {
-            Err(AppError::Timeout(timeout_secs))
-        }
-    }
 }
 
 fn test_config() -> Config {
@@ -88,8 +59,7 @@ fn test_config() -> Config {
         ],
         owner_mxid: "@owner:example.org".to_string(),
         admission: Admission::Trusted,
-        xmsg_url: "http://127.0.0.1:7787".to_string(),
-        xmsg_socket: None,
+        xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         history_n: 5,
         history_byte_cap: 1024,
@@ -97,7 +67,6 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 1024,
         answer_timeout_secs: 10,
-        answer_deadline_secs: 60,
         session_live_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
@@ -163,7 +132,7 @@ async fn oracle_1_first_mention_in_existing_thread_bootstraps_with_room_and_thre
     let outcome = handle_incoming_event(&event, &history, &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome, BotOutcome::Replied);
+    assert_eq!(outcome, BotOutcome::Forwarded);
 
     let payloads = xmsg.sent_payloads.lock().unwrap();
     assert_eq!(payloads.len(), 1);
@@ -195,10 +164,7 @@ async fn oracle_1_first_mention_in_existing_thread_bootstraps_with_room_and_thre
 async fn oracle_2_second_forward_within_live_window_is_delta_with_bystander_and_no_room_block() {
     let config = test_config();
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::new(vec![
-        Ok("First answer".to_string()),
-        Ok("Second answer".to_string()),
-    ]);
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     let mut history = vec![
@@ -243,7 +209,7 @@ async fn oracle_2_second_forward_within_live_window_is_delta_with_bystander_and_
     let outcome1 = handle_incoming_event(&event1, &history, &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome1, BotOutcome::Replied);
+    assert_eq!(outcome1, BotOutcome::Forwarded);
 
     // Bystander message in thread at t=4500 (between forwards)
     history.push(EventMessage {
@@ -279,7 +245,7 @@ async fn oracle_2_second_forward_within_live_window_is_delta_with_bystander_and_
     let outcome2 = handle_incoming_event(&event2, &history, &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome2, BotOutcome::Replied);
+    assert_eq!(outcome2, BotOutcome::Forwarded);
 
     let payloads = xmsg.sent_payloads.lock().unwrap();
     assert_eq!(payloads.len(), 2);
@@ -319,10 +285,7 @@ async fn oracle_3_forward_after_session_live_secs_rebootstraps() {
     config.session_live_secs = 3600;
 
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::new(vec![
-        Ok("First answer".to_string()),
-        Ok("Second answer".to_string()),
-    ]);
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     let history = vec![
@@ -680,7 +643,7 @@ async fn oracle_8_thread_with_public_history_delta_has_no_thread_tier_header() {
     let mut config = test_config();
     config.admission = Admission::Public;
     let matrix = MockMatrixClient::default();
-    let xmsg = TestXmsgMock::new(vec![Ok("Answer 1".to_string()), Ok("Answer 2".to_string())]);
+    let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
     // Earlier public line in thread history
@@ -710,7 +673,7 @@ async fn oracle_8_thread_with_public_history_delta_has_no_thread_tier_header() {
     let outcome1 = handle_incoming_event(&event1, &history, &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome1, BotOutcome::Replied);
+    assert_eq!(outcome1, BotOutcome::Forwarded);
 
     // Update history to include trig_1
     history.push(EventMessage {
@@ -739,7 +702,7 @@ async fn oracle_8_thread_with_public_history_delta_has_no_thread_tier_header() {
     let outcome2 = handle_incoming_event(&event2, &history, &config, &matrix, &xmsg, &store)
         .await
         .unwrap();
-    assert_eq!(outcome2, BotOutcome::Replied);
+    assert_eq!(outcome2, BotOutcome::Forwarded);
 
     let sent = xmsg.sent_payloads.lock().unwrap();
     assert_eq!(sent.len(), 2);
