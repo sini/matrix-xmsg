@@ -9,10 +9,13 @@
 ### 1.1 Admission Policy & Silence Rule
 
 - **Public Room Posture:** Anyone may join and post in the room.
-- **Mention Trigger:** The bot acts **only** on messages that `@`-mention it (via `m.mentions.user_ids`, Matrix pills, or plain text) or in-thread control triggers.
+- **Mention Trigger & Engaged Threads (M8):**
+  - Top-level messages require an explicit `@`-mention (via `m.mentions.user_ids`, Matrix pills, or plain text) or in-thread control triggers (`!deeper`, `!escalate`).
+  - An **engaged thread** is one whose root has a recorded asker or a bot message. Any admitted message in an engaged thread passes the mention gate without requiring a mention.
+  - The envelope marks whether the trigger line addressed the bot (`addressed: true|false`). For unaddressed follow messages (`addressed: false`), a missing expert reply posts nothing (no timeout notice, no DM); addressed messages preserve existing timeout escalation notices.
 - **Admission Modes:**
-  - `trusted` (default): Mentions from non-allowlisted senders are dropped **silently**. The bot never responds or sends an error notice, preventing oracle attacks where attackers probe for valid allowlisted usernames.
-  - `public`: Any room member's top-level question is relayed to the expert session.
+  - `trusted` (default): Messages from non-allowlisted senders are dropped **silently**. The bot never responds or sends an error notice, preventing oracle attacks where attackers probe for valid allowlisted usernames.
+  - `public`: Any room member's top-level question is relayed to the expert session; in engaged threads, the original thread asker and trusted senders are admitted, while bystanders are silently ignored.
 
 ### 1.2 Interaction Controls & Authorization (M5a)
 

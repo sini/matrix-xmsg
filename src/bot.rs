@@ -18,6 +18,7 @@ pub enum BotOutcome {
     Replied,
     RepliedAndEscalated,
     TimedOutAndEscalated,
+    TimedOutSilent,
     AbortedByRestart,
     ControlEmitted,
     ControlDebounced,
@@ -185,7 +186,8 @@ pub async fn handle_incoming_event_with_claim(
         return Ok(BotOutcome::IgnoredRoom);
     }
 
-    // 2. Mention / Command Gate: Drop silently if not mentioned and not !escalate / !deeper in a thread
+    // 2. Mention / Command Gate: Drop silently if not mentioned and not !escalate / !deeper in a thread,
+    // unless in an engaged thread.
     let is_thread_escalate = event.thread_root_id.is_some() && event.body.trim() == "!escalate";
     let is_thread_deeper = event.thread_root_id.is_some() && event.body.trim() == "!deeper";
     let is_mentioned = is_bot_mentioned(
@@ -194,8 +196,15 @@ pub async fn handle_incoming_event_with_claim(
         event.mentions.as_deref(),
         &config.bot_mxid,
     );
+    let is_addressed = is_mentioned || is_thread_escalate || is_thread_deeper;
 
-    if !is_thread_escalate && !is_thread_deeper && !is_mentioned {
+    let is_engaged_thread = if let Some(ref root) = event.thread_root_id {
+        store.is_thread_engaged(root)?
+    } else {
+        false
+    };
+
+    if !is_addressed && !is_engaged_thread {
         return Ok(BotOutcome::IgnoredNoMention);
     }
 
@@ -331,6 +340,7 @@ pub async fn handle_incoming_event_with_claim(
         Some(&config.owner_mxid),
         config.history_n,
         config.history_byte_cap,
+        is_addressed,
     );
 
     // 8. Send to xmsg Expert Inbox
@@ -395,6 +405,9 @@ pub async fn handle_incoming_event_with_claim(
             }
         }
         Err(AppError::Timeout(_)) => {
+            if !is_addressed {
+                return Ok(BotOutcome::TimedOutSilent);
+            }
             // R2: Atomic claim before posting timeout notice
             if let Some(flag) = claimed {
                 if flag

@@ -340,6 +340,20 @@ impl Store {
         }
     }
 
+    /// Returns true if the thread is engaged (has a recorded asker or bot message).
+    pub fn is_thread_engaged(&self, thread_root_id: &str) -> Result<bool, AppError> {
+        if self.get_thread_asker(thread_root_id)?.is_some() {
+            return Ok(true);
+        }
+        if self
+            .get_latest_bot_message_in_thread(thread_root_id)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Records a control event if it has not already been recorded for this (message_id, user_mxid, control).
     /// Returns Ok(true) if newly inserted, or Ok(false) if debounced (duplicate).
     pub fn record_control_if_new(

@@ -144,6 +144,7 @@ fn oracle_1_per_line_tier_tags() {
         Some("@owner:example.org"),
         10,
         4096,
+        true,
     );
 
     let req_lines = parse_relayed_lines(&envelope, "request");
@@ -198,6 +199,7 @@ fn oracle_2_thread_tier_mixed() {
         Some("@owner:example.org"),
         10,
         4096,
+        true,
     );
 
     let first_line = envelope.lines().next().unwrap_or("");
@@ -235,6 +237,7 @@ fn oracle_3_text_tier_injection_neutralized() {
         Some("@owner:example.org"),
         10,
         4096,
+        true,
     );
 
     let req_lines = parse_relayed_lines(&envelope, "request");

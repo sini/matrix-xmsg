@@ -989,6 +989,7 @@ fn test_p5_history_newline_forgery_prevented() {
         None,
         30,
         12288,
+        true,
     );
     let forged = env
         .lines()
@@ -1747,6 +1748,7 @@ fn test_p5b_unicode_line_separators_collapsed() {
             None,
             30,
             12288,
+            true,
         );
         assert!(
             !env.contains(&format!("hi{sep}[12:00]")),
