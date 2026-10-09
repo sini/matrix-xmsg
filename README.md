@@ -19,6 +19,15 @@
 - **Admission Modes:**
   - `trusted` (default): Messages from non-allowlisted senders are dropped **silently**. The bot never responds or sends an error notice, preventing oracle attacks where attackers probe for valid allowlisted usernames.
   - `public`: Any room member's top-level question is relayed to the expert session; in engaged threads, the original thread asker and trusted senders are admitted, while bystanders are silently ignored.
+- **Edit Mentions & De-duplication (M10, F3):**
+  - Edits (`m.replace`) are ignored by default (F3) to prevent re-triggering questions that have already been answered or relayed.
+  - An edit is handled as a trigger iff:
+    1. Its replacement content (`m.new_content`) mentions the bot (`is_bot_mentioned`),
+    2. The original event did not mention the bot, and
+    3. The original event ID has never been relayed (claims are keyed on the original event ID, not the edit's).
+  - The replacement content is evaluated against all standard gates (room allowlist, admission where the edit sender must match the original sender, size cap, rate limit, and backlog cutoff on the edit's own timestamp).
+  - Thread placement, context history, and the relay acknowledgement reaction (👀) attach to the original event ID.
+  - If the original event is not in the bot's store/history, it is fetched via the Matrix client; if it cannot be read, the edit is dropped (fail closed) and logged at debug.
 
 ### 1.2 Interaction Controls & Authorization (M5a)
 

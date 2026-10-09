@@ -183,6 +183,7 @@ async fn oracle_1_control_authorization() {
         mentions: None,
         timestamp_ms: 4000,
         thread_root_id: Some(thread_id.to_string()),
+        replaces_event_id: None,
     };
     let outcome = handle_incoming_event(&deeper_stranger, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -349,6 +350,7 @@ async fn oracle_5_admission_policy() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 1000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     // 5A. Under default admission (trusted): 0 relays

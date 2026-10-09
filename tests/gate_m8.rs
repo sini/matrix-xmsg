@@ -144,6 +144,7 @@ async fn oracle_1_engaged_thread_unmentioned_asker_forwarded_unaddressed() {
         mentions: None,
         timestamp_ms: 10000,
         thread_root_id: Some(thread_root.to_string()),
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
@@ -188,6 +189,7 @@ async fn oracle_2_non_engaged_thread_and_top_level_unmentioned_dropped() {
         mentions: None,
         timestamp_ms: 10000,
         thread_root_id: Some("$thread_root_unengaged".to_string()),
+        replaces_event_id: None,
     };
     let outcome1 = handle_incoming_event(&unengaged_event, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -212,6 +214,7 @@ async fn oracle_2_non_engaged_thread_and_top_level_unmentioned_dropped() {
         mentions: None,
         timestamp_ms: 11000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
     let outcome2 = handle_incoming_event(&toplevel_event, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -258,6 +261,7 @@ async fn oracle_3_engaged_thread_public_admission_bystander_refused() {
         mentions: None,
         timestamp_ms: 12000,
         thread_root_id: Some(thread_root.to_string()),
+        replaces_event_id: None,
     };
     let outcome_bystander =
         handle_incoming_event(&bystander_event, &[], &config, &matrix, &xmsg, &store)
@@ -284,6 +288,7 @@ async fn oracle_3_engaged_thread_public_admission_bystander_refused() {
         mentions: None,
         timestamp_ms: 13000,
         thread_root_id: Some(thread_root.to_string()),
+        replaces_event_id: None,
     };
     let outcome_trusted =
         handle_incoming_event(&trusted_event, &[], &config, &matrix, &xmsg, &store)
@@ -330,6 +335,7 @@ async fn oracle_4_unaddressed_timeout_silent_addressed_escalates() {
         mentions: None,
         timestamp_ms: 14000,
         thread_root_id: Some(thread_root.to_string()),
+        replaces_event_id: None,
     };
 
     let outcome_unaddressed = handle_incoming_event(
@@ -368,6 +374,7 @@ async fn oracle_4_unaddressed_timeout_silent_addressed_escalates() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 15000,
         thread_root_id: Some(thread_root.to_string()),
+        replaces_event_id: None,
     };
 
     let outcome_addressed = handle_incoming_event(
@@ -424,6 +431,7 @@ async fn oracle_5_mention_in_engaged_thread_yields_addressed_true() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 16000,
         thread_root_id: Some(thread_root.to_string()),
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)

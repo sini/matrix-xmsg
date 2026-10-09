@@ -102,6 +102,10 @@ impl Store {
                 control TEXT NOT NULL,
                 timestamp INTEGER NOT NULL,
                 PRIMARY KEY (message_id, user_mxid, control)
+            );
+            CREATE TABLE IF NOT EXISTS relayed_events (
+                event_id TEXT PRIMARY KEY,
+                timestamp INTEGER NOT NULL
             );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
@@ -380,6 +384,53 @@ impl Store {
         .map_err(|e| AppError::Store(format!("Failed to record control event: {e}")))?;
         Ok(true)
     }
+
+    /// Checks whether an event ID has already been relayed.
+    pub fn is_event_relayed(&self, event_id: &str) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT 1 FROM relayed_events WHERE event_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let exists = stmt
+            .exists(params![event_id])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(exists)
+    }
+
+    /// Records an event ID as relayed.
+    pub fn record_event_relayed(&self, event_id: &str, now: i64) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO relayed_events (event_id, timestamp) VALUES (?1, ?2)",
+            params![event_id, now],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Returns the count of rows across all tables in the store.
+    pub fn total_row_count(&self) -> Result<usize, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let tables = [
+            "threads",
+            "rate_limits",
+            "bot_meta",
+            "dm_rooms",
+            "thread_askers",
+            "bot_messages",
+            "control_events",
+            "relayed_events",
+        ];
+        let mut total = 0;
+        for table in tables {
+            let query = format!("SELECT COUNT(*) FROM {}", table);
+            let count: usize = conn
+                .query_row(&query, [], |row| row.get(0))
+                .map_err(|e| AppError::Store(e.to_string()))?;
+            total += count;
+        }
+        Ok(total)
+    }
 }
 
 #[cfg(test)]
@@ -469,5 +520,27 @@ mod tests {
         let _store = Store::new(&db_path).unwrap();
         let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "Created SQLite database must have 0600 mode");
+    }
+
+    #[test]
+    fn test_relayed_events_tracking() {
+        let store = Store::new_in_memory().unwrap();
+        assert!(!store.is_event_relayed("$ev_1").unwrap());
+
+        store.record_event_relayed("$ev_1", 1000).unwrap();
+        assert!(store.is_event_relayed("$ev_1").unwrap());
+
+        // Repeated record is idempotent
+        store.record_event_relayed("$ev_1", 2000).unwrap();
+        assert!(store.is_event_relayed("$ev_1").unwrap());
+        assert!(!store.is_event_relayed("$ev_2").unwrap());
+    }
+
+    #[test]
+    fn test_total_row_count() {
+        let store = Store::new_in_memory().unwrap();
+        assert_eq!(store.total_row_count().unwrap(), 0);
+        store.record_event_relayed("$ev_1", 1000).unwrap();
+        assert_eq!(store.total_row_count().unwrap(), 1);
     }
 }

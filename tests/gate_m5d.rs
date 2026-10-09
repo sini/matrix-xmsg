@@ -274,6 +274,7 @@ async fn oracle_4_public_admission_header_and_thread_tier() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 4000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&stranger_msg, &[], &config, &matrix, &xmsg, &store)

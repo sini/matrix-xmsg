@@ -41,6 +41,15 @@ pub trait MatrixClient: Send + Sync {
         reason: Option<&str>,
     ) -> Result<(), AppError>;
 
+    /// Fetches a single event by ID in a room.
+    async fn fetch_event(
+        &self,
+        _room_id: &str,
+        _event_id: &str,
+    ) -> Result<Option<EventMessage>, AppError> {
+        Ok(None)
+    }
+
     /// Attaches the SQLite Store for DM room caching and state persistence.
     fn set_store(&self, _store: std::sync::Arc<crate::store::Store>) {}
 }
@@ -406,6 +415,43 @@ impl MatrixClient for MatrixSdkClient {
         Ok(())
     }
 
+    async fn fetch_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<EventMessage>, AppError> {
+        use matrix_sdk::ruma::{EventId, RoomId};
+
+        let r_id = <&RoomId>::try_from(room_id)
+            .map_err(|e| AppError::Matrix(format!("Invalid room ID '{room_id}': {e}")))?;
+        let e_id = <&EventId>::try_from(event_id)
+            .map_err(|e| AppError::Matrix(format!("Invalid event ID '{event_id}': {e}")))?;
+
+        let room = match self.client.get_room(r_id) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        match room.event(e_id, None).await {
+            Ok(timeline_event) => {
+                if let Ok(sync_event) = timeline_event.raw().deserialize() {
+                    Ok(parse_timeline_event(sync_event))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to fetch event {} in room {}: {}",
+                    event_id,
+                    room_id,
+                    e
+                );
+                Ok(None)
+            }
+        }
+    }
+
     fn set_store(&self, store: std::sync::Arc<crate::store::Store>) {
         self.set_store(store);
     }
@@ -559,6 +605,7 @@ pub struct MockMatrixClient {
     pub sent_reactions: Mutex<Vec<SentReaction>>,
     pub redacted_events: Mutex<Vec<RedactedEvent>>,
     pub canned_history: Mutex<Vec<EventMessage>>,
+    pub canned_events: Mutex<std::collections::HashMap<String, EventMessage>>,
 }
 
 #[async_trait]
@@ -626,6 +673,19 @@ impl MatrixClient for MockMatrixClient {
     ) -> Result<Vec<EventMessage>, AppError> {
         let list = self.canned_history.lock().unwrap();
         Ok(list.clone())
+    }
+
+    async fn fetch_event(
+        &self,
+        _room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<EventMessage>, AppError> {
+        let history = self.canned_history.lock().unwrap();
+        if let Some(msg) = history.iter().find(|m| m.event_id == event_id) {
+            return Ok(Some(msg.clone()));
+        }
+        let events = self.canned_events.lock().unwrap();
+        Ok(events.get(event_id).cloned())
     }
 }
 

@@ -115,6 +115,7 @@ async fn oracle_1_addressed_accepted_gets_eye_reaction() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 1000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
@@ -159,6 +160,7 @@ async fn oracle_2_unaddressed_and_dropped_get_no_reaction() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 1000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
     handle_incoming_event(&init_event, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -177,6 +179,7 @@ async fn oracle_2_unaddressed_and_dropped_get_no_reaction() {
         mentions: None,
         timestamp_ms: 2000,
         thread_root_id: Some("$root_1".to_string()),
+        replaces_event_id: None,
     };
     let follow_outcome = handle_incoming_event(&follow_event, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -200,6 +203,7 @@ async fn oracle_2_unaddressed_and_dropped_get_no_reaction() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 3000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
     let drop_outcome = handle_incoming_event(&stranger_event, &[], &config, &matrix, &xmsg, &store)
         .await
@@ -243,6 +247,7 @@ async fn oracle_3_late_answer_posted_and_owner_dmed() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 1000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
@@ -296,6 +301,7 @@ async fn oracle_4_reply_past_deadline_not_posted() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 1000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     // Bound test execution to ensure mutant (wait forever) times out
@@ -351,6 +357,7 @@ async fn oracle_5_silent_decline_redacts_eye_and_salutes() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 1000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)

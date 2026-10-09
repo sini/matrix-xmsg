@@ -12,7 +12,7 @@ pub struct RelayedLine {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventMessage {
     pub event_id: String,
     pub sender_mxid: String,

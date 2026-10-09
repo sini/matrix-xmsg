@@ -261,6 +261,7 @@ async fn oracle_2_reply_long_poll_and_bot_posts_reply() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 1000000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, xmsg.as_ref(), &store)

@@ -23,6 +23,7 @@ pub enum BotOutcome {
     AbortedByRestart,
     ControlEmitted,
     ControlDebounced,
+    IgnoredEdit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +160,7 @@ pub struct IncomingMatrixEvent {
     pub mentions: Option<Vec<String>>,
     pub timestamp_ms: i64,
     pub thread_root_id: Option<String>,
+    pub replaces_event_id: Option<String>,
 }
 
 pub async fn handle_incoming_event(
@@ -191,82 +193,194 @@ pub async fn handle_incoming_event_with_claim(
         return Ok(BotOutcome::IgnoredRoom);
     }
 
-    // 2. Mention / Command Gate: Drop silently if not mentioned and not !escalate / !deeper in a thread,
-    // unless in an engaged thread.
-    let is_thread_escalate = event.thread_root_id.is_some() && event.body.trim() == "!escalate";
-    let is_thread_deeper = event.thread_root_id.is_some() && event.body.trim() == "!deeper";
-    let is_mentioned = is_bot_mentioned(
-        &event.body,
-        event.formatted_body.as_deref(),
-        event.mentions.as_deref(),
-        &config.bot_mxid,
-    );
-    let is_addressed = is_mentioned || is_thread_escalate || is_thread_deeper;
+    let (thread_root, claim_id, reaction_target_id, trigger_msg, is_addressed) =
+        if let Some(ref orig_event_id) = event.replaces_event_id {
+            // M10 Rule 1: Replacement content must mention the bot
+            let is_mentioned = is_bot_mentioned(
+                &event.body,
+                event.formatted_body.as_deref(),
+                event.mentions.as_deref(),
+                &config.bot_mxid,
+            );
+            if !is_mentioned {
+                return Ok(BotOutcome::IgnoredNoMention);
+            }
 
-    let is_engaged_thread = if let Some(ref root) = event.thread_root_id {
-        store.is_thread_engaged(root)?
-    } else {
-        false
-    };
+            // M10 Rule 3: Original event must never have been relayed
+            if store.is_event_relayed(orig_event_id)? {
+                return Ok(BotOutcome::IgnoredEdit);
+            }
 
-    if !is_addressed && !is_engaged_thread {
-        return Ok(BotOutcome::IgnoredNoMention);
-    }
+            // Fetch original event from history or Matrix API
+            let orig_event = if let Some(msg) =
+                room_history.iter().find(|m| m.event_id == *orig_event_id)
+            {
+                Some(msg.clone())
+            } else {
+                match matrix.fetch_event(&event.room_id, orig_event_id).await {
+                    Ok(Some(msg)) => Some(msg),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::debug!("Failed to fetch original event {}: {}", orig_event_id, e);
+                        None
+                    }
+                }
+            };
 
-    let thread_root = event.thread_root_id.as_deref().unwrap_or(&event.event_id);
+            let Some(orig) = orig_event else {
+                tracing::debug!(
+                    "Original event {} could not be read; dropping edit {}",
+                    orig_event_id,
+                    event.event_id
+                );
+                return Ok(BotOutcome::IgnoredEdit);
+            };
+
+            // M10 Rule 2: Original event must NOT have mentioned the bot
+            let orig_mentioned = is_bot_mentioned(&orig.body, None, None, &config.bot_mxid);
+            if orig_mentioned {
+                return Ok(BotOutcome::IgnoredEdit);
+            }
+
+            // Admission: Sender of edit must match original sender
+            if event.sender_mxid != orig.sender_mxid {
+                return Ok(BotOutcome::IgnoredUntrustedUser);
+            }
+
+            // Admission: Sender must pass standard admission policy
+            let is_trusted = config.is_user_trusted(&event.sender_mxid);
+            let is_top_level = orig.thread_root_id.is_none();
+            let is_asker = if let Some(ref root) = orig.thread_root_id {
+                store.get_thread_asker(root)?.as_deref() == Some(&event.sender_mxid)
+            } else {
+                false
+            };
+            let is_admitted = match config.admission {
+                Admission::Trusted => is_trusted,
+                Admission::Public => is_trusted || is_top_level || is_asker,
+            };
+            if !is_admitted {
+                return Ok(BotOutcome::IgnoredUntrustedUser);
+            }
+
+            let thread_root = orig
+                .thread_root_id
+                .as_deref()
+                .unwrap_or(&orig.event_id)
+                .to_string();
+            let claim_id = orig.event_id.clone();
+            let reaction_target_id = orig.event_id.clone();
+            let trigger_msg = EventMessage {
+                event_id: orig.event_id.clone(),
+                sender_mxid: event.sender_mxid.clone(),
+                timestamp_ms: event.timestamp_ms,
+                body: event.body.clone(),
+                thread_root_id: orig.thread_root_id.clone(),
+            };
+            (thread_root, claim_id, reaction_target_id, trigger_msg, true)
+        } else {
+            let is_thread_escalate =
+                event.thread_root_id.is_some() && event.body.trim() == "!escalate";
+            let is_thread_deeper = event.thread_root_id.is_some() && event.body.trim() == "!deeper";
+            let is_mentioned = is_bot_mentioned(
+                &event.body,
+                event.formatted_body.as_deref(),
+                event.mentions.as_deref(),
+                &config.bot_mxid,
+            );
+            let is_addressed = is_mentioned || is_thread_escalate || is_thread_deeper;
+
+            let is_engaged_thread = if let Some(ref root) = event.thread_root_id {
+                store.is_thread_engaged(root)?
+            } else {
+                false
+            };
+
+            if !is_addressed && !is_engaged_thread {
+                return Ok(BotOutcome::IgnoredNoMention);
+            }
+
+            let thread_root = event
+                .thread_root_id
+                .as_deref()
+                .unwrap_or(&event.event_id)
+                .to_string();
+            let now_secs = event.timestamp_ms / 1000;
+
+            // Handle !deeper control command in thread
+            if is_thread_deeper {
+                let asker = store.get_thread_asker(&thread_root)?;
+                let is_asker = asker.as_deref() == Some(&event.sender_mxid);
+                let is_trusted = config.is_user_trusted(&event.sender_mxid);
+
+                if !is_asker && !is_trusted {
+                    return Ok(BotOutcome::IgnoredUntrustedUser);
+                }
+
+                let target_msg = store
+                    .get_latest_bot_message_in_thread(&thread_root)?
+                    .unwrap_or_else(|| thread_root.clone());
+
+                let is_new = store.record_control_if_new(
+                    &target_msg,
+                    &event.sender_mxid,
+                    "deeper",
+                    now_secs,
+                )?;
+
+                if !is_new {
+                    return Ok(BotOutcome::ControlDebounced);
+                }
+
+                let payload = serde_json::json!({
+                    "thread_id": thread_root,
+                    "control": "deeper",
+                    "by": event.sender_mxid,
+                })
+                .to_string();
+
+                let mapped_sender = map_sender_mxid(&event.sender_mxid);
+                xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
+                    .await?;
+
+                return Ok(BotOutcome::ControlEmitted);
+            }
+
+            // Admission Gate for normal event
+            let is_trusted = config.is_user_trusted(&event.sender_mxid);
+            let is_top_level = event.thread_root_id.is_none();
+            let is_asker = if let Some(ref root) = event.thread_root_id {
+                store.get_thread_asker(root)?.as_deref() == Some(&event.sender_mxid)
+            } else {
+                false
+            };
+            let is_admitted = match config.admission {
+                Admission::Trusted => is_trusted,
+                Admission::Public => is_trusted || is_top_level || is_asker,
+            };
+            if !is_admitted {
+                return Ok(BotOutcome::IgnoredUntrustedUser);
+            }
+
+            let claim_id = event.event_id.clone();
+            let reaction_target_id = event.event_id.clone();
+            let trigger_msg = EventMessage {
+                event_id: event.event_id.clone(),
+                sender_mxid: event.sender_mxid.clone(),
+                timestamp_ms: event.timestamp_ms,
+                body: event.body.clone(),
+                thread_root_id: event.thread_root_id.clone(),
+            };
+            (
+                thread_root,
+                claim_id,
+                reaction_target_id,
+                trigger_msg,
+                is_addressed,
+            )
+        };
+
     let now_secs = event.timestamp_ms / 1000;
-
-    // Handle !deeper control command in thread
-    if is_thread_deeper {
-        let asker = store.get_thread_asker(thread_root)?;
-        let is_asker = asker.as_deref() == Some(&event.sender_mxid);
-        let is_trusted = config.is_user_trusted(&event.sender_mxid);
-
-        if !is_asker && !is_trusted {
-            return Ok(BotOutcome::IgnoredUntrustedUser);
-        }
-
-        let target_msg = store
-            .get_latest_bot_message_in_thread(thread_root)?
-            .unwrap_or_else(|| thread_root.to_string());
-
-        let is_new =
-            store.record_control_if_new(&target_msg, &event.sender_mxid, "deeper", now_secs)?;
-
-        if !is_new {
-            return Ok(BotOutcome::ControlDebounced);
-        }
-
-        let payload = serde_json::json!({
-            "thread_id": thread_root,
-            "control": "deeper",
-            "by": event.sender_mxid,
-        })
-        .to_string();
-
-        let mapped_sender = map_sender_mxid(&event.sender_mxid);
-        xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
-            .await?;
-
-        return Ok(BotOutcome::ControlEmitted);
-    }
-
-    // 3. Admission Gate: Under "trusted" (default), drop silently if sender is not on allowlist.
-    // Under "public", any room member's top-level question is relayed.
-    let is_trusted = config.is_user_trusted(&event.sender_mxid);
-    let is_top_level = event.thread_root_id.is_none();
-    let is_asker = if let Some(ref root) = event.thread_root_id {
-        store.get_thread_asker(root)?.as_deref() == Some(&event.sender_mxid)
-    } else {
-        false
-    };
-    let is_admitted = match config.admission {
-        Admission::Trusted => is_trusted,
-        Admission::Public => is_trusted || is_top_level || is_asker,
-    };
-    if !is_admitted {
-        return Ok(BotOutcome::IgnoredUntrustedUser);
-    }
 
     // 4. Size Cap Gate
     if event.body.len() > config.size_cap_bytes {
@@ -277,7 +391,7 @@ pub async fn handle_incoming_event_with_claim(
         matrix
             .send_notice(
                 &event.room_id,
-                Some(thread_root),
+                Some(&thread_root),
                 &notice,
                 Some(&event.sender_mxid),
             )
@@ -299,7 +413,7 @@ pub async fn handle_incoming_event_with_claim(
         matrix
             .send_notice(
                 &event.room_id,
-                Some(thread_root),
+                Some(&thread_root),
                 notice,
                 Some(&event.sender_mxid),
             )
@@ -319,7 +433,7 @@ pub async fn handle_incoming_event_with_claim(
         matrix
             .send_notice(
                 &event.room_id,
-                Some(thread_root),
+                Some(&thread_root),
                 notice,
                 Some(&event.sender_mxid),
             )
@@ -328,17 +442,9 @@ pub async fn handle_incoming_event_with_claim(
     }
 
     // 7. Context & Envelope Assembly
-    let trigger_msg = EventMessage {
-        event_id: event.event_id.clone(),
-        sender_mxid: event.sender_mxid.clone(),
-        timestamp_ms: event.timestamp_ms,
-        body: event.body.clone(),
-        thread_root_id: event.thread_root_id.clone(),
-    };
-
     let envelope = build_envelope(
         &event.room_id,
-        thread_root,
+        &thread_root,
         &trigger_msg,
         room_history,
         &config.trusted_mxids,
@@ -347,6 +453,9 @@ pub async fn handle_incoming_event_with_claim(
         config.history_byte_cap,
         is_addressed,
     );
+
+    // Record relay claim in SQLite
+    store.record_event_relayed(&claim_id, now_secs)?;
 
     // 8. Send to xmsg Expert Inbox
     let mapped_sender = map_sender_mxid(&event.sender_mxid);
@@ -357,7 +466,7 @@ pub async fn handle_incoming_event_with_claim(
     let mut ack_reaction_id: Option<String> = None;
     if is_addressed {
         match matrix
-            .send_reaction(&event.room_id, &event.event_id, "👀")
+            .send_reaction(&event.room_id, &reaction_target_id, "👀")
             .await
         {
             Ok(rid) => {
@@ -366,7 +475,7 @@ pub async fn handle_incoming_event_with_claim(
             Err(e) => {
                 tracing::warn!(
                     "Failed to send ack reaction for event {}: {}",
-                    event.event_id,
+                    reaction_target_id,
                     e
                 );
             }
@@ -374,8 +483,8 @@ pub async fn handle_incoming_event_with_claim(
     }
 
     // Record mapping in SQLite
-    store.record_thread_message(thread_root, &message_id, now_secs)?;
-    store.record_thread_asker(thread_root, &event.sender_mxid)?;
+    store.record_thread_message(&thread_root, &message_id, now_secs)?;
+    store.record_thread_asker(&thread_root, &event.sender_mxid)?;
 
     // 9. Long-poll for Expert Reply
     let first_timeout = config.answer_timeout_secs.min(config.answer_deadline_secs);
@@ -428,12 +537,12 @@ pub async fn handle_incoming_event_with_claim(
                     }
                     if is_addressed {
                         if let Err(e) = matrix
-                            .send_reaction(&event.room_id, &event.event_id, "🫡")
+                            .send_reaction(&event.room_id, &reaction_target_id, "🫡")
                             .await
                         {
                             tracing::warn!(
                                 "Failed to send decline reaction for event {}: {}",
-                                event.event_id,
+                                reaction_target_id,
                                 e
                             );
                         }
@@ -451,23 +560,23 @@ pub async fn handle_incoming_event_with_claim(
                         let sent_ev_id = matrix
                             .send_notice(
                                 &event.room_id,
-                                Some(thread_root),
+                                Some(&thread_root),
                                 &rendered_reply,
                                 Some(&event.sender_mxid),
                             )
                             .await?;
-                        let _ = store.record_bot_message(&sent_ev_id, thread_root, now_secs);
+                        let _ = store.record_bot_message(&sent_ev_id, &thread_root, now_secs);
                         Ok(BotOutcome::RepliedAndEscalated)
                     } else {
                         let sent_ev_id = matrix
                             .send_notice(
                                 &event.room_id,
-                                Some(thread_root),
+                                Some(&thread_root),
                                 &rendered_reply,
                                 Some(&event.sender_mxid),
                             )
                             .await?;
-                        let _ = store.record_bot_message(&sent_ev_id, thread_root, now_secs);
+                        let _ = store.record_bot_message(&sent_ev_id, &thread_root, now_secs);
                         Ok(BotOutcome::Replied)
                     }
                 }
@@ -496,12 +605,12 @@ pub async fn handle_incoming_event_with_claim(
             let sent_ev_id = matrix
                 .send_notice(
                     &event.room_id,
-                    Some(thread_root),
+                    Some(&thread_root),
                     notice,
                     Some(&event.sender_mxid),
                 )
                 .await?;
-            let _ = store.record_bot_message(&sent_ev_id, thread_root, now_secs);
+            let _ = store.record_bot_message(&sent_ev_id, &thread_root, now_secs);
             Ok(BotOutcome::TimedOutAndEscalated)
         }
         Err(e) => Err(e),
@@ -516,9 +625,30 @@ pub fn extract_incoming_event(
     use matrix_sdk::ruma::events::room::message::{MessageType, Relation, SyncRoomMessageEvent};
 
     if let SyncRoomMessageEvent::Original(orig) = event {
-        // F3: Edits (m.replace) must not re-trigger questions
-        if let Some(Relation::Replacement(_)) = &orig.content.relates_to {
-            return None;
+        if let Some(Relation::Replacement(repl)) = &orig.content.relates_to {
+            let formatted_body = match &repl.new_content.msgtype {
+                MessageType::Text(t) => t.formatted.as_ref().map(|f| f.body.clone()),
+                MessageType::Notice(n) => n.formatted.as_ref().map(|f| f.body.clone()),
+                _ => None,
+            };
+            let mentions = repl
+                .new_content
+                .mentions
+                .as_ref()
+                .map(|m| m.user_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>());
+            let body = repl.new_content.msgtype.body().to_string();
+
+            return Some(IncomingMatrixEvent {
+                room_id: room_id.to_string(),
+                event_id: orig.event_id.to_string(),
+                sender_mxid: orig.sender.to_string(),
+                body,
+                formatted_body,
+                mentions,
+                timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
+                thread_root_id: None,
+                replaces_event_id: Some(repl.event_id.to_string()),
+            });
         }
 
         let formatted_body = match &orig.content.msgtype {
@@ -544,6 +674,7 @@ pub fn extract_incoming_event(
             mentions,
             timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
             thread_root_id,
+            replaces_event_id: None,
         })
     } else {
         None
@@ -896,7 +1027,7 @@ pub fn register_event_handlers_full(
                     }
 
                     // N3 Gate 3: Admission check (synchronous)
-                    // For !deeper, authorization is checked in handle_incoming_event (original asker or trusted)
+                    // For !deeper or edits, full authorization is checked in handle_incoming_event
                     let is_top_level = incoming.thread_root_id.is_none();
                     let is_trusted = config.is_user_trusted(&incoming.sender_mxid);
                     let is_admitted = match config.admission {
@@ -904,6 +1035,7 @@ pub fn register_event_handlers_full(
                         Admission::Public => {
                             is_trusted
                                 || is_top_level
+                                || incoming.replaces_event_id.is_some()
                                 || incoming
                                     .thread_root_id
                                     .as_deref()
@@ -920,6 +1052,7 @@ pub fn register_event_handlers_full(
                     let thread_root = incoming
                         .thread_root_id
                         .clone()
+                        .or_else(|| incoming.replaces_event_id.clone())
                         .unwrap_or_else(|| incoming.event_id.clone());
 
                     let question = InFlightQuestion::new(

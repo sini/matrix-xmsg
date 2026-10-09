@@ -106,6 +106,7 @@ async fn test_silence_non_allowlisted_user_mention() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 100000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
@@ -136,6 +137,7 @@ async fn test_silence_allowlisted_message_without_mention() {
         mentions: None,
         timestamp_ms: 100000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
@@ -165,6 +167,7 @@ async fn test_silence_non_allowlisted_room() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 100000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
@@ -203,6 +206,7 @@ async fn test_allowlisted_mention_triggers_and_replies_in_thread() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 1728259260000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &history, &config, &matrix, &xmsg, &store)
@@ -306,6 +310,7 @@ async fn test_history_window_and_thread_isolation() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 4000,
         thread_root_id: Some("$root_1".to_string()),
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &history, &config, &matrix, &xmsg, &store)
@@ -344,6 +349,7 @@ async fn test_size_cap_refusal() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 100000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
@@ -381,6 +387,7 @@ async fn test_rate_limit_refusal() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: t,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     // First 2 calls succeed
@@ -462,6 +469,7 @@ async fn test_answer_timeout_escalation() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 100000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
@@ -503,6 +511,7 @@ async fn test_expert_escalate_marker() {
         mentions: Some(vec!["@genie:example.org".to_string()]),
         timestamp_ms: 100000,
         thread_root_id: None,
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
@@ -544,6 +553,7 @@ async fn test_user_explicit_escalate_command() {
         mentions: None, // In-thread !escalate does not require explicit @mention
         timestamp_ms: 100000,
         thread_root_id: Some("$thread_root".to_string()),
+        replaces_event_id: None,
     };
 
     let outcome = handle_incoming_event(&event, &[], &config, &matrix, &xmsg, &store)
