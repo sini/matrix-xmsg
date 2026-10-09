@@ -26,6 +26,7 @@ let
       rate_limit_window_secs = cfg.rateLimitWindowSecs;
       size_cap_bytes = cfg.sizeCapBytes;
       answer_timeout_secs = cfg.answerTimeoutSecs;
+      answer_deadline_secs = cfg.answerDeadlineSecs;
       db_path = cfg.dbPath;
     }
     // lib.optionalAttrs (cfg.xmsgUrl != null) {
@@ -158,6 +159,12 @@ in
       type = lib.types.ints.unsigned;
       default = 300;
       description = "Timeout in seconds to wait for an expert reply before escalating.";
+    };
+
+    answerDeadlineSecs = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 3600;
+      description = "Deadline in seconds to wait for late answers before giving up.";
     };
 
     dbPath = lib.mkOption {

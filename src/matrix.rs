@@ -25,6 +25,22 @@ pub trait MatrixClient: Send + Sync {
         limit: usize,
     ) -> Result<Vec<EventMessage>, AppError>;
 
+    /// Sends a reaction (m.reaction) to an event in a room.
+    async fn send_reaction(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        key: &str,
+    ) -> Result<String, AppError>;
+
+    /// Redacts an event in a room.
+    async fn redact_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), AppError>;
+
     /// Attaches the SQLite Store for DM room caching and state persistence.
     fn set_store(&self, _store: std::sync::Arc<crate::store::Store>) {}
 }
@@ -338,6 +354,58 @@ impl MatrixClient for MatrixSdkClient {
         Ok(messages)
     }
 
+    async fn send_reaction(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        key: &str,
+    ) -> Result<String, AppError> {
+        use matrix_sdk::ruma::events::reaction::ReactionEventContent;
+        use matrix_sdk::ruma::events::relation::Annotation;
+        use matrix_sdk::ruma::{EventId, RoomId};
+
+        let r_id = <&RoomId>::try_from(room_id)
+            .map_err(|e| AppError::Matrix(format!("Invalid room ID '{room_id}': {e}")))?;
+        let e_id = <&EventId>::try_from(event_id)
+            .map_err(|e| AppError::Matrix(format!("Invalid event ID '{event_id}': {e}")))?;
+
+        let room = self.client.get_room(r_id).ok_or_else(|| {
+            AppError::Matrix(format!("Room not found in client state: {room_id}"))
+        })?;
+
+        let content = ReactionEventContent::new(Annotation::new(e_id.to_owned(), key.to_string()));
+        let resp = room
+            .send(content)
+            .await
+            .map_err(|e| AppError::Matrix(format!("Failed to send reaction: {e}")))?;
+
+        Ok(resp.response.event_id.to_string())
+    }
+
+    async fn redact_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), AppError> {
+        use matrix_sdk::ruma::{EventId, RoomId};
+
+        let r_id = <&RoomId>::try_from(room_id)
+            .map_err(|e| AppError::Matrix(format!("Invalid room ID '{room_id}': {e}")))?;
+        let e_id = <&EventId>::try_from(event_id)
+            .map_err(|e| AppError::Matrix(format!("Invalid event ID '{event_id}': {e}")))?;
+
+        let room = self.client.get_room(r_id).ok_or_else(|| {
+            AppError::Matrix(format!("Room not found in client state: {room_id}"))
+        })?;
+
+        room.redact(e_id, reason, None)
+            .await
+            .map_err(|e| AppError::Matrix(format!("Failed to redact event: {e}")))?;
+
+        Ok(())
+    }
+
     fn set_store(&self, store: std::sync::Arc<crate::store::Store>) {
         self.set_store(store);
     }
@@ -470,10 +538,26 @@ pub struct SentDm {
     pub body: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SentReaction {
+    pub room_id: String,
+    pub event_id: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RedactedEvent {
+    pub room_id: String,
+    pub event_id: String,
+    pub reason: Option<String>,
+}
+
 #[derive(Default)]
 pub struct MockMatrixClient {
     pub sent_notices: Mutex<Vec<SentNotice>>,
     pub sent_dms: Mutex<Vec<SentDm>>,
+    pub sent_reactions: Mutex<Vec<SentReaction>>,
+    pub redacted_events: Mutex<Vec<RedactedEvent>>,
     pub canned_history: Mutex<Vec<EventMessage>>,
 }
 
@@ -503,6 +587,36 @@ impl MatrixClient for MockMatrixClient {
             body: body.to_string(),
         });
         Ok(format!("$mock_dm_{}", list.len()))
+    }
+
+    async fn send_reaction(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        key: &str,
+    ) -> Result<String, AppError> {
+        let mut list = self.sent_reactions.lock().unwrap();
+        list.push(SentReaction {
+            room_id: room_id.to_string(),
+            event_id: event_id.to_string(),
+            key: key.to_string(),
+        });
+        Ok(format!("$mock_reaction_{}", list.len()))
+    }
+
+    async fn redact_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), AppError> {
+        let mut list = self.redacted_events.lock().unwrap();
+        list.push(RedactedEvent {
+            room_id: room_id.to_string(),
+            event_id: event_id.to_string(),
+            reason: reason.map(|s| s.to_string()),
+        });
+        Ok(())
     }
 
     async fn fetch_history(

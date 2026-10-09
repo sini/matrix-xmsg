@@ -84,6 +84,7 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 200,
         answer_timeout_secs: 30,
+        answer_deadline_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
 }

@@ -77,6 +77,7 @@ fn test_config() -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 500,
         answer_timeout_secs: 30,
+        answer_deadline_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
 }
@@ -269,7 +270,7 @@ fn oracle_3_render_snapshot_confidence_and_gaps() {
     })
     .to_string();
 
-    let (rendered, is_escalate) = format_expert_reply(&reply_json);
+    let (rendered, is_escalate) = format_expert_reply(&reply_json).unwrap();
     assert!(!is_escalate);
 
     let expected = "\
@@ -292,7 +293,7 @@ Controls: ✅ accept · 🔍 deeper · !deeper";
     })
     .to_string();
 
-    let (expert_rendered, _) = format_expert_reply(&expert_json);
+    let (expert_rendered, _) = format_expert_reply(&expert_json).unwrap();
     let expected_expert = "\
 [expert review]
 Expert analysis confirms derivation correctness.
@@ -314,7 +315,7 @@ Controls: ✅ accept · 🔍 deeper · !deeper";
 #[test]
 fn oracle_4_plaintext_reply_byte_identical() {
     let pre_m5_sample_1 = "This is a direct answer to your question about Nix overlays.";
-    let (rendered_1, is_esc_1) = format_expert_reply(pre_m5_sample_1);
+    let (rendered_1, is_esc_1) = format_expert_reply(pre_m5_sample_1).unwrap();
     assert_eq!(
         rendered_1, pre_m5_sample_1,
         "plain-text reply must be byte-identical to pre-M5 output"
@@ -322,7 +323,7 @@ fn oracle_4_plaintext_reply_byte_identical() {
     assert!(!is_esc_1);
 
     let pre_m5_sample_2 = "Partial investigation completed. [escalate]";
-    let (rendered_2, is_esc_2) = format_expert_reply(pre_m5_sample_2);
+    let (rendered_2, is_esc_2) = format_expert_reply(pre_m5_sample_2).unwrap();
     assert_eq!(
         rendered_2, "Partial investigation completed.",
         "clean plain-text reply must strip [escalate] and match pre-M5"

@@ -35,6 +35,10 @@ fn default_answer_timeout_secs() -> u64 {
     300
 }
 
+fn default_answer_deadline_secs() -> u64 {
+    3600
+}
+
 fn default_db_path() -> PathBuf {
     PathBuf::from("/var/lib/matrix-xmsg/matrix-xmsg.db")
 }
@@ -91,6 +95,9 @@ pub struct Config {
 
     #[serde(default = "default_answer_timeout_secs")]
     pub answer_timeout_secs: u64,
+
+    #[serde(default = "default_answer_deadline_secs")]
+    pub answer_deadline_secs: u64,
 
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
@@ -240,5 +247,19 @@ mod tests {
             cfg.xmsg_endpoint(),
             XmsgEndpoint::Unix(PathBuf::from("/run/user/1000/xmsg/http.sock"))
         );
+    }
+
+    #[test]
+    fn test_answer_deadline_default() {
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = []
+            owner_mxid = "@owner:example.org"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.answer_deadline_secs, 3600);
     }
 }

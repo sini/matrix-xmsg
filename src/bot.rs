@@ -19,6 +19,7 @@ pub enum BotOutcome {
     RepliedAndEscalated,
     TimedOutAndEscalated,
     TimedOutSilent,
+    Declined,
     AbortedByRestart,
     ControlEmitted,
     ControlDebounced,
@@ -60,16 +61,20 @@ pub fn parse_reaction_control(key: &str) -> Option<ControlAction> {
     }
 }
 
-/// Renders an expert reply. If the reply is JSON carrying `confidence` (0..1), `gaps[]`
-/// or `tier: 1|expert`, renders the answer, confidence line, and controls hint line.
+/// Renders an expert reply. If the reply is JSON `{"silent": true}`, returns `None`
+/// indicating the expert declined silently. If the reply is JSON carrying `confidence` (0..1),
+/// `gaps[]` or `tier: 1|expert`, renders the answer, confidence line, and controls hint line.
 /// Replies with `tier: expert` are labelled "expert review".
 /// Plain-text replies with no JSON render exactly as pre-M5.
-/// Returns (rendered_text, is_escalate).
-pub fn format_expert_reply(reply_text: &str) -> (String, bool) {
+/// Returns Option<(rendered_text, is_escalate)>.
+pub fn format_expert_reply(reply_text: &str) -> Option<(String, bool)> {
     let trimmed = reply_text.trim();
 
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
         if let Some(obj) = val.as_object() {
+            if obj.get("silent").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return None;
+            }
             if let Some(answer_val) = obj
                 .get("answer")
                 .or_else(|| obj.get("text"))
@@ -131,16 +136,16 @@ pub fn format_expert_reply(reply_text: &str) -> (String, bool) {
 
                 rendered.push_str("\nControls: ✅ accept · 🔍 deeper · !deeper");
 
-                return (rendered, is_escalate);
+                return Some((rendered, is_escalate));
             }
         }
     }
 
     if trimmed.ends_with("[escalate]") {
         let clean = trimmed.strip_suffix("[escalate]").unwrap_or(trimmed).trim();
-        (clean.to_string(), true)
+        Some((clean.to_string(), true))
     } else {
-        (trimmed.to_string(), false)
+        Some((trimmed.to_string(), false))
     }
 }
 
@@ -349,15 +354,55 @@ pub async fn handle_incoming_event_with_claim(
         .send_message(&config.expert_ref, &mapped_sender, &envelope)
         .await?;
 
+    let mut ack_reaction_id: Option<String> = None;
+    if is_addressed {
+        match matrix
+            .send_reaction(&event.room_id, &event.event_id, "👀")
+            .await
+        {
+            Ok(rid) => {
+                ack_reaction_id = Some(rid);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to send ack reaction for event {}: {}",
+                    event.event_id,
+                    e
+                );
+            }
+        }
+    }
+
     // Record mapping in SQLite
     store.record_thread_message(thread_root, &message_id, now_secs)?;
     store.record_thread_asker(thread_root, &event.sender_mxid)?;
 
     // 9. Long-poll for Expert Reply
-    match xmsg
-        .wait_for_reply(&message_id, config.answer_timeout_secs)
-        .await
-    {
+    let first_timeout = config.answer_timeout_secs.min(config.answer_deadline_secs);
+    let first_res = xmsg.wait_for_reply(&message_id, first_timeout).await;
+
+    let final_res = match first_res {
+        Ok(reply) => Ok(reply),
+        Err(AppError::Timeout(_)) => {
+            if is_addressed {
+                let dm_text = format!(
+                    "[matrix-xmsg] Answer timeout in room {} thread {} for message {}",
+                    event.room_id, thread_root, message_id
+                );
+                matrix.send_dm(&config.owner_mxid, &dm_text).await?;
+            }
+
+            let remaining = config.answer_deadline_secs.saturating_sub(first_timeout);
+            if remaining > 0 {
+                xmsg.wait_for_reply(&message_id, remaining).await
+            } else {
+                Err(AppError::Timeout(config.answer_deadline_secs))
+            }
+        }
+        Err(e) => Err(e),
+    };
+
+    match final_res {
         Ok(reply_text) => {
             // R2: Atomic claim before posting reply
             if let Some(flag) = claimed {
@@ -373,35 +418,59 @@ pub async fn handle_incoming_event_with_claim(
                     return Ok(BotOutcome::AbortedByRestart);
                 }
             }
-            let (rendered_reply, is_escalate) = format_expert_reply(&reply_text);
-            if is_escalate {
-                let dm_text = format!(
-                    "[matrix-xmsg] Expert requested escalation in room {} thread {} for message {}",
-                    event.room_id, thread_root, message_id
-                );
-                matrix.send_dm(&config.owner_mxid, &dm_text).await?;
+            match format_expert_reply(&reply_text) {
+                None => {
+                    // Declined ({"silent": true})
+                    if let Some(ref r_id) = ack_reaction_id {
+                        if let Err(e) = matrix.redact_event(&event.room_id, r_id, None).await {
+                            tracing::warn!("Failed to redact ack reaction {}: {}", r_id, e);
+                        }
+                    }
+                    if is_addressed {
+                        if let Err(e) = matrix
+                            .send_reaction(&event.room_id, &event.event_id, "🫡")
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to send decline reaction for event {}: {}",
+                                event.event_id,
+                                e
+                            );
+                        }
+                    }
+                    Ok(BotOutcome::Declined)
+                }
+                Some((rendered_reply, is_escalate)) => {
+                    if is_escalate {
+                        let dm_text = format!(
+                            "[matrix-xmsg] Expert requested escalation in room {} thread {} for message {}",
+                            event.room_id, thread_root, message_id
+                        );
+                        matrix.send_dm(&config.owner_mxid, &dm_text).await?;
 
-                let sent_ev_id = matrix
-                    .send_notice(
-                        &event.room_id,
-                        Some(thread_root),
-                        &rendered_reply,
-                        Some(&event.sender_mxid),
-                    )
-                    .await?;
-                let _ = store.record_bot_message(&sent_ev_id, thread_root, now_secs);
-                Ok(BotOutcome::RepliedAndEscalated)
-            } else {
-                let sent_ev_id = matrix
-                    .send_notice(
-                        &event.room_id,
-                        Some(thread_root),
-                        &rendered_reply,
-                        Some(&event.sender_mxid),
-                    )
-                    .await?;
-                let _ = store.record_bot_message(&sent_ev_id, thread_root, now_secs);
-                Ok(BotOutcome::Replied)
+                        let sent_ev_id = matrix
+                            .send_notice(
+                                &event.room_id,
+                                Some(thread_root),
+                                &rendered_reply,
+                                Some(&event.sender_mxid),
+                            )
+                            .await?;
+                        let _ = store.record_bot_message(&sent_ev_id, thread_root, now_secs);
+                        Ok(BotOutcome::RepliedAndEscalated)
+                    } else {
+                        let sent_ev_id = matrix
+                            .send_notice(
+                                &event.room_id,
+                                Some(thread_root),
+                                &rendered_reply,
+                                Some(&event.sender_mxid),
+                            )
+                            .await?;
+                        let _ = store.record_bot_message(&sent_ev_id, thread_root, now_secs);
+                        Ok(BotOutcome::Replied)
+                    }
+                }
             }
         }
         Err(AppError::Timeout(_)) => {
@@ -422,11 +491,6 @@ pub async fn handle_incoming_event_with_claim(
                     return Ok(BotOutcome::AbortedByRestart);
                 }
             }
-            let dm_text = format!(
-                "[matrix-xmsg] Answer timeout in room {} thread {} for message {}",
-                event.room_id, thread_root, message_id
-            );
-            matrix.send_dm(&config.owner_mxid, &dm_text).await?;
 
             let notice = "The expert has not answered; a human has been notified.";
             let sent_ev_id = matrix

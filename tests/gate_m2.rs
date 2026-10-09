@@ -102,6 +102,7 @@ fn test_config(homeserver_url: &str) -> Config {
         rate_limit_window_secs: 60,
         size_cap_bytes: 2048,
         answer_timeout_secs: 10,
+        answer_deadline_secs: 3600,
         db_path: PathBuf::from(":memory:"),
     }
 }
@@ -946,7 +947,7 @@ async fn test_p4_reply_body_is_threaded_and_mentions_asker() {
     let reqs = mock_server.received_requests().await.unwrap();
     let puts: Vec<serde_json::Value> = reqs
         .iter()
-        .filter(|r| r.method.as_str() == "PUT")
+        .filter(|r| r.method.as_str() == "PUT" && r.url.path().contains("/m.room.message/"))
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
 
@@ -1326,8 +1327,10 @@ async fn test_n1_shutdown_grace_period_expired_posts_notice() {
         .await;
 
     let reqs = mock_server.received_requests().await.unwrap();
-    let put_reqs: Vec<&wiremock::Request> =
-        reqs.iter().filter(|r| r.method.as_str() == "PUT").collect();
+    let put_reqs: Vec<&wiremock::Request> = reqs
+        .iter()
+        .filter(|r| r.method.as_str() == "PUT" && r.url.path().contains("/m.room.message/"))
+        .collect();
     assert_eq!(
         put_reqs.len(),
         1,
@@ -2022,7 +2025,7 @@ async fn test_n1_double_post() {
     let requests = mock_server.received_requests().await.unwrap();
     let put_reqs: Vec<_> = requests
         .iter()
-        .filter(|r| r.method.as_str() == "PUT")
+        .filter(|r| r.method.as_str() == "PUT" && r.url.path().contains("/m.room.message/"))
         .collect();
 
     // R2 Gating Oracle: EXACTLY 1 PUT under race! Never both answer and restart notice.
@@ -2061,6 +2064,17 @@ async fn test_n1_tracker_leak_eliminated() {
         }
         async fn fetch_history(&self, _r: &str, _l: usize) -> Result<Vec<EventMessage>, AppError> {
             Ok(vec![])
+        }
+        async fn send_reaction(&self, _r: &str, _e: &str, _k: &str) -> Result<String, AppError> {
+            Ok("$reaction".into())
+        }
+        async fn redact_event(
+            &self,
+            _r: &str,
+            _e: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), AppError> {
+            Ok(())
         }
     }
 
@@ -2351,6 +2365,17 @@ async fn test_p_a_n1_abort_oracle() {
         }
         async fn fetch_history(&self, _r: &str, _l: usize) -> Result<Vec<EventMessage>, AppError> {
             Ok(vec![])
+        }
+        async fn send_reaction(&self, _r: &str, _e: &str, _k: &str) -> Result<String, AppError> {
+            Ok("$reaction".into())
+        }
+        async fn redact_event(
+            &self,
+            _r: &str,
+            _e: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), AppError> {
+            Ok(())
         }
     }
 

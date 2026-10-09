@@ -13,6 +13,9 @@
   - Top-level messages require an explicit `@`-mention (via `m.mentions.user_ids`, Matrix pills, or plain text) or in-thread control triggers (`!deeper`, `!escalate`).
   - An **engaged thread** is one whose root has a recorded asker or a bot message. Any admitted message in an engaged thread passes the mention gate without requiring a mention.
   - The envelope marks whether the trigger line addressed the bot (`addressed: true|false`). For unaddressed follow messages (`addressed: false`), a missing expert reply posts nothing (no timeout notice, no DM); addressed messages preserve existing timeout escalation notices.
+- **Relay Acknowledgement & Late Answers (M9):**
+  - **ACK Reaction (👀):** When an addressed message (`addressed: true`) is accepted by xmsg, the bot reacts to the event with 👀 (`m.reaction`) to signal work has begun. Unaddressed follows and dropped/refused messages receive no reaction.
+  - **Late Answers & Deadline:** If the expert reply does not arrive within `answer_timeout_secs` (default 300s), an owner DM is sent, but the bot continues waiting up to `answer_deadline_secs` (default 3600s). If the reply arrives before the deadline, it is posted to the thread as normal. Past the deadline, the bot stops waiting and posts a user-facing timeout notice.
 - **Admission Modes:**
   - `trusted` (default): Messages from non-allowlisted senders are dropped **silently**. The bot never responds or sends an error notice, preventing oracle attacks where attackers probe for valid allowlisted usernames.
   - `public`: Any room member's top-level question is relayed to the expert session; in engaged threads, the original thread asker and trusted senders are admitted, while bystanders are silently ignored.
@@ -27,13 +30,14 @@
 - **Debouncing:** Duplicate reactions or commands from the same user on the same bot message are debounced via SQLite `(message_id, user_mxid, control)` unique constraints, emitting exactly one event to the expert.
 - **Expert Event Format:** Interaction controls emit JSON payloads to the expert over xmsg: `{"thread_id": ..., "control": "accept"|"deeper", "by": ...}`.
 
-### 1.3 Tiered Genie Rendering (M5b)
+### 1.3 Tiered Genie Rendering & Silent Decline (M5b, M9)
 
 - **Structured JSON Replies:** When the expert responds with JSON containing `confidence`, `gaps`, and/or `tier`:
   - Renders answer body.
   - Confidence metadata line: `confidence 0.72 · gaps: ...` (or `gaps: none`).
   - `tier: "expert"` replies display `[expert review]` header and `expert review` in the metadata line.
   - Hint line: `Controls: ✅ accept · 🔍 deeper · !deeper`.
+- **Silent Decline (`{"silent": true}`):** If the agent determines the message requires no response, it replies with `{"silent": true}`. The bot posts no room message, sends no owner DM, redacts its original 👀 reaction, and reacts with 🫡 ("noted"). The bot's own reactions are filtered by the self-sender guard and never parsed as controls.
 - **Backward Compatibility:** Plain-text replies with no JSON structure render byte-identically to legacy outputs without confidence or control hint lines.
 
 ### 1.4 Context Isolation & Provenance Tagging (M5d)
@@ -79,6 +83,7 @@ rate_limit_count = 10
 rate_limit_window_secs = 600
 size_cap_bytes = 4096
 answer_timeout_secs = 300
+answer_deadline_secs = 3600
 db_path = "/var/lib/matrix-xmsg/matrix-xmsg.db"
 ```
 
@@ -145,6 +150,7 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
 | `rateLimitWindowSecs` | `uint`        | `600`                          | Sliding window duration in seconds.                                                                |
 | `sizeCapBytes`        | `uint`        | `4096`                         | Max body size of queries accepted.                                                                 |
 | `answerTimeoutSecs`   | `uint`        | `300`                          | Timeout before escalating to owner.                                                                |
+| `answerDeadlineSecs`  | `uint`        | `3600`                         | Deadline in seconds to wait for late answers before giving up.                                     |
 | `dbPath`              | `path`        | `"${stateDir}/matrix-xmsg.db"` | Path to SQLite database (created mode `0600`).                                                     |
 | `dynamicUser`         | `bool`        | `true`                         | Whether to allocate an ephemeral systemd DynamicUser.                                              |
 | `user`                | `str`         | `"matrix-xmsg"`                | Static user when `dynamicUser = false`.                                                            |
