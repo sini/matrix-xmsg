@@ -29,6 +29,7 @@
                 base == "nix"
                 || base == "docs"
                 || base == "ci"
+                || base == ".github"
                 || base == "README.md"
                 || base == "TODO.md"
                 || base == "LICENSE"
@@ -43,6 +44,32 @@
             description = "Matrix support bot backed by an expert agent session";
             mainProgram = "matrix-xmsg";
             license = nixpkgs.lib.licenses.mit;
+          };
+        };
+
+        image = pkgs.dockerTools.buildLayeredImage {
+          name = "ghcr.io/sini/matrix-xmsg";
+          tag = "latest";
+          contents = [
+            pkgs.cacert
+            self.packages.${pkgs.system}.default
+          ];
+          extraCommands = ''
+            mkdir -p -m 1777 tmp
+            mkdir -p -m 0755 var/lib/matrix-xmsg
+            mkdir -p etc/matrix-xmsg
+          '';
+          config = {
+            User = "10001:10001";
+            Entrypoint = [ "${self.packages.${pkgs.system}.default}/bin/matrix-xmsg" ];
+            Cmd = [
+              "--config"
+              "/etc/matrix-xmsg/config.toml"
+            ];
+            WorkingDir = "/var/lib/matrix-xmsg";
+            Env = [
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            ];
           };
         };
       });
@@ -61,6 +88,15 @@
             inherit pkgs self;
             mode = "mutant-wrong-token";
           };
+          image =
+            pkgs.runCommand "check-image-oracle"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+              }
+              ''
+                python3 ${./nix/check_image.py} ${self.packages.${pkgs.system}.image}
+                touch $out
+              '';
         }
       );
 

@@ -7,6 +7,7 @@
 ## 1. Security Architecture & Trust Model
 
 ### 1.1 Admission Policy & Silence Rule
+
 - **Public Room Posture:** Anyone may join and post in the room.
 - **Mention Trigger:** The bot acts **only** on messages that `@`-mention it (via `m.mentions.user_ids`, Matrix pills, or plain text) or in-thread control triggers.
 - **Admission Modes:**
@@ -14,6 +15,7 @@
   - `public`: Any room member's top-level question is relayed to the expert session.
 
 ### 1.2 Interaction Controls & Authorization (M5a)
+
 - **Reactions & Commands:**
   - `✅` reaction: Accept answer.
   - `🔍` reaction: Request deeper investigation.
@@ -23,6 +25,7 @@
 - **Expert Event Format:** Interaction controls emit JSON payloads to the expert over xmsg: `{"thread_id": ..., "control": "accept"|"deeper", "by": ...}`.
 
 ### 1.3 Tiered Genie Rendering (M5b)
+
 - **Structured JSON Replies:** When the expert responds with JSON containing `confidence`, `gaps`, and/or `tier`:
   - Renders answer body.
   - Confidence metadata line: `confidence 0.72 · gaps: ...` (or `gaps: none`).
@@ -31,6 +34,7 @@
 - **Backward Compatibility:** Plain-text replies with no JSON structure render byte-identically to legacy outputs without confidence or control hint lines.
 
 ### 1.4 Context Isolation & Provenance Tagging (M5d)
+
 - Messages sent to the expert include recent room history (for top-level questions) or thread history (for threaded questions) under count and byte caps.
 - Header format: `[matrix] room={room_id} thread={thread_root_id} user={mapped_sender} ({trigger_tier}) thread_tier={thread_tier}`.
   - Senders in `trusted_mxids` or matching `owner_mxid` receive tier `trusted`; all others receive `public`.
@@ -43,7 +47,9 @@
 - Any `<request>`, `</request>`, `<context`, or `</context>` tags occurring inside user-supplied message text are automatically escaped prior to JSON serialization to prevent XML sandbox breakouts.
 
 ### 1.5 Strict ASCII Sender Mapping
+
 Matrix IDs (`@alice:example.org`) are converted to sanitized ASCII identifiers (`matrix alice at example.org`):
+
 - Never contains `:` or `/` (conforming to xmsg HTTP sender invariants).
 - Strips non-ASCII characters.
 - Enforces a 64-character length cap.
@@ -105,6 +111,7 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
 ```
 
 ### 3.2 Token Provisioning Steps (Host Owner)
+
 1. **Generate Matrix Access Token:**
    Log in to the homeserver as the bot user (`@genie:json64.dev`) and obtain an access token.
 2. **Provision Token Secret:**
@@ -115,38 +122,41 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
 
 ### 3.3 Module Options Reference
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `enable` | `bool` | `false` | Enable the matrix-xmsg daemon. |
-| `package` | `package` | `matrix-xmsg` | Package to run. |
-| `homeserverUrl` | `str` | *(required)* | Base URL of the Matrix homeserver. |
-| `botMxid` | `str` | *(required)* | Full Matrix user ID of the bot (`@name:server`). |
-| `accessTokenFile` | `path` | *(required)* | Path to file containing the Matrix access token. |
-| `rooms` | `listOf str` | `[]` | Room IDs (`!id:server`) monitored by the bot. Aliases (`#alias:server`) are rejected at eval time. |
-| `trustedMxids` | `listOf str` | `[]` | Allowlist of user Matrix IDs permitted to interact with the bot. |
-| `ownerMxid` | `str` | *(required)* | Owner Matrix ID for escalations and direct notices. |
-| `stateDir` | `path` | `"/var/lib/matrix-xmsg"` | State directory for persistent store and database. |
-| `xmsgUrl` | `str` | `"http://127.0.0.1:7787"` | HTTP bridge URL to xmsg server. |
-| `xmsgSocket` | `nullOr path` | `null` | Optional agent socket path (evaluated; see attestation below). |
-| `expertRef` | `str` | `"claude"` | Session name/ref in xmsg to route queries to. |
-| `historyN` | `uint` | `30` | Number of context messages fetched from timeline. |
-| `historyByteCap` | `uint` | `12288` | Maximum byte size of context history window. |
-| `rateLimitCount` | `uint` | `10` | Max queries permitted per user per window. |
-| `rateLimitWindowSecs` | `uint` | `600` | Sliding window duration in seconds. |
-| `sizeCapBytes` | `uint` | `4096` | Max body size of queries accepted. |
-| `answerTimeoutSecs` | `uint` | `300` | Timeout before escalating to owner. |
-| `dbPath` | `path` | `"${stateDir}/matrix-xmsg.db"` | Path to SQLite database (created mode `0600`). |
-| `dynamicUser` | `bool` | `true` | Whether to allocate an ephemeral systemd DynamicUser. |
-| `user` | `str` | `"matrix-xmsg"` | Static user when `dynamicUser = false`. |
-| `group` | `str` | `"matrix-xmsg"` | Static group when `dynamicUser = false`. |
+| Option                | Type          | Default                        | Description                                                                                        |
+| --------------------- | ------------- | ------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `enable`              | `bool`        | `false`                        | Enable the matrix-xmsg daemon.                                                                     |
+| `package`             | `package`     | `matrix-xmsg`                  | Package to run.                                                                                    |
+| `homeserverUrl`       | `str`         | *(required)*                   | Base URL of the Matrix homeserver.                                                                 |
+| `botMxid`             | `str`         | *(required)*                   | Full Matrix user ID of the bot (`@name:server`).                                                   |
+| `accessTokenFile`     | `path`        | *(required)*                   | Path to file containing the Matrix access token.                                                   |
+| `rooms`               | `listOf str`  | `[]`                           | Room IDs (`!id:server`) monitored by the bot. Aliases (`#alias:server`) are rejected at eval time. |
+| `trustedMxids`        | `listOf str`  | `[]`                           | Allowlist of user Matrix IDs permitted to interact with the bot.                                   |
+| `ownerMxid`           | `str`         | *(required)*                   | Owner Matrix ID for escalations and direct notices.                                                |
+| `stateDir`            | `path`        | `"/var/lib/matrix-xmsg"`       | State directory for persistent store and database.                                                 |
+| `xmsgUrl`             | `str`         | `"http://127.0.0.1:7787"`      | HTTP bridge URL to xmsg server.                                                                    |
+| `xmsgSocket`          | `nullOr path` | `null`                         | Optional agent socket path (evaluated; see attestation below).                                     |
+| `expertRef`           | `str`         | `"claude"`                     | Session name/ref in xmsg to route queries to.                                                      |
+| `historyN`            | `uint`        | `30`                           | Number of context messages fetched from timeline.                                                  |
+| `historyByteCap`      | `uint`        | `12288`                        | Maximum byte size of context history window.                                                       |
+| `rateLimitCount`      | `uint`        | `10`                           | Max queries permitted per user per window.                                                         |
+| `rateLimitWindowSecs` | `uint`        | `600`                          | Sliding window duration in seconds.                                                                |
+| `sizeCapBytes`        | `uint`        | `4096`                         | Max body size of queries accepted.                                                                 |
+| `answerTimeoutSecs`   | `uint`        | `300`                          | Timeout before escalating to owner.                                                                |
+| `dbPath`              | `path`        | `"${stateDir}/matrix-xmsg.db"` | Path to SQLite database (created mode `0600`).                                                     |
+| `dynamicUser`         | `bool`        | `true`                         | Whether to allocate an ephemeral systemd DynamicUser.                                              |
+| `user`                | `str`         | `"matrix-xmsg"`                | Static user when `dynamicUser = false`.                                                            |
+| `group`               | `str`         | `"matrix-xmsg"`                | Static group when `dynamicUser = false`.                                                           |
 
 ### 3.4 Systemd Hardening & Lifetime Guarantees
+
 - **Strict Isolation:** `DynamicUser = true`, `ProtectSystem = strict`, `ProtectHome = true`, `PrivateTmp = true`, `PrivateDevices = true`, `ProtectKernelTunables = true`, `ProtectControlGroups = true`, `NoNewPrivileges = true`, `RestrictNamespaces = true`, `RestrictAddressFamilies = AF_INET AF_INET6 AF_UNIX`, `UMask = 0077`.
 - **State Persistence:** `StateDirectory = "matrix-xmsg"` provisions `/var/lib/matrix-xmsg` owned by the service user. The SQLite database is created mode `0600` via `Store::new`.
 - **Bounded Shutdown:** `TimeoutStopSec = 60` provides generous margin above the 5-second in-flight drain and 5-second shutdown notice bounds.
 
 ### 3.5 xmsg Attestation Evaluation
+
 `xmsg` operates two incoming interfaces:
+
 1. **HTTP Bridge (`xmsgUrl`, default `http://127.0.0.1:7787`):**
    Used by `matrix-xmsg`. Accepts `POST /v1/sessions/{expert}/messages`. Senders are tagged as `from@host_label`. This interface requires network reachability to localhost and does not enforce process UID checks.
 2. **Attested Unix Domain Socket (`agent.sock`):**
@@ -154,22 +164,46 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
 
 **System Service Attestation Finding:**
 A systemd system service (`matrix-xmsg.service`) running under a system user or `DynamicUser` **cannot** connect to `agent.sock` under existing `xmsg` rules due to:
+
 - DAC permissions (`0600` / `0700` owned by desktop user UID).
 - Strict peer UID check (`peer_uid != my_uid` rejection).
 - PPID ancestor walk terminating at PID 1 (`systemd`), matching no known LLM harness.
 
 **Minimal Proposed `xmsg`-side Evolution:**
 To support attested daemon bridges like `matrix-xmsg` over Unix sockets in the future:
+
 1. Provide a group-accessible socket (`mode 0660`, e.g. group `xmsg`).
 2. Accept peer UIDs belonging to the trusted socket group or authorized via credential token.
 3. Add a `bridge` harness identity in `resolve_caller_session` that verifies the caller executable path or systemd unit cgroup and generates an attested badge `xmsg@host · bridge:matrix-xmsg`.
 
 ---
 
-## 4. Verification & Testing
+## 4. OCI Container Image (M4)
+
+An unprivileged, minimal OCI container image is built via `dockerTools.buildLayeredImage` and published to `ghcr.io/sini/matrix-xmsg`.
+
+### 4.1 Security Properties
+
+- **Non-root Execution:** Runs under UID/GID `10001:10001`.
+- **No Shell:** The image contains only CA certificates (`/etc/ssl/certs/ca-bundle.crt`) and the `matrix-xmsg` static binary; no shell (`/bin/sh`) or auxiliary utilities are present in any layer.
+- **Entrypoint:** Preconfigured entrypoint `matrix-xmsg` with default args `--config /etc/matrix-xmsg/config.toml` and working directory `/var/lib/matrix-xmsg`.
+
+### 4.2 Building & Verification
 
 ```bash
-# 1. Run Cargo tests (54/54 tests)
+# Build the OCI image archive
+nix build .#image
+
+# Run the image oracle check (asserts non-root user, bot binary entrypoint, no /bin/sh in layers)
+nix build -L .#checks.x86_64-linux.image
+```
+
+---
+
+## 5. Verification & Testing
+
+```bash
+# 1. Run Cargo tests
 nix develop --command cargo test --all-targets
 
 # 2. Check Formatting and Clippy
@@ -180,9 +214,12 @@ nix develop --command cargo clippy --all-targets -- -D warnings
 nix build -L .#checks.x86_64-linux.nixos-module
 
 # 4. Run NixOS VM Mutant Test (Demonstrates RED on invalid token path)
-nix build -L .#checks.x86_64-linux.nixos-module-mutant
+nix build -L .#checks.x86_64-linux.nixos-module-mutant-wrong-token
 
-# 5. Run full Nix flake checks
+# 5. Run OCI Image Oracle Check
+nix build -L .#checks.x86_64-linux.image
+
+# 6. Run full Nix flake checks
 nix flake check
 nix flake check ./ci
 ```

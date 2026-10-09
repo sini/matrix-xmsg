@@ -1,0 +1,11 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  evaluators:
+    uses: sini/gen-harness/.github/workflows/evaluators.yml@79e1194de545446cad4802264c744b4f196114e4
