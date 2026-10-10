@@ -55,6 +55,10 @@ fn default_guard_retry_budget() -> usize {
     3
 }
 
+fn default_inbox_retry_budget() -> usize {
+    10
+}
+
 fn default_db_path() -> PathBuf {
     PathBuf::from("/var/lib/matrix-xmsg/matrix-xmsg.db")
 }
@@ -93,6 +97,9 @@ pub struct Config {
 
     #[serde(default = "default_guard_retry_budget")]
     pub guard_retry_budget: usize,
+
+    #[serde(default = "default_inbox_retry_budget")]
+    pub inbox_retry_budget: usize,
 
     #[serde(default = "default_history_n")]
     pub history_n: usize,
@@ -308,5 +315,19 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.resync_byte_cap, 65536);
+    }
+
+    #[test]
+    fn test_inbox_retry_budget_default() {
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = []
+            owner_mxid = "@owner:example.org"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.inbox_retry_budget, 10);
     }
 }

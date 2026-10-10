@@ -94,6 +94,7 @@ fn test_config() -> Config {
         guard_ref: "svc:genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
+        inbox_retry_budget: 10,
         history_n: 10,
         history_byte_cap: 12 * 1024,
         resync_byte_cap: 65536,

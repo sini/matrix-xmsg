@@ -1271,6 +1271,11 @@ pub async fn run_inbox_loop<I: SvcInbox>(
     xmsg: std::sync::Arc<dyn XmsgClient>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), AppError> {
+    // Resolve configured rooms right after start before serving the inbox
+    if let Err(e) = matrix.resolve_rooms(&config.rooms).await {
+        tracing::warn!("Failed resolving configured rooms at startup: {e}");
+    }
+
     loop {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1295,7 +1300,13 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
-                        if let Err(e) = handle_inbox_delivery_with_xmsg(
+                        let prev_attempts = store
+                            .get_inbox_retries(&delivery.message_id)
+                            .unwrap_or(None)
+                            .map(|(a, _)| a)
+                            .unwrap_or(0);
+
+                        match handle_inbox_delivery_with_xmsg(
                             &delivery,
                             &config,
                             matrix.as_ref(),
@@ -1304,7 +1315,55 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                             &mut inbox,
                             now,
                         ).await {
-                            tracing::error!("Error handling inbox delivery {}: {e}", delivery.message_id);
+                            Ok(_) => {
+                                if prev_attempts > 0 {
+                                    let _ = store.clear_inbox_retries(&delivery.message_id);
+                                }
+                            }
+                            Err(e) => {
+                                let attempt = prev_attempts + 1;
+                                if attempt >= config.inbox_retry_budget {
+                                    tracing::error!(
+                                        "Delivery {} permanently failed after {} attempts: {e}; giving up",
+                                        delivery.message_id,
+                                        attempt
+                                    );
+                                    let err_reply = serde_json::json!({
+                                        "error": format!("{e}")
+                                    })
+                                    .to_string();
+                                    let _ = xmsg.reply_message(&delivery.message_id, &err_reply).await;
+                                    let dm_text = format!(
+                                        "[matrix-xmsg] Delivery {} permanently failed after {} attempts: {e}",
+                                        delivery.message_id,
+                                        attempt
+                                    );
+                                    let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
+                                    if let Err(ack_err) = inbox.ack(&delivery.message_id).await {
+                                        tracing::error!(
+                                            "Failed to ack delivery {} on give-up: {ack_err}",
+                                            delivery.message_id
+                                        );
+                                    }
+                                    let _ = store.clear_inbox_retries(&delivery.message_id);
+                                } else {
+                                    let _ = store.record_inbox_retry(&delivery.message_id, attempt, now);
+                                    let backoff_secs = (1u64 << (attempt - 1).min(30)).min(300);
+                                    tracing::warn!(
+                                        "Delivery {} attempt {} failed: {e}; retrying in {}s",
+                                        delivery.message_id,
+                                        attempt,
+                                        backoff_secs
+                                    );
+                                    tokio::select! {
+                                        _ = shutdown_rx.recv() => {
+                                            tracing::info!("Inbox loop received shutdown signal during retry backoff");
+                                            break;
+                                        }
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                                    }
+                                }
+                            }
                         }
                     }
                     Ok(None) => {}

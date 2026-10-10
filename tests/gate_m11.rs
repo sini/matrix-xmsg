@@ -72,6 +72,7 @@ fn test_config() -> Config {
         guard_ref: "svc:genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
+        inbox_retry_budget: 10,
         db_path: PathBuf::from(":memory:"),
     }
 }

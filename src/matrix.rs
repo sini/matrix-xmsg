@@ -73,6 +73,11 @@ pub trait MatrixClient: Send + Sync {
 
     /// Attaches the SQLite Store for DM room caching and state persistence.
     fn set_store(&self, _store: std::sync::Arc<crate::store::Store>) {}
+
+    /// Resolves configured rooms in the client state (e.g. at startup before serving the inbox).
+    async fn resolve_rooms(&self, _rooms: &[String]) -> Result<(), AppError> {
+        Ok(())
+    }
 }
 
 /// Real Matrix client backed by `matrix-sdk`.
@@ -127,6 +132,21 @@ impl MatrixSdkClient {
 
     pub fn inner(&self) -> &Client {
         &self.client
+    }
+
+    pub async fn resolve_rooms(&self, rooms: &[String]) -> Result<(), AppError> {
+        use matrix_sdk::ruma::RoomId;
+        for room_str in rooms {
+            if let Ok(r_id) = <&RoomId>::try_from(room_str.as_str()) {
+                if self.client.get_room(r_id).is_none() {
+                    tracing::info!("Resolving room {room_str} into client state");
+                    if let Err(e) = self.client.join_room_by_id(r_id).await {
+                        tracing::warn!("Failed to resolve/join configured room {room_str}: {e}");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -308,10 +328,6 @@ impl MatrixClient for MatrixSdkClient {
         let r_id = <&RoomId>::try_from(room_id)
             .map_err(|e| AppError::Matrix(format!("Invalid room ID '{room_id}': {e}")))?;
 
-        let room = self.client.get_room(r_id).ok_or_else(|| {
-            AppError::Matrix(format!("Room not found in client state: {room_id}"))
-        })?;
-
         let mut content = RoomMessageEventContent::notice_markdown(body);
 
         if let Some(user_mxid) = mention_user {
@@ -330,12 +346,45 @@ impl MatrixClient for MatrixSdkClient {
             )));
         }
 
-        let resp = room
-            .send(content)
-            .await
-            .map_err(|e| AppError::Matrix(format!("Failed to send notice: {e}")))?;
+        if let Some(room) = self.client.get_room(r_id) {
+            let resp = room
+                .send(content)
+                .await
+                .map_err(|e| AppError::Matrix(format!("Failed to send notice: {e}")))?;
+            return Ok(resp.response.event_id.to_string());
+        }
 
-        Ok(resp.response.event_id.to_string())
+        // Cold room fallback: attempt to join/resolve into client state
+        if let Ok(room) = self.client.join_room_by_id(r_id).await {
+            let resp = room
+                .send(content)
+                .await
+                .map_err(|e| AppError::Matrix(format!("Failed to send notice: {e}")))?;
+            return Ok(resp.response.event_id.to_string());
+        }
+
+        // Direct HTTP send fallback (matching send_dm Arm B)
+        use matrix_sdk::ruma::api::client::message::send_message_event::v3::Request as SendMessageEventRequest;
+        use matrix_sdk::ruma::events::MessageLikeEventType;
+        use matrix_sdk::ruma::TransactionId;
+
+        if let Ok(raw_content) = serde_json::to_string(&content) {
+            if let Ok(raw_val) = matrix_sdk::ruma::serde::Raw::from_json_string(raw_content) {
+                let req = SendMessageEventRequest::new_raw(
+                    r_id.to_owned(),
+                    TransactionId::new(),
+                    MessageLikeEventType::RoomMessage,
+                    raw_val,
+                );
+                if let Ok(resp) = self.client.send(req).await {
+                    return Ok(resp.event_id.to_string());
+                }
+            }
+        }
+
+        Err(AppError::Matrix(format!(
+            "Room not found in client state: {room_id}"
+        )))
     }
 
     async fn send_dm(&self, user_id: &str, body: &str) -> Result<String, AppError> {
@@ -624,6 +673,10 @@ impl MatrixClient for MatrixSdkClient {
     fn set_store(&self, store: std::sync::Arc<crate::store::Store>) {
         self.set_store(store);
     }
+
+    async fn resolve_rooms(&self, rooms: &[String]) -> Result<(), AppError> {
+        self.resolve_rooms(rooms).await
+    }
 }
 
 /// Paged thread fetch helper: fetches root event and queries thread relations pages
@@ -813,6 +866,9 @@ pub struct MockMatrixClient {
     pub canned_events: Mutex<std::collections::HashMap<String, EventMessage>>,
     pub canned_thread_relations: Mutex<std::collections::HashMap<String, Vec<EventMessage>>>,
     pub canned_thread_page_size: Mutex<Option<usize>>,
+    pub known_rooms: Mutex<std::collections::HashSet<String>>,
+    pub require_known_rooms: std::sync::atomic::AtomicBool,
+    pub fail_send_notice: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -824,6 +880,27 @@ impl MatrixClient for MockMatrixClient {
         body: &str,
         mention_user: Option<&str>,
     ) -> Result<String, AppError> {
+        if self
+            .fail_send_notice
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AppError::Matrix(
+                "Send notice failed: network error".to_string(),
+            ));
+        }
+
+        if self
+            .require_known_rooms
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let known = self.known_rooms.lock().unwrap();
+            if !known.contains(room_id) {
+                return Err(AppError::Matrix(format!(
+                    "Room not found in client state: {room_id}"
+                )));
+            }
+        }
+
         let mut list = self.sent_notices.lock().unwrap();
         list.push(SentNotice {
             room_id: room_id.to_string(),
@@ -935,6 +1012,14 @@ impl MatrixClient for MockMatrixClient {
         thread_root_id: &str,
     ) -> Result<Vec<EventMessage>, AppError> {
         fetch_paged_thread_history(self, room_id, thread_root_id).await
+    }
+
+    async fn resolve_rooms(&self, rooms: &[String]) -> Result<(), AppError> {
+        let mut known = self.known_rooms.lock().unwrap();
+        for r in rooms {
+            known.insert(r.clone());
+        }
+        Ok(())
     }
 }
 

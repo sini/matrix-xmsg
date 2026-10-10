@@ -76,6 +76,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
+    // Resolve configured rooms in client state before serving the inbox
+    if let Err(e) = matrix_client.resolve_rooms(&config.rooms).await {
+        tracing::warn!("Failed resolving configured rooms in client state: {e}");
+    }
+
     let register_sock = config.xmsg_register_socket();
     let svc_inbox = matrix_xmsg::xmsg::ReconnectingSvcInbox::new(register_sock, "matrix-xmsg");
 

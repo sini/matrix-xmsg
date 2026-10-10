@@ -143,6 +143,11 @@ impl Store {
                 attempts INTEGER NOT NULL,
                 last_attempt_at INTEGER NOT NULL,
                 failed_dm_sent INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS inbox_retries (
+                message_id TEXT PRIMARY KEY,
+                attempts INTEGER NOT NULL,
+                last_attempt_at INTEGER NOT NULL
             );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
@@ -869,6 +874,50 @@ impl Store {
         .map_err(|e| AppError::Store(e.to_string()))?;
         Ok(())
     }
+
+    pub fn get_inbox_retries(&self, message_id: &str) -> Result<Option<(usize, i64)>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT attempts, last_attempt_at FROM inbox_retries WHERE message_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![message_id], |row| {
+            let attempts: usize = row.get(0)?;
+            let last_attempt_at: i64 = row.get(1)?;
+            Ok((attempts, last_attempt_at))
+        });
+        match res {
+            Ok(pair) => Ok(Some(pair)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    pub fn record_inbox_retry(
+        &self,
+        message_id: &str,
+        attempts: usize,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO inbox_retries (message_id, attempts, last_attempt_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(message_id) DO UPDATE SET attempts = ?2, last_attempt_at = ?3",
+            params![message_id, attempts, now],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn clear_inbox_retries(&self, message_id: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM inbox_retries WHERE message_id = ?1",
+            params![message_id],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1240,5 +1289,22 @@ mod tests {
 
         store.clear_guard_retries(ev).unwrap();
         assert_eq!(store.get_guard_retries(ev).unwrap(), None);
+    }
+
+    #[test]
+    fn test_inbox_retries_crud() {
+        let store = Store::new_in_memory().unwrap();
+        let msg_id = "01M20DELIVERY1";
+
+        assert_eq!(store.get_inbox_retries(msg_id).unwrap(), None);
+
+        store.record_inbox_retry(msg_id, 1, 1000).unwrap();
+        assert_eq!(store.get_inbox_retries(msg_id).unwrap(), Some((1, 1000)));
+
+        store.record_inbox_retry(msg_id, 2, 1005).unwrap();
+        assert_eq!(store.get_inbox_retries(msg_id).unwrap(), Some((2, 1005)));
+
+        store.clear_inbox_retries(msg_id).unwrap();
+        assert_eq!(store.get_inbox_retries(msg_id).unwrap(), None);
     }
 }

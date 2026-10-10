@@ -28,6 +28,7 @@ let
       size_cap_bytes = cfg.sizeCapBytes;
       answer_timeout_secs = cfg.answerTimeoutSecs;
       session_live_secs = cfg.sessionLiveSecs;
+      inbox_retry_budget = cfg.inboxRetryBudget;
       db_path = cfg.dbPath;
     }
     // lib.optionalAttrs (cfg.xmsgSocket != null) {
@@ -163,6 +164,12 @@ in
       type = lib.types.ints.unsigned;
       default = 3600;
       description = "Duration in seconds before an idle thread/session context is re-bootstrapped.";
+    };
+
+    inboxRetryBudget = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 10;
+      description = "Maximum attempts to process a failing inbox delivery before giving up and notifying sender and owner.";
     };
 
     dbPath = lib.mkOption {
