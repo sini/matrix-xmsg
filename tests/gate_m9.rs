@@ -76,6 +76,9 @@ fn test_config() -> Config {
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
+        guard_ref: "svc:genie-guard".to_string(),
+        guard_timeout_secs: 30,
+        guard_retry_budget: 3,
         rate_limit_count: 10,
         rate_limit_window_secs: 60,
         size_cap_bytes: 1024,
@@ -276,6 +279,7 @@ async fn oracle_3_late_answer_posted_and_owner_dmed() {
         from_name: "claude".to_string(),
         text: "Late answer arrived before deadline.".to_string(),
         envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4LATE; reply with the xmsg reply tool\n\nLate answer arrived before deadline.".to_string(),
+        origin: None,
     };
     let mut inbox = TestInboxMock::default();
     let reply_outcome = matrix_xmsg::bot::handle_inbox_delivery(
@@ -342,6 +346,7 @@ async fn oracle_4_late_reply_always_posted_no_deadline() {
         from_name: "claude".to_string(),
         text: "Late reply is posted with no deadline.".to_string(),
         envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4VERYLATE; reply with the xmsg reply tool\n\nLate reply is posted with no deadline.".to_string(),
+        origin: None,
     };
     let mut inbox = TestInboxMock::default();
     let reply_outcome = matrix_xmsg::bot::handle_inbox_delivery(
@@ -407,6 +412,7 @@ async fn oracle_5_silent_decline_redacts_eye_and_salutes() {
     let delivery = matrix_xmsg::xmsg::SvcDelivery {
         message_id: "01M4DECLINE".to_string(),
         from_name: "claude".to_string(),
+        origin: None,
         text: r#"{"silent": true}"#.to_string(),
         envelope: r#"[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4DECLINE; reply with the xmsg reply tool
 

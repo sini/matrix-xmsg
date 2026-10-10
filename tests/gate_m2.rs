@@ -101,6 +101,9 @@ fn test_config(homeserver_url: &str) -> Config {
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
+        guard_ref: "svc:genie-guard".to_string(),
+        guard_timeout_secs: 30,
+        guard_retry_budget: 3,
         rate_limit_count: 5,
         rate_limit_window_secs: 60,
         size_cap_bytes: 2048,
@@ -331,6 +334,7 @@ async fn test_sdk_full_sync_and_threaded_reply_loop() {
         envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01DELIVERY001; reply with the xmsg reply tool\n\nThe cluster runs k3s with Cilium and Envoy Gateway.".to_string(),
         text: "The cluster runs k3s with Cilium and Envoy Gateway.".to_string(),
         from_name: "claude".to_string(),
+        origin: None,
     };
     let mut inbox = TestInboxMock::default();
     matrix_xmsg::bot::handle_inbox_delivery(
@@ -985,6 +989,7 @@ async fn test_p4_reply_body_is_threaded_and_mentions_asker() {
         envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01DELIVERY002; reply with the xmsg reply tool\n\nanswer".to_string(),
         text: "answer".to_string(),
         from_name: "claude".to_string(),
+        origin: None,
     };
     let mut inbox = TestInboxMock::default();
     matrix_xmsg::bot::handle_inbox_delivery(

@@ -1,10 +1,15 @@
 use crate::config::{Admission, Config};
-use crate::context::{build_envelope, ContextMode, EventMessage};
+use crate::context::{
+    build_envelope, build_envelope_with_rewrite, compute_sender_tier, ContextMode, EventMessage,
+};
 use crate::error::AppError;
 use crate::matrix::{is_bot_mentioned, MatrixClient};
 use crate::sender_map::map_sender_mxid;
 use crate::store::{ForwardedMessageRecord, Store};
-use crate::xmsg::{parse_in_reply_to_id, SvcDelivery, SvcInbox, XmsgClient};
+use crate::xmsg::{
+    parse_in_reply_to_id, GuardClient, GuardContent, GuardEnvelope, GuardLine, SvcDelivery,
+    SvcInbox, XmsgClient,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BotOutcome {
@@ -29,6 +34,12 @@ pub enum BotOutcome {
     Resynced,
     ResyncThrottled,
     ResyncUnknown,
+    OpenThreadSuccess,
+    OpenThreadRefusal,
+    GuardRejected,
+    GuardFailed,
+    Unbound,
+    IgnoredReleaseNotOwner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +176,18 @@ pub async fn handle_incoming_event(
     xmsg: &dyn XmsgClient,
     store: &Store,
 ) -> Result<BotOutcome, AppError> {
-    handle_incoming_event_with_claim(event, room_history, config, matrix, xmsg, store, None).await
+    let guard = crate::xmsg::create_guard_client(config);
+    handle_incoming_event_with_guard(
+        event,
+        room_history,
+        config,
+        matrix,
+        xmsg,
+        guard.as_ref(),
+        store,
+        None,
+    )
+    .await
 }
 
 pub async fn handle_incoming_event_with_claim(
@@ -174,6 +196,31 @@ pub async fn handle_incoming_event_with_claim(
     config: &Config,
     matrix: &dyn MatrixClient,
     xmsg: &dyn XmsgClient,
+    store: &Store,
+    claimed: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<BotOutcome, AppError> {
+    let guard = crate::xmsg::create_guard_client(config);
+    handle_incoming_event_with_guard(
+        event,
+        room_history,
+        config,
+        matrix,
+        xmsg,
+        guard.as_ref(),
+        store,
+        claimed,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_incoming_event_with_guard(
+    event: &IncomingMatrixEvent,
+    room_history: &[EventMessage],
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    xmsg: &dyn XmsgClient,
+    guard: &dyn GuardClient,
     store: &Store,
     _claimed: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BotOutcome, AppError> {
@@ -185,6 +232,29 @@ pub async fn handle_incoming_event_with_claim(
     // 1. Room Allowlist Gate: Drop silently if not allowlisted
     if !config.is_room_allowlisted(&event.room_id) {
         return Ok(BotOutcome::IgnoredRoom);
+    }
+
+    // Check for !release command on solicited thread opening post
+    if event.body.trim() == "!release" {
+        let target_root = event
+            .thread_root_id
+            .as_deref()
+            .or(event.in_reply_to_event_id.as_deref());
+        if let Some(root_id) = target_root {
+            if let Some(solicited) = store.get_solicited_thread(root_id)? {
+                let is_reply_to_opening = event.in_reply_to_event_id.as_deref()
+                    == Some(&solicited.root_event_id)
+                    || event.thread_root_id.as_deref() == Some(&solicited.root_event_id);
+                if is_reply_to_opening {
+                    if event.sender_mxid == config.owner_mxid {
+                        store.unbind_solicited_thread(&solicited.root_event_id)?;
+                        return Ok(BotOutcome::Unbound);
+                    } else {
+                        return Ok(BotOutcome::IgnoredReleaseNotOwner);
+                    }
+                }
+            }
+        }
     }
 
     let (thread_root, claim_id, reaction_target_id, trigger_msg, is_addressed) =
@@ -367,9 +437,14 @@ pub async fn handle_incoming_event_with_claim(
             } else {
                 false
             };
+            let is_solicited_thread = if let Some(ref root) = event.thread_root_id {
+                store.get_solicited_thread(root)?.is_some()
+            } else {
+                false
+            };
             let is_admitted = match config.admission {
                 Admission::Trusted => is_trusted,
-                Admission::Public => is_trusted || is_top_level || is_asker,
+                Admission::Public => is_trusted || is_top_level || is_asker || is_solicited_thread,
             };
             if !is_admitted {
                 return Ok(BotOutcome::IgnoredUntrustedUser);
@@ -482,6 +557,189 @@ pub async fn handle_incoming_event_with_claim(
         is_addressed,
         mode.clone(),
     );
+
+    // Check if this thread is a bound solicited thread (Unit M15)
+    let solicited_opt = store.get_solicited_thread(&thread_root)?;
+    if let Some(solicited) = solicited_opt {
+        // 1. Build Guard Envelope
+        let all_thread_msgs: Vec<&EventMessage> = room_history
+            .iter()
+            .filter(|m| m.event_id != trigger_msg.event_id)
+            .filter(|m| {
+                m.event_id == thread_root || m.thread_root_id.as_deref() == Some(&thread_root)
+            })
+            .collect();
+
+        let history: Vec<GuardLine> = all_thread_msgs
+            .iter()
+            .map(|m| GuardLine {
+                sender: m.sender_mxid.clone(),
+                tier: compute_sender_tier(
+                    &m.sender_mxid,
+                    &config.trusted_mxids,
+                    Some(&config.owner_mxid),
+                )
+                .to_string(),
+                text: m.body.clone(),
+            })
+            .collect();
+
+        let trigger_tier = compute_sender_tier(
+            &trigger_msg.sender_mxid,
+            &config.trusted_mxids,
+            Some(&config.owner_mxid),
+        );
+        let content = GuardContent {
+            sender: Some(trigger_msg.sender_mxid.clone()),
+            tier: Some(trigger_tier.to_string()),
+            text: trigger_msg.body.clone(),
+        };
+
+        let guard_env = GuardEnvelope {
+            source: "message".to_string(),
+            history,
+            content,
+        };
+
+        // 2. Call Guard
+        let guard_res = guard.check_guard(&config.guard_ref, &guard_env).await;
+
+        let verdict = match guard_res {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "Guard-in failure for line {} in thread {}: {}",
+                    trigger_msg.event_id,
+                    thread_root,
+                    e
+                );
+                let attempts = store.record_guard_retry(
+                    &trigger_msg.event_id,
+                    &event.room_id,
+                    &thread_root,
+                    now_secs,
+                )?;
+                if attempts >= config.guard_retry_budget
+                    && !store.has_guard_failure_dm_sent(&trigger_msg.event_id)?
+                {
+                    let permalink =
+                        format!("https://matrix.to/#/{}/{}", event.room_id, thread_root);
+                    let dm_text = format!(
+                        "[matrix-xmsg] Guard-in failed for line in thread {}",
+                        permalink
+                    );
+                    let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
+                    let _ = store.set_guard_failure_dm_sent(&trigger_msg.event_id);
+                }
+                return Ok(BotOutcome::GuardFailed);
+            }
+        };
+
+        let _ = store.clear_guard_retries(&trigger_msg.event_id);
+
+        if verdict.verdict == "reject" {
+            tracing::info!(
+                "Guard rejected line in thread {}: {}",
+                thread_root,
+                verdict.reason
+            );
+            return Ok(BotOutcome::GuardRejected);
+        }
+
+        // Build relay envelope: allow uses original text; rewrite uses cleaned_text marked rewritten
+        let (relay_trigger, is_rewritten) = if verdict.verdict == "rewrite" {
+            let mut rew = trigger_msg.clone();
+            rew.body = verdict.cleaned_text;
+            (rew, true)
+        } else {
+            (trigger_msg.clone(), false)
+        };
+
+        let relay_envelope = build_envelope_with_rewrite(
+            &event.room_id,
+            &thread_root,
+            &relay_trigger,
+            room_history,
+            &config.trusted_mxids,
+            Some(&config.owner_mxid),
+            config.history_n,
+            config.history_byte_cap,
+            is_addressed,
+            mode.clone(),
+            is_rewritten,
+        );
+
+        // Record relay claim in SQLite
+        store.record_event_relayed(&claim_id, now_secs)?;
+
+        // Relay as reply to request_message_id
+        let send_res = xmsg
+            .reply_message(&solicited.request_message_id, &relay_envelope)
+            .await;
+
+        let (relayed_message_id, session_id) = match send_res {
+            Ok(resp) => (resp.message_id, resp.session_id),
+            Err(e) => {
+                tracing::warn!(
+                    "Push failure to session in room {} thread {}: {}",
+                    event.room_id,
+                    thread_root,
+                    e
+                );
+                if !store.has_solicited_thread_push_failure_dm_sent(&thread_root)? {
+                    let permalink =
+                        format!("https://matrix.to/#/{}/{}", event.room_id, thread_root);
+                    let dm_text = format!(
+                        "[matrix-xmsg] Push failure to session in room {} thread {}: {}",
+                        event.room_id, thread_root, permalink
+                    );
+                    let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
+                    let _ = store.set_solicited_thread_push_failure_dm_sent(&thread_root);
+                }
+                (format!("dead-session-{}", trigger_msg.event_id), None)
+            }
+        };
+
+        // Advance cursor
+        store.set_thread_cursor(
+            &thread_root,
+            &trigger_msg.event_id,
+            now_secs,
+            session_id.as_deref(),
+        )?;
+
+        let mut ack_reaction_id: Option<String> = None;
+        if is_addressed {
+            match matrix
+                .send_reaction(&event.room_id, &reaction_target_id, "👀")
+                .await
+            {
+                Ok(rid) => ack_reaction_id = Some(rid),
+                Err(e) => tracing::warn!(
+                    "Failed to send ack reaction for event {}: {}",
+                    reaction_target_id,
+                    e
+                ),
+            }
+        }
+
+        store.record_thread_message(&thread_root, &relayed_message_id, now_secs)?;
+        let forward_rec = ForwardedMessageRecord {
+            message_id: relayed_message_id.clone(),
+            room_id: event.room_id.clone(),
+            thread_root_id: thread_root.clone(),
+            event_id: reaction_target_id.clone(),
+            sender_mxid: event.sender_mxid.clone(),
+            addressed: is_addressed,
+            sent_at: now_secs,
+            ack_reaction_id,
+            timeout_dm_sent: false,
+            reply_count: 0,
+        };
+        store.record_forwarded_message(&forward_rec)?;
+
+        return Ok(BotOutcome::Forwarded);
+    }
 
     // Record relay claim in SQLite
     store.record_event_relayed(&claim_id, now_secs)?;
@@ -628,6 +886,129 @@ pub async fn handle_inbox_delivery<I: SvcInbox + ?Sized>(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_open_thread<I: SvcInbox + ?Sized>(
+    delivery: &SvcDelivery,
+    open_thread_val: &serde_json::Value,
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    xmsg: &dyn XmsgClient,
+    inbox: &mut I,
+    now_secs: i64,
+) -> Result<BotOutcome, AppError> {
+    // 1. Origin check: must be kind == "local"
+    let is_local = delivery
+        .origin
+        .as_ref()
+        .and_then(|o| o.get("kind"))
+        .and_then(|k| k.as_str())
+        == Some("local");
+
+    if !is_local {
+        let reply_json = serde_json::json!({
+            "error": "unauthorized origin: open_thread requires kind: 'local'"
+        })
+        .to_string();
+        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::OpenThreadRefusal);
+    }
+
+    // 2. Room extraction and allowlist check
+    let room = match open_thread_val.get("room").and_then(|r| r.as_str()) {
+        Some(r) => r.to_string(),
+        None => {
+            let reply_json = serde_json::json!({
+                "error": "missing 'room' in open_thread request"
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::OpenThreadRefusal);
+        }
+    };
+
+    if !config.is_room_allowlisted(&room) {
+        let reply_json = serde_json::json!({
+            "error": format!("room '{room}' is not in allowlisted rooms")
+        })
+        .to_string();
+        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::OpenThreadRefusal);
+    }
+
+    // 3. Text extraction and capping
+    let text = match open_thread_val.get("text").and_then(|t| t.as_str()) {
+        Some(t) => t,
+        None => {
+            let reply_json = serde_json::json!({
+                "error": "missing 'text' in open_thread request"
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::OpenThreadRefusal);
+        }
+    };
+
+    let capped_text = if text.len() > config.size_cap_bytes {
+        let mut end = config.size_cap_bytes;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    } else {
+        text
+    };
+
+    let localpart = config
+        .owner_mxid
+        .strip_prefix('@')
+        .unwrap_or(&config.owner_mxid)
+        .split(':')
+        .next()
+        .unwrap_or(&config.owner_mxid);
+
+    let opening_body = format!("On behalf of @{localpart}: {capped_text}");
+
+    // 4. Post top-level message to Matrix room
+    let root_event_id = matrix.send_notice(&room, None, &opening_body, None).await?;
+
+    // 5. Record bot message and bind solicited thread
+    store.record_bot_message(&root_event_id, &root_event_id, now_secs)?;
+    store.bind_solicited_thread(&root_event_id, &room, &delivery.message_id, now_secs)?;
+
+    // Record forward record for opening message so replies to request_message_id also route to thread
+    let forward_rec = ForwardedMessageRecord {
+        message_id: delivery.message_id.clone(),
+        room_id: room.clone(),
+        thread_root_id: root_event_id.clone(),
+        event_id: root_event_id.clone(),
+        sender_mxid: config.owner_mxid.clone(),
+        addressed: true,
+        sent_at: now_secs,
+        ack_reaction_id: None,
+        timeout_dm_sent: false,
+        reply_count: 0,
+    };
+    store.record_forwarded_message(&forward_rec)?;
+
+    // 6. Reply with root and permalink
+    let permalink = format!("https://matrix.to/#/{room}/{root_event_id}");
+    let reply_json = serde_json::json!({
+        "root": root_event_id,
+        "permalink": permalink,
+    })
+    .to_string();
+    xmsg.reply_message(&delivery.message_id, &reply_json)
+        .await?;
+
+    inbox.ack(&delivery.message_id).await?;
+    Ok(BotOutcome::OpenThreadSuccess)
+}
+
 pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
     delivery: &SvcDelivery,
     config: &Config,
@@ -637,6 +1018,22 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
     inbox: &mut I,
     now_secs: i64,
 ) -> Result<BotOutcome, AppError> {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(delivery.text.trim()) {
+        if let Some(open_thread_val) = val.get("open_thread") {
+            return handle_open_thread(
+                delivery,
+                open_thread_val,
+                config,
+                matrix,
+                store,
+                xmsg,
+                inbox,
+                now_secs,
+            )
+            .await;
+        }
+    }
+
     let is_resync = if let Ok(val) = serde_json::from_str::<serde_json::Value>(delivery.text.trim())
     {
         val.get("resync").and_then(|v| v.as_bool()).unwrap_or(false)

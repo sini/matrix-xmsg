@@ -12,5 +12,5 @@ pub use bot::{
     BotOutcome, ControlAction, IncomingMatrixEvent, IncomingReactionEvent,
 };
 pub use config::{Admission, Config};
-pub use context::{build_envelope, compute_sender_tier, RelayedLine};
+pub use context::{build_envelope, build_envelope_with_rewrite, compute_sender_tier, RelayedLine};
 pub use error::AppError;

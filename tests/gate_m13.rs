@@ -191,6 +191,9 @@ fn test_config(socket_dir: &Path) -> Config {
         answer_timeout_secs: 10,
         session_live_secs: 3600,
         resync_byte_cap: 65536,
+        guard_ref: "svc:genie-guard".to_string(),
+        guard_timeout_secs: 30,
+        guard_retry_budget: 3,
         db_path: PathBuf::from(":memory:"),
     }
 }

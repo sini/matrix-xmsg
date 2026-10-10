@@ -1,10 +1,11 @@
 use crate::config::Config;
 use crate::error::AppError;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 /// Parses the replied-to message ID from a delivery envelope or text.
 ///
@@ -28,12 +29,32 @@ pub fn parse_in_reply_to_id(input: &str) -> Option<&str> {
 }
 
 /// A delivery received through the xmsg service inbox.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SvcDelivery {
     pub message_id: String,
     pub from_name: String,
     pub text: String,
     pub envelope: String,
+    #[serde(default)]
+    pub origin: Option<Value>,
+}
+
+impl SvcDelivery {
+    pub fn new(
+        message_id: impl Into<String>,
+        from_name: impl Into<String>,
+        text: impl Into<String>,
+        envelope: impl Into<String>,
+        origin: Option<Value>,
+    ) -> Self {
+        Self {
+            message_id: message_id.into(),
+            from_name: from_name.into(),
+            text: text.into(),
+            envelope: envelope.into(),
+            origin,
+        }
+    }
 }
 
 /// Service inbox trait for polling deliveries and acknowledging them.
@@ -129,12 +150,14 @@ impl SvcInbox for SvcSocketInbox {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let origin = val.get("origin").cloned();
 
                 Ok(Some(SvcDelivery {
                     message_id,
                     from_name,
                     text,
                     envelope,
+                    origin,
                 }))
             }
             "timeout" => Ok(None),
@@ -504,6 +527,403 @@ pub fn create_xmsg_client(config: &Config) -> Arc<dyn XmsgClient> {
     Arc::new(UnixXmsgClient::new(config.xmsg_agent_socket()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardLine {
+    pub sender: String,
+    pub tier: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardContent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardEnvelope {
+    pub source: String,
+    pub history: Vec<GuardLine>,
+    pub content: GuardContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardVerdict {
+    pub verdict: String,
+    pub reason: String,
+    pub cleaned_text: String,
+}
+
+#[async_trait]
+pub trait GuardClient: Send + Sync {
+    async fn check_guard(
+        &self,
+        guard_ref: &str,
+        envelope: &GuardEnvelope,
+    ) -> Result<GuardVerdict, AppError>;
+}
+
+#[derive(Default, Clone)]
+pub struct MockGuardClient {
+    pub verdicts: Arc<Mutex<Vec<Result<GuardVerdict, String>>>>,
+    pub calls: Arc<Mutex<Vec<(String, GuardEnvelope)>>>,
+}
+
+impl MockGuardClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_verdict(verdict: &str, reason: &str, cleaned_text: &str) -> Self {
+        let mock = Self::default();
+        mock.verdicts.lock().unwrap().push(Ok(GuardVerdict {
+            verdict: verdict.to_string(),
+            reason: reason.to_string(),
+            cleaned_text: cleaned_text.to_string(),
+        }));
+        mock
+    }
+
+    pub fn with_error(err: &str) -> Self {
+        let mock = Self::default();
+        mock.verdicts.lock().unwrap().push(Err(err.to_string()));
+        mock
+    }
+
+    pub fn add_verdict(&self, verdict: &str, reason: &str, cleaned_text: &str) {
+        self.verdicts.lock().unwrap().push(Ok(GuardVerdict {
+            verdict: verdict.to_string(),
+            reason: reason.to_string(),
+            cleaned_text: cleaned_text.to_string(),
+        }));
+    }
+
+    pub fn add_error(&self, err: &str) {
+        self.verdicts.lock().unwrap().push(Err(err.to_string()));
+    }
+}
+
+#[async_trait]
+impl GuardClient for MockGuardClient {
+    async fn check_guard(
+        &self,
+        guard_ref: &str,
+        envelope: &GuardEnvelope,
+    ) -> Result<GuardVerdict, AppError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((guard_ref.to_string(), envelope.clone()));
+        let mut list = self.verdicts.lock().unwrap();
+        if list.is_empty() {
+            Ok(GuardVerdict {
+                verdict: "allow".to_string(),
+                reason: "default allow".to_string(),
+                cleaned_text: envelope.content.text.clone(),
+            })
+        } else {
+            let res = list.remove(0);
+            match res {
+                Ok(v) => Ok(v),
+                Err(e) => Err(AppError::Xmsg(format!("Guard error: {e}"))),
+            }
+        }
+    }
+}
+
+pub struct UnixGuardClient {
+    pub agent_sock_path: PathBuf,
+    pub http_sock_path: PathBuf,
+    pub timeout_secs: u64,
+}
+
+impl UnixGuardClient {
+    pub fn new(agent_sock_path: PathBuf, http_sock_path: PathBuf, timeout_secs: u64) -> Self {
+        Self {
+            agent_sock_path,
+            http_sock_path,
+            timeout_secs,
+        }
+    }
+}
+
+pub fn parse_guard_reply(reply_text: &str) -> Result<GuardVerdict, AppError> {
+    let val: Value = serde_json::from_str(reply_text.trim()).map_err(|e| {
+        AppError::Xmsg(format!(
+            "Guard reply is not valid JSON: {e}; raw: {reply_text}"
+        ))
+    })?;
+
+    let obj = val
+        .as_object()
+        .ok_or_else(|| AppError::Xmsg("Guard reply JSON is not an object".to_string()))?;
+
+    if let Some(err_val) = obj.get("error") {
+        return Err(AppError::Xmsg(format!("Guard returned error: {err_val}")));
+    }
+
+    let verdict = obj
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Xmsg("Missing 'verdict' in guard reply".to_string()))?;
+
+    if verdict != "allow" && verdict != "rewrite" && verdict != "reject" {
+        return Err(AppError::Xmsg(format!(
+            "Invalid verdict '{verdict}': must be 'allow', 'rewrite', or 'reject'"
+        )));
+    }
+
+    let reason = obj
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let cleaned_text = obj
+        .get("cleaned_text")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(GuardVerdict {
+        verdict: verdict.to_string(),
+        reason,
+        cleaned_text,
+    })
+}
+
+async fn http_get_replies(
+    http_sock_path: &Path,
+    message_id: &str,
+    after_seq: i64,
+    wait_secs: u64,
+) -> Result<Vec<Value>, AppError> {
+    let mut stream = tokio::net::UnixStream::connect(http_sock_path)
+        .await
+        .map_err(|e| {
+            AppError::Xmsg(format!(
+                "Failed to connect to http.sock at {}: {e}",
+                http_sock_path.display()
+            ))
+        })?;
+
+    let path_query =
+        format!("/v1/messages/{message_id}/replies?after={after_seq}&wait={wait_secs}");
+    let req = format!("GET {path_query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| AppError::Xmsg(format!("Failed to write HTTP request: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| AppError::Xmsg(format!("Failed to flush HTTP request: {e}")))?;
+
+    let mut response_bytes = Vec::new();
+    stream
+        .read_to_end(&mut response_bytes)
+        .await
+        .map_err(|e| AppError::Xmsg(format!("Failed to read HTTP response: {e}")))?;
+
+    let response_str = String::from_utf8_lossy(&response_bytes);
+    let (headers, body) = match response_str.find("\r\n\r\n") {
+        Some(idx) => (&response_str[..idx], &response_str[idx + 4..]),
+        None => match response_str.find("\n\n") {
+            Some(idx) => (&response_str[..idx], &response_str[idx + 2..]),
+            None => {
+                return Err(AppError::Xmsg(format!(
+                    "Invalid HTTP response: header delimiter not found; raw: {response_str}"
+                )));
+            }
+        },
+    };
+
+    let status_line = headers.lines().next().unwrap_or("");
+    if !status_line.contains(" 200 ") && !status_line.ends_with(" 200") {
+        return Err(AppError::Xmsg(format!(
+            "HTTP error from http.sock: {status_line}; body: {body}"
+        )));
+    }
+
+    let is_chunked = headers.lines().any(|l| {
+        let lower = l.to_ascii_lowercase();
+        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+    });
+
+    let decoded_body = if is_chunked {
+        decode_chunked_body(body)?
+    } else {
+        body.to_string()
+    };
+
+    let val: Value = serde_json::from_str(&decoded_body).map_err(|e| {
+        AppError::Xmsg(format!(
+            "Failed to parse JSON replies array: {e}; body: {decoded_body}"
+        ))
+    })?;
+
+    val.as_array()
+        .cloned()
+        .ok_or_else(|| AppError::Xmsg("Expected JSON array of replies".to_string()))
+}
+
+fn decode_chunked_body(body: &str) -> Result<String, AppError> {
+    let mut result = String::new();
+    let mut remaining = body;
+    while !remaining.is_empty() {
+        let (size_str, rest) = match remaining.split_once("\r\n") {
+            Some(pair) => pair,
+            None => match remaining.split_once('\n') {
+                Some(pair) => pair,
+                None => break,
+            },
+        };
+        let size_str = size_str.trim();
+        if size_str.is_empty() {
+            break;
+        }
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|e| AppError::Xmsg(format!("Invalid chunk size hex '{size_str}': {e}")))?;
+        if chunk_size == 0 {
+            break;
+        }
+        if rest.len() < chunk_size {
+            return Err(AppError::Xmsg("Truncated chunked HTTP body".to_string()));
+        }
+        result.push_str(&rest[..chunk_size]);
+        let after_chunk = &rest[chunk_size..];
+        remaining = after_chunk
+            .strip_prefix("\r\n")
+            .or_else(|| after_chunk.strip_prefix('\n'))
+            .unwrap_or(after_chunk);
+    }
+    Ok(result)
+}
+
+#[async_trait]
+impl GuardClient for UnixGuardClient {
+    async fn check_guard(
+        &self,
+        guard_ref: &str,
+        envelope: &GuardEnvelope,
+    ) -> Result<GuardVerdict, AppError> {
+        let stream = tokio::net::UnixStream::connect(&self.agent_sock_path)
+            .await
+            .map_err(|e| {
+                AppError::Xmsg(format!(
+                    "Failed to connect to agent socket at {}: {e}",
+                    self.agent_sock_path.display()
+                ))
+            })?;
+
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = tokio::io::BufReader::new(read_half).lines();
+
+        let env_text = serde_json::to_string(envelope)
+            .map_err(|e| AppError::Xmsg(format!("Failed to serialize guard envelope: {e}")))?;
+
+        let req = serde_json::json!({
+            "action": "send",
+            "ref": guard_ref,
+            "text": env_text,
+            "push_replies": false,
+        });
+        let line = format!("{req}\n");
+        write_half.write_all(line.as_bytes()).await.map_err(|e| {
+            AppError::Xmsg(format!("Failed to write send request to agent.sock: {e}"))
+        })?;
+        write_half.flush().await.map_err(|e| {
+            AppError::Xmsg(format!("Failed to flush send request to agent.sock: {e}"))
+        })?;
+
+        let resp_line = lines
+            .next_line()
+            .await
+            .map_err(|e| {
+                AppError::Xmsg(format!("Failed to read send response from agent.sock: {e}"))
+            })?
+            .ok_or_else(|| {
+                AppError::Xmsg("Agent socket closed before send response".to_string())
+            })?;
+
+        let val: Value = serde_json::from_str(&resp_line).map_err(|e| {
+            AppError::Xmsg(format!(
+                "Invalid JSON in agent.sock send response: {e}; raw: {resp_line}"
+            ))
+        })?;
+
+        let status = val.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        if status != "ok" {
+            let detail = val
+                .get("detail")
+                .and_then(|d| d.as_str())
+                .unwrap_or("send failed");
+            return Err(AppError::Xmsg(format!(
+                "agent.sock guard send failed: {detail}"
+            )));
+        }
+
+        let message_id = val
+            .get("delivery")
+            .and_then(|d| d.get("messageId").or_else(|| d.get("message_id")))
+            .or_else(|| val.get("messageId"))
+            .or_else(|| val.get("message_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::Xmsg(format!(
+                    "agent.sock send response missing messageId: {resp_line}"
+                ))
+            })?;
+
+        // Long-poll http.sock for replies
+        let start_time = tokio::time::Instant::now();
+        let total_timeout = std::time::Duration::from_secs(self.timeout_secs);
+        let mut after_seq = 0i64;
+
+        loop {
+            let elapsed = start_time.elapsed();
+            if elapsed >= total_timeout {
+                return Err(AppError::Xmsg(format!(
+                    "Guard check timed out after {}s waiting for reply to message {message_id}",
+                    self.timeout_secs
+                )));
+            }
+            let remaining = total_timeout - elapsed;
+            let wait_secs = remaining.as_secs().clamp(1, 60);
+
+            let replies =
+                http_get_replies(&self.http_sock_path, message_id, after_seq, wait_secs).await?;
+            if !replies.is_empty() {
+                for r in &replies {
+                    if let Some(s) = r.get("seq").and_then(|s| s.as_i64()) {
+                        if s > after_seq {
+                            after_seq = s;
+                        }
+                    }
+                }
+                let last_reply = &replies[replies.len() - 1];
+                let reply_text = last_reply
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .ok_or_else(|| AppError::Xmsg("Missing 'text' in reply record".to_string()))?;
+
+                return parse_guard_reply(reply_text);
+            }
+        }
+    }
+}
+
+pub fn create_guard_client(config: &Config) -> Arc<dyn GuardClient> {
+    Arc::new(UnixGuardClient::new(
+        config.xmsg_agent_socket(),
+        config.xmsg_http_socket(),
+        config.guard_timeout_secs,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +950,49 @@ mod tests {
 
         let none = "hello world without key";
         assert_eq!(parse_in_reply_to_id(none), None);
+    }
+
+    #[test]
+    fn test_parse_guard_reply_allow() {
+        let text = r#"{"verdict": "allow", "reason": "clean", "cleaned_text": "hello"}"#;
+        let v = parse_guard_reply(text).unwrap();
+        assert_eq!(v.verdict, "allow");
+        assert_eq!(v.reason, "clean");
+        assert_eq!(v.cleaned_text, "hello");
+    }
+
+    #[test]
+    fn test_parse_guard_reply_rewrite() {
+        let text = r#"{"verdict": "rewrite", "reason": "sanitized", "cleaned_text": "safe text"}"#;
+        let v = parse_guard_reply(text).unwrap();
+        assert_eq!(v.verdict, "rewrite");
+        assert_eq!(v.reason, "sanitized");
+        assert_eq!(v.cleaned_text, "safe text");
+    }
+
+    #[test]
+    fn test_parse_guard_reply_reject() {
+        let text = r#"{"verdict": "reject", "reason": "attack detected", "cleaned_text": ""}"#;
+        let v = parse_guard_reply(text).unwrap();
+        assert_eq!(v.verdict, "reject");
+        assert_eq!(v.reason, "attack detected");
+    }
+
+    #[test]
+    fn test_parse_guard_reply_error() {
+        let text = r#"{"error": "model timeout"}"#;
+        assert!(parse_guard_reply(text).is_err());
+    }
+
+    #[test]
+    fn test_parse_guard_reply_invalid_verdict() {
+        let text = r#"{"verdict": "unknown", "reason": "none"}"#;
+        assert!(parse_guard_reply(text).is_err());
+    }
+
+    #[test]
+    fn test_parse_guard_reply_invalid_json() {
+        let text = "not json";
+        assert!(parse_guard_reply(text).is_err());
     }
 }

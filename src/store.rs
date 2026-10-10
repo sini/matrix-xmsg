@@ -128,6 +128,21 @@ impl Store {
             CREATE TABLE IF NOT EXISTS thread_resyncs (
                 thread_root_id TEXT PRIMARY KEY,
                 last_resync_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS solicited_threads (
+                root_event_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                request_message_id TEXT NOT NULL,
+                opened_at INTEGER NOT NULL,
+                push_failed_dm_sent INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS guard_retries (
+                event_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                thread_root_id TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                last_attempt_at INTEGER NOT NULL,
+                failed_dm_sent INTEGER NOT NULL DEFAULT 0
             );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
@@ -672,6 +687,8 @@ impl Store {
             "thread_cursors",
             "forwarded_messages",
             "thread_resyncs",
+            "solicited_threads",
+            "guard_retries",
         ];
         let mut total = 0;
         for table in tables {
@@ -683,6 +700,184 @@ impl Store {
         }
         Ok(total)
     }
+
+    pub fn bind_solicited_thread(
+        &self,
+        root_event_id: &str,
+        room_id: &str,
+        request_message_id: &str,
+        opened_at: i64,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO solicited_threads (root_event_id, room_id, request_message_id, opened_at, push_failed_dm_sent)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            params![root_event_id, room_id, request_message_id, opened_at],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to bind solicited thread: {e}")))?;
+        Ok(())
+    }
+
+    pub fn get_solicited_thread(
+        &self,
+        root_event_id: &str,
+    ) -> Result<Option<SolicitedThreadRecord>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT root_event_id, room_id, request_message_id, opened_at, push_failed_dm_sent
+                 FROM solicited_threads WHERE root_event_id = ?1",
+            )
+            .map_err(|e| AppError::Store(format!("Failed to prepare get_solicited_thread: {e}")))?;
+
+        let mut rows = stmt
+            .query(params![root_event_id])
+            .map_err(|e| AppError::Store(format!("Failed to query get_solicited_thread: {e}")))?;
+
+        if let Some(row) = rows.next().map_err(|e| AppError::Store(e.to_string()))? {
+            let push_failed_int: i64 = row.get(4).map_err(|e| AppError::Store(e.to_string()))?;
+            Ok(Some(SolicitedThreadRecord {
+                root_event_id: row.get(0).map_err(|e| AppError::Store(e.to_string()))?,
+                room_id: row.get(1).map_err(|e| AppError::Store(e.to_string()))?,
+                request_message_id: row.get(2).map_err(|e| AppError::Store(e.to_string()))?,
+                opened_at: row.get(3).map_err(|e| AppError::Store(e.to_string()))?,
+                push_failed_dm_sent: push_failed_int != 0,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn unbind_solicited_thread(&self, root_event_id: &str) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn
+            .execute(
+                "DELETE FROM solicited_threads WHERE root_event_id = ?1",
+                params![root_event_id],
+            )
+            .map_err(|e| AppError::Store(format!("Failed to unbind solicited thread: {e}")))?;
+        Ok(rows > 0)
+    }
+
+    pub fn has_solicited_thread_push_failure_dm_sent(
+        &self,
+        root_event_id: &str,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT push_failed_dm_sent FROM solicited_threads WHERE root_event_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![root_event_id])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| AppError::Store(e.to_string()))? {
+            let sent: i64 = row.get(0).map_err(|e| AppError::Store(e.to_string()))?;
+            Ok(sent != 0)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn set_solicited_thread_push_failure_dm_sent(
+        &self,
+        root_event_id: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE solicited_threads SET push_failed_dm_sent = 1 WHERE root_event_id = ?1",
+            params![root_event_id],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn record_guard_retry(
+        &self,
+        event_id: &str,
+        room_id: &str,
+        thread_root_id: &str,
+        now_secs: i64,
+    ) -> Result<usize, AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO guard_retries (event_id, room_id, thread_root_id, attempts, last_attempt_at, failed_dm_sent)
+             VALUES (?1, ?2, ?3, 1, ?4, 0)
+             ON CONFLICT(event_id) DO UPDATE SET
+                attempts = attempts + 1,
+                last_attempt_at = ?4",
+            params![event_id, room_id, thread_root_id, now_secs],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to record guard retry: {e}")))?;
+
+        let mut stmt = conn
+            .prepare("SELECT attempts FROM guard_retries WHERE event_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let attempts: i64 = stmt
+            .query_row(params![event_id], |row| row.get(0))
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(attempts as usize)
+    }
+
+    pub fn get_guard_retries(&self, event_id: &str) -> Result<Option<usize>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT attempts FROM guard_retries WHERE event_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![event_id])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| AppError::Store(e.to_string()))? {
+            let attempts: i64 = row.get(0).map_err(|e| AppError::Store(e.to_string()))?;
+            Ok(Some(attempts as usize))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn has_guard_failure_dm_sent(&self, event_id: &str) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT failed_dm_sent FROM guard_retries WHERE event_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![event_id])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| AppError::Store(e.to_string()))? {
+            let sent: i64 = row.get(0).map_err(|e| AppError::Store(e.to_string()))?;
+            Ok(sent != 0)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn set_guard_failure_dm_sent(&self, event_id: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE guard_retries SET failed_dm_sent = 1 WHERE event_id = ?1",
+            params![event_id],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn clear_guard_retries(&self, event_id: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM guard_retries WHERE event_id = ?1",
+            params![event_id],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SolicitedThreadRecord {
+    pub root_event_id: String,
+    pub room_id: String,
+    pub request_message_id: String,
+    pub opened_at: i64,
+    pub push_failed_dm_sent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -982,5 +1177,68 @@ mod tests {
             .check_and_record_thread_resync("$other_root", 1061, 60)
             .unwrap();
         assert_eq!(res_diff, Ok(()));
+    }
+
+    #[test]
+    fn test_solicited_threads_crud() {
+        let store = Store::new_in_memory().unwrap();
+        let root = "$root_solicited";
+        let room = "!room:example.org";
+        let req_msg = "01M15REQ";
+
+        assert!(store.get_solicited_thread(root).unwrap().is_none());
+
+        store
+            .bind_solicited_thread(root, room, req_msg, 1000)
+            .unwrap();
+        let rec = store
+            .get_solicited_thread(root)
+            .unwrap()
+            .expect("record must exist");
+        assert_eq!(rec.root_event_id, root);
+        assert_eq!(rec.room_id, room);
+        assert_eq!(rec.request_message_id, req_msg);
+        assert_eq!(rec.opened_at, 1000);
+        assert!(!rec.push_failed_dm_sent);
+
+        assert!(!store
+            .has_solicited_thread_push_failure_dm_sent(root)
+            .unwrap());
+        store
+            .set_solicited_thread_push_failure_dm_sent(root)
+            .unwrap();
+        assert!(store
+            .has_solicited_thread_push_failure_dm_sent(root)
+            .unwrap());
+
+        let unbound = store.unbind_solicited_thread(root).unwrap();
+        assert!(unbound);
+        assert!(store.get_solicited_thread(root).unwrap().is_none());
+        assert!(!store.unbind_solicited_thread(root).unwrap());
+    }
+
+    #[test]
+    fn test_guard_retries_crud() {
+        let store = Store::new_in_memory().unwrap();
+        let ev = "$ev_guard_retry";
+        let room = "!room:example.org";
+        let root = "$root_guard";
+
+        assert_eq!(store.get_guard_retries(ev).unwrap(), None);
+
+        let att1 = store.record_guard_retry(ev, room, root, 1000).unwrap();
+        assert_eq!(att1, 1);
+        assert_eq!(store.get_guard_retries(ev).unwrap(), Some(1));
+
+        let att2 = store.record_guard_retry(ev, room, root, 1010).unwrap();
+        assert_eq!(att2, 2);
+        assert_eq!(store.get_guard_retries(ev).unwrap(), Some(2));
+
+        assert!(!store.has_guard_failure_dm_sent(ev).unwrap());
+        store.set_guard_failure_dm_sent(ev).unwrap();
+        assert!(store.has_guard_failure_dm_sent(ev).unwrap());
+
+        store.clear_guard_retries(ev).unwrap();
+        assert_eq!(store.get_guard_retries(ev).unwrap(), None);
     }
 }

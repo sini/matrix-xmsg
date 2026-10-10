@@ -99,6 +99,27 @@ Matrix IDs (`@alice:example.org`) are converted to sanitized ASCII identifiers (
 - Strips non-ASCII characters.
 - Enforces a 64-character length cap.
 
+### 1.7 Solicited Threads & Guard Integration (M15)
+
+A local session on the xmsg bus can solicit Matrix threads by asking the bot to open a thread on its behalf:
+
+- **Opening a Thread (`open_thread`):** A message delivered to the bot's service inbox carrying `{"open_thread": {"room": "<room_id>", "text": "<text>"}}` initiates thread creation.
+  - **Local Origin Enforcement:** The request must carry an xmsg origin with `kind: "local"`. Messages from any other origin (or lacking local origin) are refused with an error reply and post nothing to Matrix.
+  - **Room Allowlist & Size Cap:** The requested `room` must be present in `config.rooms` and the text is capped at `size_cap_bytes`. Non-allowlisted rooms are refused with an error reply.
+  - **Opening Post:** The bot posts top-level in the requested room: `On behalf of @<localpart>: <text>`, where `<localpart>` is parsed from `config.owner_mxid`.
+  - **Binding & Reply:** The bot records `(root_event_id, room_id, request_message_id, opened_at)` in the SQLite `solicited_threads` table and replies to `request_message_id` with `{"root": "<root_event_id>", "permalink": "https://matrix.to/#/<room_id>/<root_event_id>"}`.
+- **Bound Thread Routing & Guard Pipeline:**
+  - Admitted lines occurring inside a bound thread are routed to the requesting session via `reply_message` to `request_message_id` (rather than `expert_ref`).
+  - Prior to relaying, each line is sent to `config.guard_ref` (`svc:genie-guard`) with `push_replies: false`. The bot long-polls `http.sock` at `/v1/messages/{id}/replies?wait=...` bounded by `guard_timeout_secs` (default 150s) to receive the guard's reply.
+  - **Guard Verdicts & Strict Parsing:**
+    - `allow`: Relays the original envelope text.
+    - `rewrite`: Relays `cleaned_text` with `"rewritten": true` in the context line.
+    - `reject`: Relays nothing and drops the line.
+    - `error / timeout / invalid`: Any error response (`{"error": ...}`), timeout, unparseable JSON, or unexpected verdict fails closed and retries up to `guard_retry_budget` (default 3). If retries are exhausted, sends a single DM to the owner with the thread permalink.
+- **Session Replies:** Replies from the requesting session to a relayed line land in the bot's service inbox and are posted to Matrix inside the bound thread as a notice mentioning the asker.
+- **Releasing a Thread (`!release`):** Replying `!release` to the opening post from `owner_mxid` unbinds the thread (`solicited_threads` row removed). Subsequent messages fall back to standard routing (`expert_ref`). `!release` from non-owner senders is ignored.
+- **Dead Session Push Failure:** If pushing a relayed line fails because the requesting session is dead, the bot DMs the owner once with the thread permalink and continues relaying.
+
 ---
 
 ## 2. Configuration & Direct Execution
@@ -115,6 +136,9 @@ owner_mxid = "@owner:example.org"
 admission = "trusted" # "trusted" (default) or "public"
 xmsg_socket = "/run/user/1000/xmsg"
 expert_ref = "claude"
+guard_ref = "svc:genie-guard"
+guard_timeout_secs = 150
+guard_retry_budget = 3
 history_n = 30
 history_byte_cap = 12288
 rate_limit_count = 10

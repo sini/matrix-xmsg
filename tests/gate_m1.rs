@@ -79,6 +79,9 @@ fn test_config() -> Config {
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
+        guard_ref: "svc:genie-guard".to_string(),
+        guard_timeout_secs: 30,
+        guard_retry_budget: 3,
         rate_limit_count: 3,
         rate_limit_window_secs: 60,
         size_cap_bytes: 200,
@@ -228,6 +231,7 @@ async fn test_allowlisted_mention_triggers_and_replies_in_thread() {
         from_name: "claude".to_string(),
         text: "To configure logging, set RUST_LOG=info in your environment.".to_string(),
         envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4REPLY; reply with the xmsg reply tool\n\nTo configure logging, set RUST_LOG=info in your environment.".to_string(),
+        origin: None,
     };
     let deliv_outcome =
         handle_inbox_delivery(&delivery, &config, &matrix, &store, &mut inbox, 2000)
@@ -556,6 +560,7 @@ async fn test_expert_escalate_marker() {
         from_name: "claude".to_string(),
         text: "I am unsure about this server configuration. [escalate]".to_string(),
         envelope: "[xmsg] reply to message_id=01MOCKMSG000001 — message_id=01M4ESC; reply with the xmsg reply tool\n\nI am unsure about this server configuration. [escalate]".to_string(),
+        origin: None,
     };
     let deliv_outcome =
         handle_inbox_delivery(&delivery, &config, &matrix, &store, &mut inbox, 2000)

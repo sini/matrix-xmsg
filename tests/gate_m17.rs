@@ -112,6 +112,9 @@ fn test_config() -> Config {
         answer_timeout_secs: 10,
         session_live_secs: 3600,
         resync_byte_cap: 65536,
+        guard_ref: "svc:genie-guard".to_string(),
+        guard_timeout_secs: 30,
+        guard_retry_budget: 3,
         db_path: PathBuf::from(":memory:"),
     }
 }
@@ -193,6 +196,7 @@ async fn oracle_1_resync_reply_produces_transcript_reply_and_nothing_in_room() {
     let delivery = SvcDelivery {
         message_id: "01RESYNC00001".to_string(),
         from_name: "session-oracle1".to_string(),
+        origin: None,
         text: r#"{"resync": true}"#.to_string(),
         envelope: format!(
             "[xmsg] reply to message_id={last_fwd_id} — message_id=01RESYNC00001\n{{\"resync\": true}}"
@@ -313,6 +317,7 @@ async fn oracle_2_thread_longer_than_history_n_returned_in_full_paged() {
     let delivery = SvcDelivery {
         message_id: "01RESYNC00002".to_string(),
         from_name: "session-oracle2".to_string(),
+        origin: None,
         text: r#"{"resync": true}"#.to_string(),
         envelope: format!(
             "[xmsg] reply to message_id={fwd_id} — message_id=01RESYNC00002\n{{\"resync\": true}}"
@@ -416,6 +421,7 @@ async fn oracle_3_over_byte_cap_background_lines_dropped_first_and_envelope_trun
     let delivery = SvcDelivery {
         message_id: "01RESYNC00003".to_string(),
         from_name: "session-oracle3".to_string(),
+        origin: None,
         text: r#"{"resync": true}"#.to_string(),
         envelope: format!(
             "[xmsg] reply to message_id={fwd_id} — message_id=01RESYNC00003\n{{\"resync\": true}}"
@@ -498,6 +504,7 @@ async fn oracle_4_after_resync_next_forward_is_delta_from_newest_line_sent() {
     let delivery = SvcDelivery {
         message_id: "01RESYNC00004".to_string(),
         from_name: "session-oracle4".to_string(),
+        origin: None,
         text: r#"{"resync": true}"#.to_string(),
         envelope: format!(
             "[xmsg] reply to message_id={fwd_id} — message_id=01RESYNC00004\n{{\"resync\": true}}"
@@ -583,6 +590,7 @@ async fn oracle_5_second_resync_within_60s_is_throttled() {
     let delivery1 = SvcDelivery {
         message_id: "01RESYNC00005_1".to_string(),
         from_name: "session-oracle5".to_string(),
+        origin: None,
         text: r#"{"resync": true}"#.to_string(),
         envelope: format!(
             "[xmsg] reply to message_id={fwd_id} — message_id=01RESYNC00005_1\n{{\"resync\": true}}"
@@ -606,6 +614,7 @@ async fn oracle_5_second_resync_within_60s_is_throttled() {
     let delivery2 = SvcDelivery {
         message_id: "01RESYNC00005_2".to_string(),
         from_name: "session-oracle5".to_string(),
+        origin: None,
         text: r#"{"resync": true}"#.to_string(),
         envelope: format!(
             "[xmsg] reply to message_id={fwd_id} — message_id=01RESYNC00005_2\n{{\"resync\": true}}"
@@ -645,6 +654,7 @@ async fn oracle_5_second_resync_within_60s_is_throttled() {
     let delivery3 = SvcDelivery {
         message_id: "01RESYNC00005_3".to_string(),
         from_name: "session-oracle5".to_string(),
+        origin: None,
         text: r#"{"resync": true}"#.to_string(),
         envelope: format!(
             "[xmsg] reply to message_id={fwd_id} — message_id=01RESYNC00005_3\n{{\"resync\": true}}"
@@ -679,6 +689,7 @@ async fn test_resync_unknown_forward_message_responds_unknown() {
     let delivery = SvcDelivery {
         message_id: "01RESYNC_UNK".to_string(),
         from_name: "session-unknown".to_string(),
+        origin: None,
         text: r#"{"resync": true}"#.to_string(),
         envelope:
             "[xmsg] reply to message_id=01NONEXISTENT — message_id=01RESYNC_UNK\n{\"resync\": true}"

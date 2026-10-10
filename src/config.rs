@@ -43,6 +43,18 @@ fn default_session_live_secs() -> u64 {
     3600
 }
 
+fn default_guard_ref() -> String {
+    "svc:genie-guard".to_string()
+}
+
+fn default_guard_timeout_secs() -> u64 {
+    150
+}
+
+fn default_guard_retry_budget() -> usize {
+    3
+}
+
 fn default_db_path() -> PathBuf {
     PathBuf::from("/var/lib/matrix-xmsg/matrix-xmsg.db")
 }
@@ -72,6 +84,15 @@ pub struct Config {
 
     #[serde(default = "default_expert_ref")]
     pub expert_ref: String,
+
+    #[serde(default = "default_guard_ref")]
+    pub guard_ref: String,
+
+    #[serde(default = "default_guard_timeout_secs")]
+    pub guard_timeout_secs: u64,
+
+    #[serde(default = "default_guard_retry_budget")]
+    pub guard_retry_budget: usize,
 
     #[serde(default = "default_history_n")]
     pub history_n: usize,
@@ -142,11 +163,35 @@ impl Config {
     pub fn xmsg_agent_socket(&self) -> PathBuf {
         self.xmsg_socket.join("agent.sock")
     }
+
+    pub fn xmsg_http_socket(&self) -> PathBuf {
+        self.xmsg_socket.join("http.sock")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_guard_defaults() {
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = []
+            owner_mxid = "@owner:example.org"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.guard_ref, "svc:genie-guard");
+        assert_eq!(cfg.guard_timeout_secs, 150);
+        assert_eq!(cfg.guard_retry_budget, 3);
+        assert_eq!(
+            cfg.xmsg_http_socket(),
+            PathBuf::from("/run/user/1000/xmsg/http.sock")
+        );
+    }
 
     #[test]
     fn test_admission_default_trusted() {
