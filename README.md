@@ -81,10 +81,11 @@
     ```
   - XML escaping: `<request>`, `</request>`, `<context`, and `</context>` tags occurring inside user-supplied message text are escaped (`<\request`, `<\context`) prior to JSON serialization, preventing sandbox breakouts or fake block imitation.
 
-### 1.5 Svc Inbox & Reply Contract (M13, M17)
+### 1.5 Svc Inbox & Reply Contract (M13, M17, M18)
 
 - **The Bot as `svc:matrix-xmsg`:** On startup, the bot registers on xmsg's `register.sock` as `svc:matrix-xmsg`. Every forward is sent attested on `agent.sock` (`action: "send"`, `push_replies: true`), routing subsequent replies directly to the bot's service inbox.
 - **Posting Every Reply (No Deadline):** Every reply arriving in the service inbox is posted to the Matrix thread in order. An agent may follow up by replying again; each reply is posted.
+- **Automatic Reconnect & Re-registration (M18):** When the registration connection to xmsg is lost (due to daemon restarts, upgrades, or errors), the bot automatically reconnects with exponential backoff (starting at 1s, capped at 30s) and re-registers as `svc:matrix-xmsg`, resuming inbox polling without losing unacked deliveries or requiring a bot restart.
 - **Silent Decline (`{"silent": true}`):** If an agent replies with `{"silent": true}`, the bot posts nothing to the room, redacts its original `👀` reaction, and reacts with `🫡`.
 - **Thread Resync & Compaction Recovery (`{"resync": true}`) (M17):** An agent session recovering from auto-compaction or context loss may re-request the thread's complete transcript by replying with `{"resync": true}`. The bot treats this as a control (never posted to Matrix) and replies on xmsg with a bootstrap-formatted transcript bounded by `resync_byte_cap` (dropping room background lines before thread lines). The thread cursor advances to the newest line sent with the requesting session ID. Resync requests are rate-limited to at most one per thread per 60 seconds (throttled requests receive `{"resync": "throttled", "retry_after": <s>}`); unknown messages receive `{"resync": "unknown"}`.
 - **Delivery & Ack Guarantees:** A reply is acknowledged (`ack`) on `register.sock` only after its Matrix notice post succeeds (or resync reply is dispatched). Crashes or failures cause re-delivery rather than lost replies.

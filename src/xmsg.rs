@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 /// Parses the replied-to message ID from a delivery envelope or text.
@@ -283,6 +284,106 @@ pub async fn register_svc(
         writer: write_half,
         session_id,
     })
+}
+
+/// An auto-reconnecting service inbox that wraps `register_svc`.
+/// When connection is lost or registration fails, reconnects with exponential backoff
+/// (default: start 1s, cap 30s).
+pub struct ReconnectingSvcInbox {
+    register_sock_path: PathBuf,
+    service_name: String,
+    current: Option<SvcSocketInbox>,
+    min_backoff: Duration,
+    max_backoff: Duration,
+    current_backoff: Duration,
+}
+
+impl ReconnectingSvcInbox {
+    pub fn new(register_sock_path: impl Into<PathBuf>, service_name: impl Into<String>) -> Self {
+        let min_backoff = Duration::from_secs(1);
+        Self {
+            register_sock_path: register_sock_path.into(),
+            service_name: service_name.into(),
+            current: None,
+            min_backoff,
+            max_backoff: Duration::from_secs(30),
+            current_backoff: min_backoff,
+        }
+    }
+
+    pub fn with_backoff(mut self, min: Duration, max: Duration) -> Self {
+        self.min_backoff = min;
+        self.max_backoff = max;
+        self.current_backoff = min;
+        self
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.current.is_some()
+    }
+
+    pub fn current_backoff(&self) -> Duration {
+        self.current_backoff
+    }
+}
+
+#[async_trait]
+impl SvcInbox for ReconnectingSvcInbox {
+    async fn poll(&mut self, wait_secs: u64) -> Result<Option<SvcDelivery>, AppError> {
+        if self.current.is_none() {
+            match register_svc(&self.register_sock_path, &self.service_name).await {
+                Ok(inbox) => {
+                    tracing::info!("Registered on xmsg as {}", inbox.session_id());
+                    self.current = Some(inbox);
+                    self.current_backoff = self.min_backoff;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to connect/register on xmsg at {}: {e}; retrying in {:?}",
+                        self.register_sock_path.display(),
+                        self.current_backoff
+                    );
+                    tokio::time::sleep(self.current_backoff).await;
+                    self.current_backoff = (self.current_backoff * 2).min(self.max_backoff);
+                    return Ok(None);
+                }
+            }
+        }
+
+        let res = match self.current.as_mut() {
+            Some(inbox) => inbox.poll(wait_secs).await,
+            None => return Ok(None),
+        };
+
+        match res {
+            Ok(delivery_opt) => Ok(delivery_opt),
+            Err(e) => {
+                tracing::warn!(
+                    "xmsg registration connection lost: {e}; will reconnect with backoff"
+                );
+                self.current = None;
+                self.current_backoff = self.min_backoff;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn ack(&mut self, message_id: &str) -> Result<(), AppError> {
+        match self.current.as_mut() {
+            Some(inbox) => {
+                let res = inbox.ack(message_id).await;
+                if let Err(ref e) = res {
+                    tracing::warn!("Failed to ack delivery {message_id} on xmsg: {e}");
+                    self.current = None;
+                    self.current_backoff = self.min_backoff;
+                }
+                res
+            }
+            None => Err(AppError::Xmsg(format!(
+                "Cannot ack delivery {message_id}: not connected to xmsg"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

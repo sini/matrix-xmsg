@@ -77,17 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let register_sock = config.xmsg_register_socket();
-    let svc_inbox = match matrix_xmsg::xmsg::register_svc(&register_sock, "matrix-xmsg").await {
-        Ok(inbox) => inbox,
-        Err(e) => {
-            error!(
-                "Failed to register on xmsg register.sock at {}: {e}",
-                register_sock.display()
-            );
-            std::process::exit(1);
-        }
-    };
-    info!("Registered on xmsg as {}", svc_inbox.session_id());
+    let svc_inbox = matrix_xmsg::xmsg::ReconnectingSvcInbox::new(register_sock, "matrix-xmsg");
 
     let xmsg_client = matrix_xmsg::xmsg::create_xmsg_client(&config);
 
