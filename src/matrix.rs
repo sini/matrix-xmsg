@@ -85,6 +85,7 @@ pub struct MatrixSdkClient {
     client: Client,
     dm_rooms: Mutex<std::collections::HashMap<String, String>>,
     store: Mutex<Option<std::sync::Arc<crate::store::Store>>>,
+    configured_rooms: Mutex<std::collections::HashSet<String>>,
 }
 
 impl MatrixSdkClient {
@@ -122,6 +123,7 @@ impl MatrixSdkClient {
             client,
             dm_rooms: Mutex::new(std::collections::HashMap::new()),
             store: Mutex::new(None),
+            configured_rooms: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -130,12 +132,30 @@ impl MatrixSdkClient {
         *guard = Some(store);
     }
 
+    pub fn set_configured_rooms(&self, rooms: &[String]) {
+        let mut conf = self.configured_rooms.lock().unwrap();
+        conf.clear();
+        for r in rooms {
+            conf.insert(r.clone());
+        }
+    }
+
+    pub fn is_room_configured(&self, room_id: &str) -> bool {
+        self.configured_rooms.lock().unwrap().contains(room_id)
+    }
+
     pub fn inner(&self) -> &Client {
         &self.client
     }
 
     pub async fn resolve_rooms(&self, rooms: &[String]) -> Result<(), AppError> {
         use matrix_sdk::ruma::RoomId;
+        {
+            let mut conf = self.configured_rooms.lock().unwrap();
+            for r in rooms {
+                conf.insert(r.clone());
+            }
+        }
         for room_str in rooms {
             if let Ok(r_id) = <&RoomId>::try_from(room_str.as_str()) {
                 if self.client.get_room(r_id).is_none() {
@@ -354,13 +374,16 @@ impl MatrixClient for MatrixSdkClient {
             return Ok(resp.response.event_id.to_string());
         }
 
-        // Cold room fallback: attempt to join/resolve into client state
-        if let Ok(room) = self.client.join_room_by_id(r_id).await {
-            let resp = room
-                .send(content)
-                .await
-                .map_err(|e| AppError::Matrix(format!("Failed to send notice: {e}")))?;
-            return Ok(resp.response.event_id.to_string());
+        // Cold room fallback: attempt to join/resolve into client state (restricted to configured rooms)
+        let is_configured = self.configured_rooms.lock().unwrap().contains(room_id);
+        if is_configured {
+            if let Ok(room) = self.client.join_room_by_id(r_id).await {
+                let resp = room
+                    .send(content)
+                    .await
+                    .map_err(|e| AppError::Matrix(format!("Failed to send notice: {e}")))?;
+                return Ok(resp.response.event_id.to_string());
+            }
         }
 
         // Direct HTTP send fallback (matching send_dm Arm B)
@@ -867,6 +890,8 @@ pub struct MockMatrixClient {
     pub canned_thread_relations: Mutex<std::collections::HashMap<String, Vec<EventMessage>>>,
     pub canned_thread_page_size: Mutex<Option<usize>>,
     pub known_rooms: Mutex<std::collections::HashSet<String>>,
+    pub configured_rooms: Mutex<std::collections::HashSet<String>>,
+    pub joined_rooms: Mutex<Vec<String>>,
     pub require_known_rooms: std::sync::atomic::AtomicBool,
     pub fail_send_notice: std::sync::atomic::AtomicBool,
 }
@@ -1016,8 +1041,10 @@ impl MatrixClient for MockMatrixClient {
 
     async fn resolve_rooms(&self, rooms: &[String]) -> Result<(), AppError> {
         let mut known = self.known_rooms.lock().unwrap();
+        let mut configured = self.configured_rooms.lock().unwrap();
         for r in rooms {
             known.insert(r.clone());
+            configured.insert(r.clone());
         }
         Ok(())
     }

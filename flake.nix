@@ -72,6 +72,11 @@
             ];
           };
         };
+
+        matrix-skill = pkgs.runCommand "matrix-skill" { } ''
+          mkdir -p $out
+          cp -r ${./skills/matrix}/. $out/
+        '';
       });
 
       nixosModules.default = import ./nix/module.nix { inherit self; };
