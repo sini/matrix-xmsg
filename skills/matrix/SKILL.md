@@ -47,7 +47,7 @@ Local sessions on the bot's host (`kind: "local"`) can solicit Matrix threads. R
   `{"root": "<root_event_id>", "permalink": "https://matrix.to/#/<room_id>/<root_event_id>"}`.
 - **Thread routing:** Subsequent lines in the thread arrive as replies to your initial request, pre-filtered through `svc:genie-guard` (rewritten lines carry `"rewritten": true`).
 - **Replies:** Your replies to those messages are posted directly into the thread.
-- **Releasing a thread (`!release`):** The room owner can release the thread back to standard routing by posting `!release` in reply to the opening post.
+- **Releasing a thread (`!release`):** The bot's owner (`owner_mxid` in its config) can release the thread back to standard routing by posting `!release` in reply to the opening post.
 
 ## 4. What Not to Do
 
