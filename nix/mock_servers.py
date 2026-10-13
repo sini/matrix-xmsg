@@ -174,7 +174,6 @@ SOCK_DIR = "/run/xmsg-mock"
 NODE = "test"
 pushed = queue.Queue()
 send_ids = itertools.count(1)
-EXPERT_DELAY_SECS = 2
 
 
 def write_frame(wfile, frame):
@@ -184,9 +183,9 @@ def write_frame(wfile, frame):
 
 class AgentHandler(socketserver.StreamRequestHandler):
     """agent.sock: one request per connection. A `send` is recorded and answered with a
-    message ID, and the expert's reply to it is pushed to the bot's inbox (`inReplyTo`) after
-    EXPERT_DELAY_SECS, as an expert answers in seconds: the bot records the forward only after
-    the send returns, so a reply pushed at once can arrive before its forward is known."""
+    message ID, and the expert's reply to it is pushed to the bot's inbox (`inReplyTo`) before
+    the answer is written: the reply is there before the bot's send returns, and the bot must
+    still post it."""
 
     def handle(self):
         line = self.rfile.readline()
@@ -199,14 +198,14 @@ class AgentHandler(socketserver.StreamRequestHandler):
                 f.write(line)
             n = next(send_ids)
             message_id = f"01TESTMSGID{n:05d}"
-            threading.Timer(EXPERT_DELAY_SECS, pushed.put, args=[{
+            pushed.put({
                 "action": "deliver",
                 "messageId": f"01TESTREPLY{n:05d}",
                 "fromName": f"expert · mock-claude-session@{NODE}",
                 "text": "pong from expert",
                 "envelope": "",
                 "inReplyTo": message_id,
-            }]).start()
+            })
             write_frame(self.wfile, {
                 "status": "ok",
                 "message_id": message_id,

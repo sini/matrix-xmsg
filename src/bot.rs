@@ -11,6 +11,18 @@ use crate::xmsg::{
     GuardLine, SvcDelivery, SvcInbox, XmsgClient,
 };
 
+/// The bound on a forward's send, which holds `Store::forward_gate` and with it the inbox.
+const FORWARD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn bounded_send<T>(
+    what: &str,
+    send: impl std::future::Future<Output = Result<T, AppError>>,
+) -> Result<T, AppError> {
+    tokio::time::timeout(FORWARD_SEND_TIMEOUT, send)
+        .await
+        .map_err(|_| AppError::Xmsg(format!("{what} timed out after {FORWARD_SEND_TIMEOUT:?}")))?
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BotOutcome {
     IgnoredRoom,
@@ -721,10 +733,13 @@ pub async fn handle_incoming_event_with_guard(
         // Record relay claim in SQLite
         store.record_event_relayed(&claim_id, now_secs)?;
 
-        // Relay as reply to request_message_id
-        let send_res = xmsg
-            .reply_message(&solicited.request_message_id, &relay_envelope)
-            .await;
+        // Relay as reply to request_message_id. The forward is recorded under the gate.
+        let gate = store.forward_gate.read().await;
+        let send_res = bounded_send(
+            "Relay to the solicited session",
+            xmsg.reply_message(&solicited.request_message_id, &relay_envelope),
+        )
+        .await;
 
         let (relayed_message_id, session_id) = match send_res {
             Ok(resp) => (resp.message_id, resp.session_id),
@@ -757,21 +772,6 @@ pub async fn handle_incoming_event_with_guard(
             session_id.as_deref(),
         )?;
 
-        let mut ack_reaction_id: Option<String> = None;
-        if is_addressed {
-            match matrix
-                .send_reaction(&event.room_id, &reaction_target_id, "👀")
-                .await
-            {
-                Ok(rid) => ack_reaction_id = Some(rid),
-                Err(e) => tracing::warn!(
-                    "Failed to send ack reaction for event {}: {}",
-                    reaction_target_id,
-                    e
-                ),
-            }
-        }
-
         store.record_thread_message(&thread_root, &relayed_message_id, now_secs)?;
         let forward_rec = ForwardedMessageRecord {
             message_id: relayed_message_id.clone(),
@@ -781,11 +781,23 @@ pub async fn handle_incoming_event_with_guard(
             sender_mxid: event.sender_mxid.clone(),
             addressed: is_addressed,
             sent_at: now_secs,
-            ack_reaction_id,
+            ack_reaction_id: None,
             timeout_dm_sent: false,
             reply_count: 0,
         };
         store.record_forwarded_message(&forward_rec)?;
+        drop(gate);
+
+        if is_addressed {
+            ack_forward(
+                matrix,
+                store,
+                &event.room_id,
+                &reaction_target_id,
+                &[&relayed_message_id],
+            )
+            .await?;
+        }
 
         return Ok(BotOutcome::Forwarded);
     }
@@ -793,11 +805,14 @@ pub async fn handle_incoming_event_with_guard(
     // Record relay claim in SQLite
     store.record_event_relayed(&claim_id, now_secs)?;
 
-    // 8. Send to xmsg Expert Inbox
+    // 8. Send to xmsg Expert Inbox, recording the forward under `Store::forward_gate`.
     let mapped_sender = map_sender_mxid(&event.sender_mxid);
-    let send_resp = xmsg
-        .send_message(&config.expert_ref, &mapped_sender, &envelope)
-        .await?;
+    let gate = store.forward_gate.read().await;
+    let send_resp = bounded_send(
+        "Forward to the expert",
+        xmsg.send_message(&config.expert_ref, &mapped_sender, &envelope),
+    )
+    .await?;
     let delta_message_id = send_resp.message_id;
     let mut session_id = send_resp.session_id;
     let mut rebootstrap_message_id: Option<String> = None;
@@ -830,9 +845,11 @@ pub async fn handle_incoming_event_with_guard(
                 },
             );
 
-            let boot_resp = xmsg
-                .send_message(&config.expert_ref, &mapped_sender, &bootstrap_envelope)
-                .await?;
+            let boot_resp = bounded_send(
+                "Rebootstrap to the expert",
+                xmsg.send_message(&config.expert_ref, &mapped_sender, &bootstrap_envelope),
+            )
+            .await?;
 
             rebootstrap_message_id = Some(boot_resp.message_id);
             session_id = boot_resp.session_id.or(session_id);
@@ -846,25 +863,6 @@ pub async fn handle_incoming_event_with_guard(
         now_secs,
         session_id.as_deref(),
     )?;
-
-    let mut ack_reaction_id: Option<String> = None;
-    if is_addressed {
-        match matrix
-            .send_reaction(&event.room_id, &reaction_target_id, "👀")
-            .await
-        {
-            Ok(rid) => {
-                ack_reaction_id = Some(rid);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to send ack reaction for event {}: {}",
-                    reaction_target_id,
-                    e
-                );
-            }
-        }
-    }
 
     // Record mapping in SQLite: record both message ids against the thread
     store.record_thread_message(&thread_root, &delta_message_id, now_secs)?;
@@ -883,7 +881,7 @@ pub async fn handle_incoming_event_with_guard(
         sender_mxid: event.sender_mxid.clone(),
         addressed: is_addressed,
         sent_at: now_secs,
-        ack_reaction_id: ack_reaction_id.clone(),
+        ack_reaction_id: None,
         timeout_dm_sent: false,
         reply_count: 0,
     };
@@ -898,14 +896,49 @@ pub async fn handle_incoming_event_with_guard(
             sender_mxid: event.sender_mxid.clone(),
             addressed: is_addressed,
             sent_at: now_secs,
-            ack_reaction_id,
+            ack_reaction_id: None,
             timeout_dm_sent: false,
             reply_count: 0,
         };
         store.record_forwarded_message(&boot_forward_rec)?;
     }
+    drop(gate);
+
+    // The ack reaction is cosmetic: it follows the record, so it never delays a reply's routing.
+    if is_addressed {
+        let mut forwards = vec![delta_message_id.as_str()];
+        forwards.extend(rebootstrap_message_id.as_deref());
+        ack_forward(
+            matrix,
+            store,
+            &event.room_id,
+            &reaction_target_id,
+            &forwards,
+        )
+        .await?;
+    }
 
     Ok(BotOutcome::Forwarded)
+}
+
+/// Sends the 👀 ack reaction to `target` and records it on each of `forwards`, so a decline
+/// can redact it. A reply routed before this lands finds no reaction to redact.
+async fn ack_forward(
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    room_id: &str,
+    target: &str,
+    forwards: &[&str],
+) -> Result<(), AppError> {
+    match matrix.send_reaction(room_id, target, "👀").await {
+        Ok(rid) => {
+            for message_id in forwards {
+                store.set_forward_ack_reaction(message_id, &rid)?;
+            }
+        }
+        Err(e) => tracing::warn!("Failed to send ack reaction for event {target}: {e}"),
+    }
+    Ok(())
 }
 
 /// Handles a delivery from the xmsg service inbox.
@@ -1093,6 +1126,10 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
             .await;
         }
     }
+
+    // Every forward whose send has returned is recorded once the gate is free, and a reply to
+    // one still sending waits here for its record instead of being dropped as unknown.
+    drop(store.forward_gate.write().await);
 
     let is_resync = if let Ok(val) = serde_json::from_str::<serde_json::Value>(delivery.text.trim())
     {

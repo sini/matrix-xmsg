@@ -5,6 +5,12 @@ use std::sync::Mutex;
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Orders a forward's record before any reply to it is looked up. A forward holds it shared
+    /// from its send until its record is in; the inbox takes it exclusively before it looks a
+    /// reply's forward up. A reply can only answer a send xmsg accepted, so the inbox either
+    /// finds the forward recorded or waits for the send that is recording it: a reply that
+    /// arrives before its send returns is held, never dropped as unknown.
+    pub(crate) forward_gate: tokio::sync::RwLock<()>,
 }
 
 impl Store {
@@ -48,6 +54,7 @@ impl Store {
         })?;
         let store = Self {
             conn: Mutex::new(conn),
+            forward_gate: Default::default(),
         };
         store.init_schema()?;
         Ok(store)
@@ -59,6 +66,7 @@ impl Store {
         })?;
         let store = Self {
             conn: Mutex::new(conn),
+            forward_gate: Default::default(),
         };
         store.init_schema()?;
         Ok(store)
@@ -642,6 +650,25 @@ impl Store {
         Ok(())
     }
 
+    /// Records the ack reaction sent for a forward, which is recorded before the reaction.
+    pub fn set_forward_ack_reaction(
+        &self,
+        message_id: &str,
+        reaction_id: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE forwarded_messages SET ack_reaction_id = ?2 WHERE message_id = ?1",
+            params![message_id, reaction_id],
+        )
+        .map_err(|e| {
+            AppError::Store(format!(
+                "Failed to record the ack reaction for {message_id}: {e}"
+            ))
+        })?;
+        Ok(())
+    }
+
     /// Checks if a thread resync is allowed under the rate limit (at most one per 60s).
     /// If allowed, records the new resync timestamp and returns Ok(Ok(())).
     /// If throttled, returns Ok(Err(retry_after_secs)).
@@ -1100,6 +1127,7 @@ mod tests {
 
         let store = Store {
             conn: Mutex::new(conn),
+            forward_gate: Default::default(),
         };
         store.init_schema().unwrap();
 
