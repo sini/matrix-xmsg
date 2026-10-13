@@ -355,6 +355,7 @@ pub async fn handle_incoming_event_with_guard(
             let is_thread_escalate =
                 event.thread_root_id.is_some() && event.body.trim() == "!escalate";
             let is_thread_deeper = event.thread_root_id.is_some() && event.body.trim() == "!deeper";
+            let is_thread_trust = event.thread_root_id.is_some() && event.body.trim() == "!trust";
             let is_mentioned = is_bot_mentioned(
                 &event.body,
                 event.formatted_body.as_deref(),
@@ -371,7 +372,7 @@ pub async fn handle_incoming_event_with_guard(
                 false
             };
             let is_addressed =
-                is_mentioned || is_reply_to_bot || is_thread_escalate || is_thread_deeper;
+                is_mentioned || is_reply_to_bot || is_thread_escalate || is_thread_deeper || is_thread_trust;
 
             let is_engaged_thread = if let Some(ref root) = event.thread_root_id {
                 store.is_thread_engaged(root)?
@@ -423,6 +424,52 @@ pub async fn handle_incoming_event_with_guard(
                 .to_string();
 
                 let mapped_sender = map_sender_mxid(&event.sender_mxid);
+                xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
+                    .await?;
+
+                return Ok(BotOutcome::ControlEmitted);
+            }
+
+            // Handle !trust control command in thread (Unit M12 / M20)
+            if is_thread_trust {
+                let is_trusted = config.is_user_trusted(&event.sender_mxid);
+                if !is_trusted {
+                    return Ok(BotOutcome::IgnoredUntrustedUser);
+                }
+
+                let is_new = store.record_control_if_new(
+                    &event.event_id,
+                    &event.sender_mxid,
+                    "trust",
+                    now_secs,
+                )?;
+
+                if !is_new {
+                    return Ok(BotOutcome::ControlDebounced);
+                }
+
+                if let Err(e) = matrix
+                    .send_reaction(&event.room_id, &event.event_id, "🔒")
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to send trust reaction for event {}: {}",
+                        event.event_id,
+                        e
+                    );
+                }
+
+                let mapped_sender = map_sender_mxid(&event.sender_mxid);
+                let payload = serde_json::json!({
+                    "thread_id": thread_root,
+                    "control": "trust",
+                    "sender": mapped_sender,
+                    "sender_id": event.sender_mxid,
+                    "tier": "trusted",
+                    "event_id": event.event_id,
+                })
+                .to_string();
+
                 xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
                     .await?;
 

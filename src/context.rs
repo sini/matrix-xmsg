@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayedLine {
     pub sender: String,
+    pub sender_id: String,
     pub tier: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addressed: Option<bool>,
@@ -89,6 +90,7 @@ pub fn format_context_line(
     let escaped_text = escape_xml_blocks(&collapsed_body);
     serde_json::to_string(&RelayedLine {
         sender: sender_name,
+        sender_id: msg.sender_mxid.clone(),
         tier: trust_tag.to_string(),
         addressed: None,
         rewritten: None,
@@ -146,6 +148,7 @@ pub fn build_envelope_with_rewrite(
 
     let request_line = serde_json::to_string(&RelayedLine {
         sender: mapped_sender.clone(),
+        sender_id: trigger.sender_mxid.clone(),
         tier: trigger_tier.to_string(),
         addressed: Some(addressed),
         rewritten: if rewritten { Some(true) } else { None },
@@ -449,9 +452,10 @@ mod tests {
 
         assert!(envelope.starts_with("[matrix] room=#support:example.org thread=$ev_trig user=matrix alice at example.org (trusted)"));
         assert!(!envelope.contains("thread_tier="));
-        assert!(envelope.contains("<request>\n{\"sender\":\"matrix alice at example.org\",\"tier\":\"trusted\",\"addressed\":true,\"text\":\"How do I configure logging?\"}\n</request>"));
+        assert!(envelope.contains("<request>\n{\"sender\":\"matrix alice at example.org\",\"sender_id\":\"@alice:example.org\",\"tier\":\"trusted\",\"addressed\":true,\"text\":\"How do I configure logging?\"}\n</request>"));
         let bob_expected = serde_json::to_string(&RelayedLine {
             sender: "matrix bob at example.org".to_string(),
+            sender_id: "@bob:example.org".to_string(),
             tier: "public".to_string(),
             addressed: None,
             rewritten: None,
@@ -462,6 +466,7 @@ mod tests {
 
         let alice_expected = serde_json::to_string(&RelayedLine {
             sender: "matrix alice at example.org".to_string(),
+            sender_id: "@alice:example.org".to_string(),
             tier: "trusted".to_string(),
             addressed: None,
             rewritten: None,
