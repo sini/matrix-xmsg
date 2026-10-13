@@ -7,10 +7,11 @@
     # `outputs` to the `nixpkgs` declared here, line for line as `../flake.nix` declares it.
     nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
     # The real xmsg the integration oracles run (tests/gate_ma_integration.rs), pinned by
-    # revision: xmsg main after XA4 (the four-tool surface, the register.sock `ok` frame with
-    # `node`, pushed replies with `inReplyTo`). The addressing plan's re-verify step moves it.
+    # revision: xmsg main after its atomic idempotency (the key reserved and the ID minted
+    # before delivery, `reply` taking `idempotency_key`), which every forward send now carries.
+    # The addressing plan's re-verify step moves it.
     xmsg = {
-      url = "github:sini/xmsg/948a8a6be7e5aaf73640f94eaf93ecf9427a1efa";
+      url = "github:sini/xmsg/f27791bd2095be9bdfec02639f01a17b9188cce0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

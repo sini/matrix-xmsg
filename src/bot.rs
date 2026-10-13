@@ -11,18 +11,48 @@ use crate::xmsg::{
     GuardLine, SvcDelivery, SvcInbox, XmsgClient,
 };
 
-/// The bound on each send made under `Store::forward_gate`, which holds the inbox. An expert
-/// forward makes two (the delta and its rebootstrap), so it holds the inbox up to twice this.
-/// A send that xmsg accepts after the bound is not recorded, and its reply is dropped.
+/// The bound on each attempt of a send made under `Store::forward_gate`, which holds the inbox.
+/// A send that times out is retried once with the same idempotency key, so a send xmsg accepted
+/// after the bound answers the retry with its own message ID and is recorded; its reply is
+/// dropped only when the retry fails too. An expert forward makes two sends (the delta and its
+/// rebootstrap), so it holds the inbox up to four times this.
 const FORWARD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-async fn bounded_send<T>(
-    what: &str,
-    send: impl std::future::Future<Output = Result<T, AppError>>,
-) -> Result<T, AppError> {
-    tokio::time::timeout(FORWARD_SEND_TIMEOUT, send)
+/// Runs `send` bounded by `FORWARD_SEND_TIMEOUT` and, when that times out, once more. `send`
+/// must carry one idempotency key on both attempts, so the two deliver at most one message.
+async fn bounded_send<T, F>(what: &str, send: impl Fn() -> F) -> Result<T, AppError>
+where
+    F: std::future::Future<Output = Result<T, AppError>>,
+{
+    if let Ok(res) = tokio::time::timeout(FORWARD_SEND_TIMEOUT, send()).await {
+        return res;
+    }
+    tracing::warn!("{what} timed out after {FORWARD_SEND_TIMEOUT:?}; retrying with its key");
+    let res = tokio::time::timeout(FORWARD_SEND_TIMEOUT, send())
         .await
-        .map_err(|_| AppError::Xmsg(format!("{what} timed out after {FORWARD_SEND_TIMEOUT:?}")))?
+        .unwrap_or_else(|_| {
+            Err(AppError::Xmsg(format!(
+                "{what} timed out twice after {FORWARD_SEND_TIMEOUT:?}"
+            )))
+        });
+    if let Err(e) = &res {
+        tracing::warn!("{what} failed on its retry; a reply to it will be dropped: {e}");
+    }
+    res
+}
+
+/// The idempotency key of one logical forward send: its `purpose` (`forward`, `rebootstrap`,
+/// `relay`) and the Matrix event it forwards, which is relayed at most once. xmsg takes 1 to
+/// 128 characters, so an event ID too long for that is replaced by its hash.
+fn forward_key(purpose: &str, event_id: &str) -> String {
+    let key = format!("matrix-xmsg:{purpose}:{event_id}");
+    if key.len() <= 128 {
+        return key;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    event_id.hash(&mut h);
+    format!("matrix-xmsg:{purpose}:#{:016x}", h.finish())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -737,10 +767,10 @@ pub async fn handle_incoming_event_with_guard(
 
         // Relay as reply to request_message_id. The forward is recorded under the gate.
         let mut gate = Some(store.forward_gate.read().await);
-        let send_res = bounded_send(
-            "Relay to the solicited session",
-            xmsg.reply_message(&solicited.request_message_id, &relay_envelope),
-        )
+        let key = forward_key("relay", &claim_id);
+        let send_res = bounded_send("Relay to the solicited session", || {
+            xmsg.reply_message_keyed(&solicited.request_message_id, &relay_envelope, &key)
+        })
         .await;
 
         let (relayed_message_id, session_id) = match send_res {
@@ -813,10 +843,10 @@ pub async fn handle_incoming_event_with_guard(
     // 8. Send to xmsg Expert Inbox, recording the forward under `Store::forward_gate`.
     let mapped_sender = map_sender_mxid(&event.sender_mxid);
     let gate = store.forward_gate.read().await;
-    let send_resp = bounded_send(
-        "Forward to the expert",
-        xmsg.send_message(&config.expert_ref, &mapped_sender, &envelope),
-    )
+    let key = forward_key("forward", &claim_id);
+    let send_resp = bounded_send("Forward to the expert", || {
+        xmsg.send_message_keyed(&config.expert_ref, &mapped_sender, &envelope, &key)
+    })
     .await?;
     let delta_message_id = send_resp.message_id;
     let mut session_id = send_resp.session_id;
@@ -850,10 +880,15 @@ pub async fn handle_incoming_event_with_guard(
                 },
             );
 
-            let boot_resp = bounded_send(
-                "Rebootstrap to the expert",
-                xmsg.send_message(&config.expert_ref, &mapped_sender, &bootstrap_envelope),
-            )
+            let key = forward_key("rebootstrap", &claim_id);
+            let boot_resp = bounded_send("Rebootstrap to the expert", || {
+                xmsg.send_message_keyed(
+                    &config.expert_ref,
+                    &mapped_sender,
+                    &bootstrap_envelope,
+                    &key,
+                )
+            })
             .await?;
 
             rebootstrap_message_id = Some(boot_resp.message_id);

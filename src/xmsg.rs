@@ -463,6 +463,31 @@ pub trait XmsgClient: Send + Sync {
             Some("mock-session".to_string()),
         ))
     }
+
+    /// `send_message` carrying an idempotency key (xmsg README, Idempotency): xmsg delivers
+    /// one message per key and answers a repeat of it with the first send's `message_id`, with
+    /// `outcome` `pending` while the first is still being delivered. A client that does not
+    /// deduplicate sends unkeyed.
+    async fn send_message_keyed(
+        &self,
+        expert_ref: &str,
+        from: &str,
+        text: &str,
+        _idempotency_key: &str,
+    ) -> Result<SendResponse, AppError> {
+        self.send_message(expert_ref, from, text).await
+    }
+
+    /// `reply_message` carrying an idempotency key: a repeat returns the first reply's
+    /// `pushedMessageId`. A client that does not deduplicate replies unkeyed.
+    async fn reply_message_keyed(
+        &self,
+        message_id: &str,
+        text: &str,
+        _idempotency_key: &str,
+    ) -> Result<SendResponse, AppError> {
+        self.reply_message(message_id, text).await
+    }
 }
 
 /// One `agent.sock` request: writes `frame`, reads one answer, and returns it when its
@@ -518,19 +543,21 @@ async fn agent_call(agent_sock_path: &Path, what: &str, frame: Value) -> Result<
     Ok(val)
 }
 
-/// Sends `text` to `to` on agent.sock and returns the message ID and the resolved ID.
+/// Sends `text` to `to` on agent.sock, keyed when `idempotency_key` is set, and returns the
+/// message ID and the resolved ID (`None` while a keyed repeat is `pending`: its address is
+/// empty).
 async fn agent_send(
     agent_sock_path: &Path,
     what: &str,
     to: &str,
     text: &str,
+    idempotency_key: Option<&str>,
 ) -> Result<SendResponse, AppError> {
-    let val = agent_call(
-        agent_sock_path,
-        what,
-        serde_json::json!({ "action": "send", "to": to, "text": text }),
-    )
-    .await?;
+    let mut frame = serde_json::json!({ "action": "send", "to": to, "text": text });
+    if let Some(key) = idempotency_key {
+        frame["idempotency_key"] = key.into();
+    }
+    let val = agent_call(agent_sock_path, what, frame).await?;
     let message_id = val
         .get("message_id")
         .and_then(|v| v.as_str())
@@ -541,6 +568,7 @@ async fn agent_send(
     let session_id = val
         .get("address")
         .and_then(|v| v.as_str())
+        .filter(|a| !a.is_empty())
         .map(|a| sender_id(a).to_string());
     Ok(SendResponse {
         message_id,
@@ -570,16 +598,56 @@ impl XmsgClient for UnixXmsgClient {
         _from: &str,
         text: &str,
     ) -> Result<SendResponse, AppError> {
-        agent_send(&self.agent_sock_path, "send", expert_ref, text).await
+        agent_send(&self.agent_sock_path, "send", expert_ref, text, None).await
+    }
+
+    async fn send_message_keyed(
+        &self,
+        expert_ref: &str,
+        _from: &str,
+        text: &str,
+        idempotency_key: &str,
+    ) -> Result<SendResponse, AppError> {
+        agent_send(
+            &self.agent_sock_path,
+            "send",
+            expert_ref,
+            text,
+            Some(idempotency_key),
+        )
+        .await
     }
 
     async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        let val = agent_call(
-            &self.agent_sock_path,
-            "reply",
-            serde_json::json!({ "action": "reply", "message_id": message_id, "text": text }),
-        )
-        .await?;
+        self.agent_reply(message_id, text, None).await
+    }
+
+    async fn reply_message_keyed(
+        &self,
+        message_id: &str,
+        text: &str,
+        idempotency_key: &str,
+    ) -> Result<SendResponse, AppError> {
+        self.agent_reply(message_id, text, Some(idempotency_key))
+            .await
+    }
+}
+
+impl UnixXmsgClient {
+    /// Replies to `message_id` on agent.sock, keyed when `idempotency_key` is set, and returns
+    /// the pushed reply's ID (a keyed repeat's, `pending` included, is the first reply's).
+    async fn agent_reply(
+        &self,
+        message_id: &str,
+        text: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<SendResponse, AppError> {
+        let mut frame =
+            serde_json::json!({ "action": "reply", "message_id": message_id, "text": text });
+        if let Some(key) = idempotency_key {
+            frame["idempotency_key"] = key.into();
+        }
+        let val = agent_call(&self.agent_sock_path, "reply", frame).await?;
         let pushed_message_id = val
             .get("reply")
             .and_then(|r| r.get("pushedMessageId"))
@@ -810,7 +878,13 @@ impl GuardClient for UnixGuardClient {
         // stalled agent.sock hold the map, and with it the inbox loop, past `send_timeout`.
         let (message_id, rx) = {
             let mut pending = guard_pending().lock().await;
-            let send = agent_send(&self.agent_sock_path, "guard send", guard_ref, &env_text);
+            let send = agent_send(
+                &self.agent_sock_path,
+                "guard send",
+                guard_ref,
+                &env_text,
+                None,
+            );
             let sent = tokio::time::timeout(self.send_timeout, send)
                 .await
                 .map_err(|_| {

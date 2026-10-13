@@ -13,9 +13,10 @@ pub struct Store {
     ///
     /// A reply is still dropped as unknown when xmsg accepted a send that the bot never
     /// recorded:
-    /// - the send times out (`FORWARD_SEND_TIMEOUT`) after xmsg accepted it;
-    /// - the rebootstrap send fails or times out after the delta was accepted, so neither id
-    ///   is recorded;
+    /// - the send times out (`FORWARD_SEND_TIMEOUT`) after xmsg accepted it, and its retry
+    ///   under the same idempotency key fails or times out too;
+    /// - the rebootstrap send fails, or times out on both attempts, after the delta was
+    ///   accepted, so neither id is recorded;
     /// - a store write inside the gated region fails;
     /// - the send is a control message (deeper, trust, reaction controls), which is never
     ///   recorded as a forward.
