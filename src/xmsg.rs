@@ -708,9 +708,8 @@ impl GuardClient for MockGuardClient {
 /// §6 D6). The verdict arrives pushed into the bot's service inbox, and the inbox loop hands it
 /// here by its `inReplyTo` (`route_guard_reply`); it never reaches the expert path.
 ///
-/// ponytail: one process-wide map. An entry whose verdict never arrives (a timed-out check) is
-/// kept until its verdict does, so a late verdict is still recognised as a guard verdict; the map
-/// grows by one entry per guard check that times out and is never answered.
+/// One process-wide map. A check that times out evicts its entry: a verdict arriving after that
+/// matches no entry and no forward, so the inbox loop ignores it and never posts it.
 type GuardPending = tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>;
 
 fn guard_pending() -> &'static GuardPending {
@@ -733,6 +732,10 @@ pub async fn route_guard_reply(in_reply_to: &str, text: &str) -> bool {
 pub struct UnixGuardClient {
     pub agent_sock_path: PathBuf,
     pub timeout_secs: u64,
+    /// The bound on the guard request's `agent.sock` send. The pending map is locked for that
+    /// send, and the inbox loop routes every pushed reply through the map, so this also bounds
+    /// how long one guard check can hold up the inbox.
+    pub send_timeout: Duration,
 }
 
 impl UnixGuardClient {
@@ -740,6 +743,7 @@ impl UnixGuardClient {
         Self {
             agent_sock_path,
             timeout_secs,
+            send_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -802,11 +806,20 @@ impl GuardClient for UnixGuardClient {
             .map_err(|e| AppError::Xmsg(format!("Failed to serialize guard envelope: {e}")))?;
 
         // The map stays locked from the send until the entry is in, so the inbox loop cannot
-        // see the verdict before the request is known.
+        // see the verdict before the request is known. The send is bounded, so neither can a
+        // stalled agent.sock hold the map, and with it the inbox loop, past `send_timeout`.
         let (message_id, rx) = {
             let mut pending = guard_pending().lock().await;
-            let sent = agent_send(&self.agent_sock_path, "guard send", guard_ref, &env_text)
+            let send = agent_send(&self.agent_sock_path, "guard send", guard_ref, &env_text);
+            let sent = tokio::time::timeout(self.send_timeout, send)
                 .await
+                .map_err(|_| {
+                    AppError::Xmsg(format!(
+                        "Guard send to {guard_ref} timed out after {:?}",
+                        self.send_timeout
+                    ))
+                })
+                .and_then(|r| r)
                 .inspect_err(|e| tracing::error!("Guard route {guard_ref} refused: {e}"))?;
             let (tx, rx) = tokio::sync::oneshot::channel();
             pending.insert(sent.message_id.clone(), tx);
@@ -815,10 +828,13 @@ impl GuardClient for UnixGuardClient {
 
         match tokio::time::timeout(Duration::from_secs(self.timeout_secs), rx).await {
             Ok(Ok(text)) => parse_guard_reply(&text),
-            _ => Err(AppError::Xmsg(format!(
-                "Guard check timed out after {}s waiting for the verdict to message {message_id}",
-                self.timeout_secs
-            ))),
+            _ => {
+                guard_pending().lock().await.remove(&message_id);
+                Err(AppError::Xmsg(format!(
+                    "Guard check timed out after {}s waiting for the verdict to message {message_id}",
+                    self.timeout_secs
+                )))
+            }
         }
     }
 }
@@ -869,6 +885,9 @@ mod tests {
         assert_eq!(sender_id(&format!("{id}@sini.cortex")), id);
         assert_eq!(sender_id("genie-guard@sini.bitstream"), "genie-guard");
         assert_eq!(sender_id(id), id);
+        // The attested part is the RIGHTMOST ` · `: a label is the sender's own text. xmsg drops
+        // a label containing `·`, so this only pins the split's side.
+        assert_eq!(sender_id(&format!("a · b · {id}@sini.cortex")), id);
     }
 
     #[test]

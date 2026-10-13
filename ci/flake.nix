@@ -46,20 +46,33 @@
         # Surface package build in CI checks (doCheck = true runs cargo test)
         {
           perSystem =
-            { pkgs, system, ... }:
             {
-              checks.package = matrix-xmsg.packages.${system}.default;
-              # The integration oracles against the real `xmsg serve`. MA_XMSG_REQUIRED makes
-              # a missing XMSG_BIN fail every oracle rather than skip it. xmsg's own suite is
-              # not this check's subject, so its package is built without it.
-              checks.integration = matrix-xmsg.packages.${system}.default.overrideAttrs {
-                pname = "matrix-xmsg-integration";
-                XMSG_BIN = "${xmsg.packages.${system}.default.overrideAttrs { doCheck = false; }}/bin/xmsg";
-                MA_XMSG_REQUIRED = "1";
-                cargoTestFlags = [
-                  "--test"
-                  "gate_ma_integration"
-                ];
+              lib,
+              pkgs,
+              system,
+              ...
+            }:
+            {
+              checks = {
+                package = matrix-xmsg.packages.${system}.default;
+              }
+              # The integration oracles against the real `xmsg serve`. They are `#[ignore]`d, so
+              # a plain `cargo test` reports them ignored; this check runs them with
+              # `--include-ignored`, and MA_XMSG_REQUIRED makes a missing XMSG_BIN fail every
+              # oracle rather than skip it. xmsg's own suite is not this check's subject, so its
+              # package is built without it. Linux only: the oracle file is
+              # `#![cfg(target_os = "linux")]`, so elsewhere it would collect 0 tests and pass.
+              // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+                integration = matrix-xmsg.packages.${system}.default.overrideAttrs {
+                  pname = "matrix-xmsg-integration";
+                  XMSG_BIN = "${xmsg.packages.${system}.default.overrideAttrs { doCheck = false; }}/bin/xmsg";
+                  MA_XMSG_REQUIRED = "1";
+                  cargoTestFlags = [
+                    "--test"
+                    "gate_ma_integration"
+                  ];
+                  checkFlags = [ "--include-ignored" ];
+                };
               };
             };
         }

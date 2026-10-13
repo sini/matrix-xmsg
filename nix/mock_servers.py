@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import http.server
+import itertools
 import json
+import os
+import queue
 import socketserver
 import sys
 import threading
@@ -167,59 +170,87 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"{}")
 
 
-class XmsgHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        sys.stderr.write(f"[xmsg-mock] {format % args}\n")
+SOCK_DIR = "/run/xmsg-mock"
+NODE = "test"
+pushed = queue.Queue()
+send_ids = itertools.count(1)
+EXPERT_DELAY_SECS = 2
 
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length > 0 else b""
 
-        if "/messages" in parsed.path:
+def write_frame(wfile, frame):
+    wfile.write((json.dumps(frame) + "\n").encode())
+    wfile.flush()
+
+
+class AgentHandler(socketserver.StreamRequestHandler):
+    """agent.sock: one request per connection. A `send` is recorded and answered with a
+    message ID, and the expert's reply to it is pushed to the bot's inbox (`inReplyTo`) after
+    EXPERT_DELAY_SECS, as an expert answers in seconds: the bot records the forward only after
+    the send returns, so a reply pushed at once can arrive before its forward is known."""
+
+    def handle(self):
+        line = self.rfile.readline()
+        if not line:
+            return
+        req = json.loads(line)
+        sys.stderr.write(f"[xmsg-mock] agent.sock {req.get('action')}\n")
+        if req.get("action") == "send":
             with open("/tmp/xmsg_query_received.json", "wb") as f:
-                f.write(body)
-            self.send_response(202)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({
-                "sessionId": "mock-claude-session",
-                "fromName": "bot",
-                "bytes": len(body),
-                "messageId": "01TESTMSGID12345"
-            }).encode())
+                f.write(line)
+            n = next(send_ids)
+            message_id = f"01TESTMSGID{n:05d}"
+            threading.Timer(EXPERT_DELAY_SECS, pushed.put, args=[{
+                "action": "deliver",
+                "messageId": f"01TESTREPLY{n:05d}",
+                "fromName": f"expert · mock-claude-session@{NODE}",
+                "text": "pong from expert",
+                "envelope": "",
+                "inReplyTo": message_id,
+            }]).start()
+            write_frame(self.wfile, {
+                "status": "ok",
+                "message_id": message_id,
+                "address": f"mock-claude-session@{NODE}",
+                "outcome": "delivered",
+            })
+        else:
+            write_frame(self.wfile, {"status": "ok"})
+
+
+class RegisterHandler(socketserver.StreamRequestHandler):
+    """register.sock: the service registration, then poll/ack on the same connection."""
+
+    def handle(self):
+        line = self.rfile.readline()
+        if not line:
             return
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b"{}")
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        after = int(qs.get("after", ["0"])[0])
-
-        if "/replies" in parsed.path:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            if after < 1:
-                resp = [{
-                    "seq": 1,
-                    "text": "pong from expert",
-                    "body": "pong from expert"
-                }]
+        name = json.loads(line).get("name", "")
+        sys.stderr.write(f"[xmsg-mock] register.sock registered {name}\n")
+        write_frame(self.wfile, {"status": "ok", "node": NODE, "address": f"{name}@{NODE}"})
+        for line in self.rfile:
+            req = json.loads(line)
+            if req.get("action") == "poll":
+                try:
+                    frame = pushed.get(timeout=min(int(req.get("waitSecs", 1)), 1))
+                    sys.stderr.write(f"[xmsg-mock] deliver {frame['messageId']}\n")
+                except queue.Empty:
+                    frame = {"action": "timeout"}
+                write_frame(self.wfile, frame)
             else:
-                time.sleep(1)
-                resp = []
-            self.wfile.write(json.dumps(resp).encode())
-            return
+                write_frame(self.wfile, {"status": "ok"})
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b"{}")
+
+class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+def run_unix_server(name, handler):
+    sock = os.path.join(SOCK_DIR, name)
+    if os.path.exists(sock):
+        os.remove(sock)
+    server = ThreadedUnixServer(sock, handler)
+    os.chmod(sock, 0o666)
+    server.serve_forever()
 
 
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -231,17 +262,18 @@ def run_matrix_server():
     server.serve_forever()
 
 
-def run_xmsg_server():
-    server = ThreadedTCPServer(("127.0.0.1", 7787), XmsgHandler)
-    server.serve_forever()
 
 
 if __name__ == "__main__":
     t1 = threading.Thread(target=run_matrix_server, daemon=True)
-    t2 = threading.Thread(target=run_xmsg_server, daemon=True)
+    os.makedirs(SOCK_DIR, exist_ok=True)
+    os.chmod(SOCK_DIR, 0o755)
+    t2 = threading.Thread(target=run_unix_server, args=("register.sock", RegisterHandler), daemon=True)
+    t3 = threading.Thread(target=run_unix_server, args=("agent.sock", AgentHandler), daemon=True)
     t1.start()
     t2.start()
-    print(f"Mock servers listening on 127.0.0.1:8008 (Matrix) and 127.0.0.1:7787 (xmsg)")
+    t3.start()
+    print(f"Mock servers listening on 127.0.0.1:8008 (Matrix) and {SOCK_DIR} (xmsg)")
     sys.stdout.flush()
     while True:
         time.sleep(1)

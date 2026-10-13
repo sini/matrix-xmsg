@@ -1,8 +1,10 @@
 //! MA gating oracles (xmsg addressing plan §3 MA), each against a real `xmsg serve`.
 //!
-//! The binary is `$XMSG_BIN`. Without it these oracles skip, unless `MA_XMSG_REQUIRED` is set,
-//! as the `ci/` integration check sets it: there a missing `XMSG_BIN` fails every oracle, so
-//! a run that measured nothing cannot pass.
+//! The binary is `$XMSG_BIN`. The oracles are `#[ignore]`d, so a plain `cargo test` reports them
+//! ignored rather than passed; run them with `--include-ignored`. Without `XMSG_BIN` they skip,
+//! unless `MA_XMSG_REQUIRED` is set, as the `ci/` integration check sets it (with
+//! `--include-ignored`): there a missing `XMSG_BIN` fails every oracle, so a run that measured
+//! nothing cannot pass.
 //!
 //! This test process is the bot: it registers on `register.sock` as `matrix-xmsg`, so its
 //! `agent.sock` sends are the service's (xmsg attributes them by pid), and Matrix is
@@ -62,9 +64,16 @@ fn xmsg_bin() -> Option<PathBuf> {
     }
 }
 
-/// The body of every child this binary starts.
+/// The body of every child this binary starts. In the parent under `MA_XMSG_REQUIRED`, it fails
+/// unless the `#[ignore]`d oracles are included: otherwise the run would pass having run none.
 #[test]
 fn ma_child_entry() {
+    if std::env::var_os(CHILD_ENV).is_none() && std::env::var_os(REQUIRED).is_some() {
+        assert!(
+            std::env::args().any(|a| a == "--include-ignored" || a == "--ignored"),
+            "{REQUIRED} is set but the oracles are #[ignore]d: pass --include-ignored"
+        );
+    }
     child::serve_if_child();
 }
 
@@ -499,6 +508,7 @@ fn open_thread(text: &str) -> String {
 // Mutant: the inbox loop handles every pushed reply as an expert reply => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a real xmsg: set XMSG_BIN and pass --include-ignored"]
 async fn oracle_1_a_verdict_is_not_an_answer() {
     let Some(bin) = xmsg_bin() else { return };
     let node = Node::start(
@@ -622,6 +632,7 @@ async fn oracle_1_a_verdict_is_not_an_answer() {
 // Mutant: accept any origin => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a real xmsg: set XMSG_BIN and pass --include-ignored"]
 async fn oracle_2_origin_by_node() {
     let Some(bin) = xmsg_bin() else { return };
     let ca_dir = tempdir().unwrap();
@@ -715,6 +726,7 @@ async fn oracle_2_origin_by_node() {
 // Mutant: invert the comparison => RED.
 // =============================================================================
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a real xmsg: set XMSG_BIN and pass --include-ignored"]
 async fn oracle_3_m16_rebootstraps_on_a_new_resolved_id() {
     let Some(bin) = xmsg_bin() else { return };
     let node = Node::start(

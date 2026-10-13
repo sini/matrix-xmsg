@@ -228,12 +228,13 @@ async fn oracle_trust_control_distinct_sender_id_for_colliding_mapped_names() {
     assert_eq!(outcome1, BotOutcome::ControlEmitted);
 
     // Verify 🔒 reaction sent on event 1
-    let reactions = matrix.sent_reactions.lock().unwrap();
-    assert_eq!(reactions.len(), 1);
-    assert_eq!(reactions[0].room_id, "!support:example.org");
-    assert_eq!(reactions[0].event_id, "$ev_trust_1");
-    assert_eq!(reactions[0].key, "🔒");
-    drop(reactions);
+    {
+        let reactions = matrix.sent_reactions.lock().unwrap();
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].room_id, "!support:example.org");
+        assert_eq!(reactions[0].event_id, "$ev_trust_1");
+        assert_eq!(reactions[0].key, "🔒");
+    }
 
     // 2. Trusted user 2 issues !trust in the same engaged thread (new event)
     let trust_event_2 = IncomingMatrixEvent {

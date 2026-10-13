@@ -20,6 +20,7 @@ let
       trusted_mxids = cfg.trustedMxids;
       owner_mxid = cfg.ownerMxid;
       expert_ref = cfg.expertRef;
+      guard_ref = cfg.guardRef;
       history_n = cfg.historyN;
       history_byte_cap = cfg.historyByteCap;
       resync_byte_cap = cfg.resyncByteCap;
@@ -116,6 +117,17 @@ in
       type = lib.types.str;
       default = "claude";
       description = "The expert's xmsg address: a label, optionally with @<node>.";
+    };
+
+    guardRef = lib.mkOption {
+      type = lib.types.str;
+      default = "genie-guard";
+      example = "genie-guard@sini.bitstream";
+      description = ''
+        The guard service's xmsg address: a bare name, or `name@node`.
+        Set `@node` when two guards are in view: a bare name then resolves `ambiguous`
+        and every guard check fails.
+      '';
     };
 
     historyN = lib.mkOption {

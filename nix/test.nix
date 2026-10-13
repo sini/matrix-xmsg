@@ -14,9 +14,12 @@ pkgs.testers.nixosTest {
         self.nixosModules.default
       ];
 
+      # The mock xmsg's socket directory, present before either service starts (BindPaths).
+      systemd.tmpfiles.rules = [ "d /run/xmsg-mock 0755 root root -" ];
+
       # Mock server service
       systemd.services.mock-servers = {
-        description = "Mock Matrix homeserver and xmsg bridge";
+        description = "Mock Matrix homeserver and xmsg sockets";
         wantedBy = [ "multi-user.target" ];
         before = [ "matrix-xmsg.service" ];
         serviceConfig = {
@@ -35,6 +38,8 @@ pkgs.testers.nixosTest {
         mode = "0400";
       };
 
+      systemd.services.matrix-xmsg.environment.RUST_LOG = "info";
+
       # Enable and configure matrix-xmsg
       services.matrix-xmsg = {
         enable = true;
@@ -45,7 +50,8 @@ pkgs.testers.nixosTest {
         rooms = [ "!test:test.local" ];
         trustedMxids = [ "@trusted:test.local" ];
         ownerMxid = "@owner:test.local";
-        xmsgUrl = "http://127.0.0.1:7787";
+        xmsgSocket = "/run/xmsg-mock";
+        dynamicUser = false;
         expertRef = "claude";
         stateDir = "/var/lib/matrix-xmsg";
       };
@@ -59,7 +65,7 @@ pkgs.testers.nixosTest {
         # 1. Wait for mock servers to bind
         machine.wait_for_unit("mock-servers.service")
         machine.wait_for_open_port(8008)
-        machine.wait_for_open_port(7787)
+        machine.wait_for_file("/run/xmsg-mock/agent.sock")
 
         # 2. Verify that matrix-xmsg fails to become active due to missing credential
         machine.wait_until_fails("systemctl is-active --quiet matrix-xmsg.service")
@@ -76,7 +82,7 @@ pkgs.testers.nixosTest {
         # 1. Wait for mock servers to bind
         machine.wait_for_unit("mock-servers.service")
         machine.wait_for_open_port(8008)
-        machine.wait_for_open_port(7787)
+        machine.wait_for_file("/run/xmsg-mock/agent.sock")
 
         # 2. Wait for matrix-xmsg service to start
         machine.wait_for_unit("matrix-xmsg.service")
@@ -109,7 +115,7 @@ pkgs.testers.nixosTest {
         # 1. Wait for mock servers to bind
         machine.wait_for_unit("mock-servers.service")
         machine.wait_for_open_port(8008)
-        machine.wait_for_open_port(7787)
+        machine.wait_for_file("/run/xmsg-mock/agent.sock")
 
         # 2. Wait for matrix-xmsg to start up and load token credential
         machine.wait_for_unit("matrix-xmsg.service")

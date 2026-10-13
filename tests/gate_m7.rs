@@ -411,6 +411,86 @@ fn oracle_3_module_eval_assertions() {
 }
 
 // ---------------------------------------------------------------------------
+// Oracle 3b: the module renders `guardRef` into config.toml as `guard_ref` (A-10), both its
+// default and a configured `@node`. The rendered file is read back from the ExecStart.
+// Mutant: drop the `guard_ref` render line => RED.
+// ---------------------------------------------------------------------------
+#[test]
+fn oracle_3b_module_renders_guard_ref() {
+    let which_nix = Command::new("which")
+        .arg("nix")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !which_nix {
+        eprintln!(
+            "Nix binary not found in PATH; skipping nix-eval test (handled in CI flake check)"
+        );
+        return;
+    }
+
+    let nix_expr = r#"
+    let
+      pkgs = import <nixpkgs> {};
+      lib = pkgs.lib;
+      pkg = pkgs.hello;
+      baseModule = {
+        options = {
+          assertions = lib.mkOption { type = lib.types.listOf lib.types.attrs; default = []; };
+          users.users = lib.mkOption { type = lib.types.attrs; default = {}; };
+          users.groups = lib.mkOption { type = lib.types.attrs; default = {}; };
+          systemd.services = lib.mkOption { type = lib.types.attrs; default = {}; };
+        };
+      };
+      rendered = serviceCfg:
+        let
+          eval = lib.evalModules {
+            modules = [
+              baseModule
+              { _module.args.pkgs = pkgs; }
+              (import ./nix/module.nix {
+                self = { packages.${pkgs.stdenv.hostPlatform.system}.default = pkg; };
+              })
+              {
+                services.matrix-xmsg = {
+                  enable = true;
+                  homeserverUrl = "http://localhost:8008";
+                  botMxid = "@bot:local";
+                  accessTokenFile = /dev/null;
+                  rooms = [ "!room:local" ];
+                  ownerMxid = "@owner:local";
+                } // serviceCfg;
+              }
+            ];
+          };
+          exec = eval.config.systemd.services.matrix-xmsg.serviceConfig.ExecStart;
+        in
+        builtins.fromTOML (builtins.readFile (lib.removePrefix "${pkg}/bin/matrix-xmsg --config " exec));
+    in {
+      default = (rendered { }).guard_ref or null;
+      atNode = (rendered { guardRef = "genie-guard@sini.bitstream"; }).guard_ref or null;
+    }
+    "#;
+
+    let output = Command::new("nix")
+        .args(["eval", "--impure", "--json", "--expr", nix_expr])
+        .output()
+        .expect("Failed to execute nix eval");
+
+    assert!(
+        output.status.success(),
+        "nix eval failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let val: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("Failed to parse json");
+    assert_eq!(val["default"], "genie-guard", "{val}");
+    assert_eq!(val["atNode"], "genie-guard@sini.bitstream", "{val}");
+}
+
+// ---------------------------------------------------------------------------
 // Oracle 4:
 // Unix domain socket configuration verifies paths for register.sock and agent.sock.
 // ---------------------------------------------------------------------------
