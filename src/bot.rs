@@ -11,7 +11,9 @@ use crate::xmsg::{
     GuardLine, SvcDelivery, SvcInbox, XmsgClient,
 };
 
-/// The bound on a forward's send, which holds `Store::forward_gate` and with it the inbox.
+/// The bound on each send made under `Store::forward_gate`, which holds the inbox. An expert
+/// forward makes two (the delta and its rebootstrap), so it holds the inbox up to twice this.
+/// A send that xmsg accepts after the bound is not recorded, and its reply is dropped.
 const FORWARD_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn bounded_send<T>(
@@ -734,7 +736,7 @@ pub async fn handle_incoming_event_with_guard(
         store.record_event_relayed(&claim_id, now_secs)?;
 
         // Relay as reply to request_message_id. The forward is recorded under the gate.
-        let gate = store.forward_gate.read().await;
+        let mut gate = Some(store.forward_gate.read().await);
         let send_res = bounded_send(
             "Relay to the solicited session",
             xmsg.reply_message(&solicited.request_message_id, &relay_envelope),
@@ -744,6 +746,9 @@ pub async fn handle_incoming_event_with_guard(
         let (relayed_message_id, session_id) = match send_res {
             Ok(resp) => (resp.message_id, resp.session_id),
             Err(e) => {
+                // The synthetic id below answers no send, so no reply waits on its record:
+                // release the gate before the unbounded owner DM.
+                gate = None;
                 tracing::warn!(
                     "Push failure to session in room {} thread {}: {}",
                     event.room_id,

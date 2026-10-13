@@ -7,9 +7,18 @@ pub struct Store {
     conn: Mutex<Connection>,
     /// Orders a forward's record before any reply to it is looked up. A forward holds it shared
     /// from its send until its record is in; the inbox takes it exclusively before it looks a
-    /// reply's forward up. A reply can only answer a send xmsg accepted, so the inbox either
-    /// finds the forward recorded or waits for the send that is recording it: a reply that
-    /// arrives before its send returns is held, never dropped as unknown.
+    /// reply's forward up. So a reply to a forward whose send returned, and whose record then
+    /// went in, is held until that record is in, never dropped as unknown because it arrived
+    /// before its send returned.
+    ///
+    /// A reply is still dropped as unknown when xmsg accepted a send that the bot never
+    /// recorded:
+    /// - the send times out (`FORWARD_SEND_TIMEOUT`) after xmsg accepted it;
+    /// - the rebootstrap send fails or times out after the delta was accepted, so neither id
+    ///   is recorded;
+    /// - a store write inside the gated region fails;
+    /// - the send is a control message (deeper, trust, reaction controls), which is never
+    ///   recorded as a forward.
     pub(crate) forward_gate: tokio::sync::RwLock<()>,
 }
 

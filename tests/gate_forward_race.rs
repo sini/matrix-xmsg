@@ -3,9 +3,9 @@
 //!
 //! The mock xmsg hands the inbox the reply to each send before the send returns, and the mock
 //! Matrix reaction takes a round-trip, so the reply can be routed anywhere in the window from
-//! the send to the ack reaction. Both run on one thread, so the interleaving is the same on
-//! every run: the reply task runs at each yield, and it either finishes or waits on the
-//! forward gate.
+//! the send to the ack reaction. The cells run on four worker threads and loop, so the reply
+//! task also runs between the send's return and the record, where nothing yields: a forward
+//! that releases the gate before its record is in is seen there.
 
 use async_trait::async_trait;
 use matrix_xmsg::bot::{
@@ -19,10 +19,13 @@ use matrix_xmsg::store::Store;
 use matrix_xmsg::xmsg::{MockGuardClient, SendResponse, SvcDelivery, SvcInbox, XmsgClient};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 const ROOM: &str = "!support:example.org";
 const REPLY: &str = "pong from expert";
+/// Iterations of each race cell; one iteration is a fresh store and a fresh forward.
+const RACE_RUNS: usize = 300;
 
 /// Enough yields for the reply task to run to completion when nothing holds it.
 async fn round_trip() {
@@ -250,40 +253,165 @@ fn posted_replies(matrix: &SlowReactions, root: &str) -> usize {
 }
 
 // An expert reply delivered before the forward's send has returned is posted to the thread
-// exactly once. Mutants: record the forward after the ack reaction, or route without taking
-// the forward gate => RED (IgnoredUnknownMessage).
-#[tokio::test]
+// exactly once. Mutants: record the forward after the ack reaction, route without taking the
+// forward gate, or release the gate after the send returns but before the record => RED
+// (IgnoredUnknownMessage).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_instant_expert_reply_is_posted_once() {
-    let store = Arc::new(Store::new_in_memory().unwrap());
-    let (matrix, _) = forward_and_route("$root_expert", store.clone()).await;
-    assert_eq!(posted_replies(&matrix, "$root_expert"), 1);
+    for _ in 0..RACE_RUNS {
+        let store = Arc::new(Store::new_in_memory().unwrap());
+        let (matrix, _) = forward_and_route("$root_expert", store.clone()).await;
+        assert_eq!(posted_replies(&matrix, "$root_expert"), 1);
 
-    // The reaction, sent after the record, is still recorded on the forward.
-    let forward = store
-        .get_forwarded_message("01RACEFORWARD0001")
-        .unwrap()
-        .unwrap();
-    assert!(
-        forward.ack_reaction_id.is_some(),
-        "ack reaction not recorded"
-    );
+        // The reaction, sent after the record, is still recorded on the forward.
+        let forward = store
+            .get_forwarded_message("01RACEFORWARD0001")
+            .unwrap()
+            .unwrap();
+        assert!(
+            forward.ack_reaction_id.is_some(),
+            "ack reaction not recorded"
+        );
+    }
 }
 
 // The same for a relay into a solicited thread, whose forward is the pushed reply to the
 // session's request. Mutant: record the relayed forward after the reaction => RED.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_instant_reply_to_a_relay_is_posted_once() {
+    for _ in 0..RACE_RUNS {
+        let store = Arc::new(Store::new_in_memory().unwrap());
+        store
+            .bind_solicited_thread("$root_solicited", ROOM, "01RACEREQUEST0001", 900)
+            .unwrap();
+        let (matrix, _) = forward_and_route("$root_solicited", store.clone()).await;
+        assert_eq!(posted_replies(&matrix, "$root_solicited"), 1);
+        assert!(
+            store
+                .get_forwarded_message("01RACERELAY00001")
+                .unwrap()
+                .is_some(),
+            "the forward is not the relay's"
+        );
+    }
+}
+
+/// `MockMatrixClient` whose owner DM takes `DM_DELAY`.
+#[derive(Default)]
+struct SlowDm(MockMatrixClient);
+
+const DM_DELAY: Duration = Duration::from_secs(3);
+
+#[async_trait]
+impl MatrixClient for SlowDm {
+    async fn send_notice(
+        &self,
+        room_id: &str,
+        thread_root_id: Option<&str>,
+        body: &str,
+        mention_user: Option<&str>,
+    ) -> Result<String, AppError> {
+        self.0
+            .send_notice(room_id, thread_root_id, body, mention_user)
+            .await
+    }
+    async fn send_dm(&self, user_id: &str, body: &str) -> Result<String, AppError> {
+        tokio::time::sleep(DM_DELAY).await;
+        self.0.send_dm(user_id, body).await
+    }
+    async fn fetch_history(
+        &self,
+        room_id: &str,
+        limit: usize,
+    ) -> Result<Vec<matrix_xmsg::context::EventMessage>, AppError> {
+        self.0.fetch_history(room_id, limit).await
+    }
+    async fn send_reaction(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        key: &str,
+    ) -> Result<String, AppError> {
+        self.0.send_reaction(room_id, event_id, key).await
+    }
+    async fn redact_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.0.redact_event(room_id, event_id, reason).await
+    }
+}
+
+/// An xmsg whose relay to the solicited session fails.
+struct SessionGone;
+
+#[async_trait]
+impl XmsgClient for SessionGone {
+    async fn send_message(&self, _: &str, _: &str, _: &str) -> Result<SendResponse, AppError> {
+        Err(AppError::Xmsg("unexpected send".to_string()))
+    }
+    async fn reply_message(&self, _: &str, _: &str) -> Result<SendResponse, AppError> {
+        Err(AppError::Xmsg("session gone".to_string()))
+    }
+}
+
+// A relay whose send fails DMs the owner without the forward gate, so an unrelated inbox
+// delivery does not wait for the DM. Mutant: DM while holding the gate => RED (the delivery
+// waits out the DM).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_relay_dms_the_owner_without_the_gate() {
     let store = Arc::new(Store::new_in_memory().unwrap());
     store
-        .bind_solicited_thread("$root_solicited", ROOM, "01RACEREQUEST0001", 900)
+        .bind_solicited_thread("$root_gone", ROOM, "01GONEREQUEST001", 900)
         .unwrap();
-    let (matrix, _) = forward_and_route("$root_solicited", store.clone()).await;
-    assert_eq!(posted_replies(&matrix, "$root_solicited"), 1);
-    assert!(
-        store
-            .get_forwarded_message("01RACERELAY00001")
-            .unwrap()
-            .is_some(),
-        "the forward is not the relay's"
+    let config = config();
+    let matrix = Arc::new(SlowDm::default());
+    let (s, m, c) = (store.clone(), matrix.clone(), config.clone());
+    let relay = tokio::spawn(async move {
+        handle_incoming_event_with_guard(
+            &mention("$root_gone"),
+            &[],
+            &c,
+            m.as_ref(),
+            &SessionGone,
+            &MockGuardClient::new(),
+            &s,
+            None,
+        )
+        .await
+    });
+    // The relay is in its DM by now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!relay.is_finished(), "the relay did not reach its DM");
+
+    let mut other = SvcDelivery::new(
+        "01OTHERREPLY0001",
+        "expert · sess@sini.test",
+        REPLY,
+        "",
+        None,
     );
+    other.in_reply_to = Some("01SOMEOTHERFWD01".to_string());
+    let started = Instant::now();
+    let outcome = handle_inbox_delivery_with_xmsg(
+        &other,
+        &config,
+        matrix.as_ref(),
+        &store,
+        &NoXmsg,
+        &mut AckInbox::default(),
+        2000,
+    )
+    .await
+    .expect("route");
+    let stalled = started.elapsed();
+    assert_eq!(outcome, BotOutcome::IgnoredUnknownMessage);
+    assert!(
+        stalled < DM_DELAY / 3,
+        "the delivery waited {stalled:?} on the owner DM"
+    );
+    assert_eq!(relay.await.unwrap().expect("relay"), BotOutcome::Forwarded);
+    assert_eq!(matrix.0.sent_dms.lock().unwrap().len(), 1, "one owner DM");
 }
