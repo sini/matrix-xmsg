@@ -75,9 +75,9 @@
   - Header format: `[matrix] room={room_id} thread={thread_root_id} user={mapped_sender} ({trigger_tier})`.
   - Per design §5.1, thread tier folding belongs to the supervisor (C7) from the per-line `tier` tags, so `thread_tier` is not carried in the envelope header in any mode. The header carries the trigger's own user tier (`({trigger_tier})`).
   - Senders in `trusted_mxids` or matching `owner_mxid` receive tier `trusted`; all others receive `public`.
-  - Each line within `<request>` and `<context>` is an authenticated JSON object:
+  - Each line within `<request>` and `<context>` is an authenticated JSON object carrying an injective sender ID alongside the display name (M21):
     ```json
-    {"sender": "matrix alice at example.org", "tier": "trusted", "text": "message text"}
+    {"sender": "matrix alice at example.org", "sender_id": "@alice:example.org", "tier": "trusted", "text": "message text"}
     ```
   - XML escaping: `<request>`, `</request>`, `<context`, and `</context>` tags occurring inside user-supplied message text are escaped (`<\request`, `<\context`) prior to JSON serialization, preventing sandbox breakouts or fake block imitation.
 
@@ -122,6 +122,25 @@ A local session on the xmsg bus can solicit Matrix threads by asking the bot to 
 - **Session Replies:** Replies from the requesting session to a relayed line land in the bot's service inbox and are posted to Matrix inside the bound thread as a notice mentioning the asker.
 - **Releasing a Thread (`!release`):** Replying `!release` to the opening post from `owner_mxid` unbinds the thread (`solicited_threads` row removed). Subsequent messages fall back to standard routing (`expert_ref`). `!release` from non-owner senders is ignored.
 - **Dead Session Push Failure:** If pushing a relayed line fails because the requesting session is dead, the bot DMs the owner once with the thread permalink and continues relaying.
+
+### 1.8 Trust Control & Injective Sender ID (M21)
+
+- **Injective Sender ID (`sender_id`):** `map_sender_mxid` is a lossy mapping designed for HTTP sender name compatibility (replacing `/` with `-`, dropping non-ASCII, and capping at 64 characters). To prevent identity collisions and authorization escalation across participants, every `RelayedLine` within `<request>` and `<context>` blocks carries an injective `sender_id` (the raw Matrix user ID) alongside the mapped `sender` display name.
+- **`!trust` Control Command:** When an authenticated trusted sender (`config.is_user_trusted`) posts `!trust` in an engaged thread, the bot promotes the thread context:
+  1. Validates that the sender is trusted (untrusted senders are ignored with `BotOutcome::IgnoredUntrustedUser`, dropping the command without reactions or forwarding).
+  2. Debounces duplicate events via `store.record_control_if_new`.
+  3. Reacts with `🔒` on the `!trust` Matrix event.
+  4. Forwards a typed control payload to `config.expert_ref` over xmsg:
+     ```json
+     {
+       "thread_id": "$thread_root",
+       "control": "trust",
+       "sender": "matrix alice at example.org",
+       "sender_id": "@alice:example.org",
+       "tier": "trusted",
+       "event_id": "$event_id"
+     }
+     ```
 
 ---
 

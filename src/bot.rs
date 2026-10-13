@@ -372,7 +372,7 @@ pub async fn handle_incoming_event_with_guard(
                 false
             };
             let is_addressed =
-                is_mentioned || is_reply_to_bot || is_thread_escalate || is_thread_deeper || is_thread_trust;
+                is_mentioned || is_reply_to_bot || is_thread_escalate || is_thread_deeper;
 
             let is_engaged_thread = if let Some(ref root) = event.thread_root_id {
                 store.is_thread_engaged(root)?

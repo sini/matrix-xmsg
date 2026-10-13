@@ -39,8 +39,8 @@ fn test_config() -> Config {
         access_token_file: PathBuf::from("/nonexistent/token"),
         rooms: vec!["!support:example.org".to_string()],
         trusted_mxids: vec![
-            "@alice:example.org".to_string(),
-            "@alice🚀:example.org".to_string(),
+            "@alice-admin:example.org".to_string(),
+            "@alice/admin:example.org".to_string(),
             "@trusted:example.org".to_string(),
         ],
         owner_mxid: "@owner:example.org".to_string(),
@@ -104,16 +104,16 @@ async fn oracle_relayed_line_distinct_sender_id_for_colliding_mapped_names() {
     let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
-    let mxid1 = "@alice:example.org";
-    let mxid2 = "@alice🚀:example.org";
+    let mxid1 = "@alice-admin:example.org";
+    let mxid2 = "@alice/admin:example.org";
 
-    // Both MXIDs must map to the same lossy display name
+    // Both valid Matrix MXIDs must map to the same lossy display name
     assert_eq!(
         map_sender_mxid(mxid1),
         map_sender_mxid(mxid2),
         "Precondition: both MXIDs must collide in map_sender_mxid"
     );
-    assert_eq!(map_sender_mxid(mxid1), "matrix alice at example.org");
+    assert_eq!(map_sender_mxid(mxid1), "matrix alice-admin at example.org");
 
     // 1. First event from mxid1 opens a thread
     let event1 = IncomingMatrixEvent {
@@ -174,20 +174,21 @@ async fn oracle_relayed_line_distinct_sender_id_for_colliding_mapped_names() {
 
     // Display names MUST collide
     assert_eq!(req1[0].sender, req2[0].sender);
-    assert_eq!(req1[0].sender, "matrix alice at example.org");
+    assert_eq!(req1[0].sender, "matrix alice-admin at example.org");
 
     // Injective sender_ids MUST stay distinct (raw MXIDs)
     assert_ne!(
         req1[0].sender_id, req2[0].sender_id,
         "Oracle violation: colliding display names must not collide in sender_id"
     );
-    assert_eq!(req1[0].sender_id, "@alice:example.org");
-    assert_eq!(req2[0].sender_id, "@alice🚀:example.org");
+    assert_eq!(req1[0].sender_id, "@alice-admin:example.org");
+    assert_eq!(req2[0].sender_id, "@alice/admin:example.org");
 }
 
 // ---------------------------------------------------------------------------
 // Oracle 2:
-// Two MXIDs that map to the same display name stay distinct on the `!trust` control.
+// Two MXIDs that map to the same display name stay distinct on the `!trust` control
+// in an engaged thread.
 // Mutant: sender_id = mapped_name => RED.
 // Producer check: delete sender_id at producer => RED.
 // ---------------------------------------------------------------------------
@@ -198,11 +199,15 @@ async fn oracle_trust_control_distinct_sender_id_for_colliding_mapped_names() {
     let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
-    let mxid1 = "@alice:example.org";
-    let mxid2 = "@alice🚀:example.org";
+    let mxid1 = "@alice-admin:example.org";
+    let mxid2 = "@alice/admin:example.org";
     assert_eq!(map_sender_mxid(mxid1), map_sender_mxid(mxid2));
 
-    // 1. Trusted user 1 issues !trust in thread
+    // Pre-engage the thread in the store (NOTE-1: production only routes !trust on engaged threads)
+    let thread_root = "$thread_root";
+    store.record_thread_asker(thread_root, mxid1).unwrap();
+
+    // 1. Trusted user 1 issues !trust in the engaged thread
     let trust_event_1 = IncomingMatrixEvent {
         room_id: "!support:example.org".to_string(),
         event_id: "$ev_trust_1".to_string(),
@@ -210,7 +215,7 @@ async fn oracle_trust_control_distinct_sender_id_for_colliding_mapped_names() {
         body: "!trust".to_string(),
         formatted_body: None,
         mentions: None,
-        thread_root_id: Some("$thread_root".to_string()),
+        thread_root_id: Some(thread_root.to_string()),
         in_reply_to_event_id: None,
         replaces_event_id: None,
         timestamp_ms: 1000,
@@ -230,7 +235,7 @@ async fn oracle_trust_control_distinct_sender_id_for_colliding_mapped_names() {
     assert_eq!(reactions[0].key, "🔒");
     drop(reactions);
 
-    // 2. Trusted user 2 issues !trust in the same thread (new event)
+    // 2. Trusted user 2 issues !trust in the same engaged thread (new event)
     let trust_event_2 = IncomingMatrixEvent {
         room_id: "!support:example.org".to_string(),
         event_id: "$ev_trust_2".to_string(),
@@ -238,7 +243,7 @@ async fn oracle_trust_control_distinct_sender_id_for_colliding_mapped_names() {
         body: "!trust".to_string(),
         formatted_body: None,
         mentions: None,
-        thread_root_id: Some("$thread_root".to_string()),
+        thread_root_id: Some(thread_root.to_string()),
         in_reply_to_event_id: None,
         replaces_event_id: None,
         timestamp_ms: 2000,
@@ -266,25 +271,25 @@ async fn oracle_trust_control_distinct_sender_id_for_colliding_mapped_names() {
 
     assert_eq!(ctrl1["control"], "trust");
     assert_eq!(ctrl1["tier"], "trusted");
-    assert_eq!(ctrl1["thread_id"], "$thread_root");
+    assert_eq!(ctrl1["thread_id"], thread_root);
     assert_eq!(ctrl1["event_id"], "$ev_trust_1");
 
     assert_eq!(ctrl2["control"], "trust");
     assert_eq!(ctrl2["tier"], "trusted");
-    assert_eq!(ctrl2["thread_id"], "$thread_root");
+    assert_eq!(ctrl2["thread_id"], thread_root);
     assert_eq!(ctrl2["event_id"], "$ev_trust_2");
 
     // Display names collide
     assert_eq!(ctrl1["sender"], ctrl2["sender"]);
-    assert_eq!(ctrl1["sender"], "matrix alice at example.org");
+    assert_eq!(ctrl1["sender"], "matrix alice-admin at example.org");
 
     // Injective sender_ids MUST stay distinct
     assert_ne!(
         ctrl1["sender_id"], ctrl2["sender_id"],
         "Oracle violation: !trust sender_ids must stay distinct despite display name collision"
     );
-    assert_eq!(ctrl1["sender_id"], "@alice:example.org");
-    assert_eq!(ctrl2["sender_id"], "@alice🚀:example.org");
+    assert_eq!(ctrl1["sender_id"], "@alice-admin:example.org");
+    assert_eq!(ctrl2["sender_id"], "@alice/admin:example.org");
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +304,12 @@ async fn oracle_trust_control_untrusted_sender_dropped() {
     let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
+    // Pre-engage the thread
+    let thread_root = "$thread_root";
+    store
+        .record_thread_asker(thread_root, "@alice-admin:example.org")
+        .unwrap();
+
     let untrusted_event = IncomingMatrixEvent {
         room_id: "!support:example.org".to_string(),
         event_id: "$ev_untrusted_trust".to_string(),
@@ -306,7 +317,7 @@ async fn oracle_trust_control_untrusted_sender_dropped() {
         body: "!trust".to_string(),
         formatted_body: None,
         mentions: None,
-        thread_root_id: Some("$thread_root".to_string()),
+        thread_root_id: Some(thread_root.to_string()),
         in_reply_to_event_id: None,
         replaces_event_id: None,
         timestamp_ms: 1000,
@@ -340,14 +351,20 @@ async fn oracle_trust_control_debounced() {
     let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
+    // Pre-engage the thread
+    let thread_root = "$thread_root";
+    store
+        .record_thread_asker(thread_root, "@alice-admin:example.org")
+        .unwrap();
+
     let trust_event = IncomingMatrixEvent {
         room_id: "!support:example.org".to_string(),
         event_id: "$ev_trust_dup".to_string(),
-        sender_mxid: "@alice:example.org".to_string(),
+        sender_mxid: "@alice-admin:example.org".to_string(),
         body: "!trust".to_string(),
         formatted_body: None,
         mentions: None,
-        thread_root_id: Some("$thread_root".to_string()),
+        thread_root_id: Some(thread_root.to_string()),
         in_reply_to_event_id: None,
         replaces_event_id: None,
         timestamp_ms: 1000,
@@ -384,7 +401,7 @@ async fn oracle_context_history_line_carries_injective_sender_id() {
     let xmsg = TestXmsgMock::default();
     let store = Store::new_in_memory().unwrap();
 
-    let mxid = "@alice🚀:example.org";
+    let mxid = "@alice/admin:example.org";
 
     let trigger = IncomingMatrixEvent {
         room_id: "!support:example.org".to_string(),
@@ -403,7 +420,7 @@ async fn oracle_context_history_line_carries_injective_sender_id() {
     let history = vec![EventMessage {
         event_id: "$ev_root".to_string(),
         sender_mxid: mxid.to_string(),
-        body: "prior chat from unicode alice".to_string(),
+        body: "prior chat from alice with slash".to_string(),
         thread_root_id: None,
         timestamp_ms: 1000,
     }];
@@ -416,7 +433,7 @@ async fn oracle_context_history_line_carries_injective_sender_id() {
     let payloads = xmsg.sent_payloads.lock().unwrap();
     let ctx_lines = parse_relayed_lines(&payloads[0].2, "context");
     assert_eq!(ctx_lines.len(), 1);
-    assert_eq!(ctx_lines[0].sender, "matrix alice at example.org");
+    assert_eq!(ctx_lines[0].sender, "matrix alice-admin at example.org");
     assert_eq!(
         ctx_lines[0].sender_id, mxid,
         "Context line must carry the injective raw MXID"
