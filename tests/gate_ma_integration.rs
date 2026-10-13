@@ -668,12 +668,18 @@ async fn oracle_2_origin_by_node() {
         },
     );
     let bot = Bot::start(&a).await;
+    // In a mesh a bare name resolves over the whole view and fails closed when a peer cannot
+    // be asked (xmsg A7), so the local service addresses the bot `@node` as listed on node A.
+    let (_, list) = a.http("GET", "/v1/recipients", None);
+    let list = list.to_string();
+    let at = list.find("\"matrix-xmsg@").expect("the bot is listed") + 1;
+    let bot_addr = &list[at..at + list[at..].find('"').unwrap()];
 
     // Local: a service on the bot's own node.
     let requester = Fake::start(json!({
         "role": "service", "name": "requester",
         "register_sock": a.sock("register.sock"), "agent_sock": a.sock("agent.sock"),
-        "send": { "to": "matrix-xmsg", "text": open_thread("FROM-LOCAL") },
+        "send": { "to": bot_addr, "text": open_thread("FROM-LOCAL") },
     }));
     requester.ready().await;
     let reply = eventually("the local requester's answer", 20, || {
