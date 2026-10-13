@@ -76,7 +76,7 @@ fn test_config() -> Config {
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
-        guard_ref: "svc:genie-guard".to_string(),
+        guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         inbox_retry_budget: 10,
@@ -276,6 +276,7 @@ async fn oracle_3_late_answer_posted_and_owner_dmed() {
 
     // Late answer arrives in inbox and is posted in thread
     let delivery = matrix_xmsg::xmsg::SvcDelivery {
+        in_reply_to: None,
         message_id: "01M4LATE".to_string(),
         from_name: "claude".to_string(),
         text: "Late answer arrived before deadline.".to_string(),
@@ -343,6 +344,7 @@ async fn oracle_4_late_reply_always_posted_no_deadline() {
 
     // Reply arrives long after former deadline (+7200s)
     let delivery = matrix_xmsg::xmsg::SvcDelivery {
+        in_reply_to: None,
         message_id: "01M4VERYLATE".to_string(),
         from_name: "claude".to_string(),
         text: "Late reply is posted with no deadline.".to_string(),
@@ -411,6 +413,7 @@ async fn oracle_5_silent_decline_redacts_eye_and_salutes() {
 
     // Inbox delivery with silent: true arrives
     let delivery = matrix_xmsg::xmsg::SvcDelivery {
+        in_reply_to: None,
         message_id: "01M4DECLINE".to_string(),
         from_name: "claude".to_string(),
         origin: None,

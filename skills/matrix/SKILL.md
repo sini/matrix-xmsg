@@ -38,15 +38,15 @@ Reply to inbound messages using the xmsg `reply` tool directed to the message ID
 
 ## 3. Opening a Thread
 
-Local sessions on the bot's host (`kind: "local"`) can solicit Matrix threads. Remote sessions cannot open threads.
+Senders on the bot's own node can solicit Matrix threads: the bot accepts a request whose xmsg `origin.node` is the node it registered on. A sender on any other node is refused with an error reply, and nothing is posted.
 
-- **Request:** Send an xmsg message to `svc:matrix-xmsg`:
+- **Request:** Send an xmsg message to the service `matrix-xmsg` (a bare name; add `@<node>` if more than one is in view):
   `{"open_thread": {"room": "<room id>", "text": "<question>"}}`
 - **Room allowlist:** `<room id>` must exist in the bot's configured `rooms`.
 - **Opening post:** The bot posts top-level in the room: `On behalf of @<localpart>: <text>`.
 - **Response:** The bot replies to your request with:
   `{"root": "<root_event_id>", "permalink": "https://matrix.to/#/<room_id>/<root_event_id>"}`.
-- **Thread routing:** Subsequent lines in the thread arrive as replies to your initial request, pre-filtered through `svc:genie-guard` (rewritten lines carry `"rewritten": true`).
+- **Thread routing:** Subsequent lines in the thread arrive as replies to your initial request, pre-filtered through the guard service (`genie-guard`, or the `guard_ref` the bot is configured with); rewritten lines carry `"rewritten": true`.
 - **Replies:** Your replies to those messages are posted directly into the thread.
 - **Releasing a thread (`!release`):** The bot's owner (`owner_mxid` in its config) can release the thread back to standard routing by posting `!release` in reply to the opening post.
 

@@ -79,7 +79,7 @@ fn test_config() -> Config {
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
-        guard_ref: "svc:genie-guard".to_string(),
+        guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         inbox_retry_budget: 10,
@@ -228,6 +228,7 @@ async fn test_allowlisted_mention_triggers_and_replies_in_thread() {
     // Feed delivery to inbox
     let mut inbox = TestInboxMock::default();
     let delivery = SvcDelivery {
+        in_reply_to: None,
         message_id: "01M4REPLY".to_string(),
         from_name: "claude".to_string(),
         text: "To configure logging, set RUST_LOG=info in your environment.".to_string(),
@@ -557,6 +558,7 @@ async fn test_expert_escalate_marker() {
     // Feed delivery to inbox
     let mut inbox = TestInboxMock::default();
     let delivery = SvcDelivery {
+        in_reply_to: None,
         message_id: "01M4ESC".to_string(),
         from_name: "claude".to_string(),
         text: "I am unsure about this server configuration. [escalate]".to_string(),

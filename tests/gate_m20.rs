@@ -86,6 +86,10 @@ impl SvcInbox for TestQueueInbox {
         }
         Ok(())
     }
+
+    fn node(&self) -> Option<String> {
+        Some("sini.test".to_string())
+    }
 }
 
 fn test_config() -> Config {
@@ -102,7 +106,7 @@ fn test_config() -> Config {
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
-        guard_ref: "svc:genie-guard".to_string(),
+        guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         inbox_retry_budget: 10,
@@ -151,7 +155,7 @@ async fn oracle_1_restart_with_saved_sync_token_posts_in_quiet_room() {
         })
         .to_string(),
         "envelope",
-        Some(serde_json::json!({ "kind": "local" })),
+        Some(serde_json::json!({ "service": "requester", "node": "sini.test" })),
     );
 
     let inbox = TestQueueInbox::new(delivery);
@@ -217,7 +221,7 @@ async fn oracle_2_failing_delivery_retried_with_backoff() {
         })
         .to_string(),
         "envelope",
-        Some(serde_json::json!({ "kind": "local" })),
+        Some(serde_json::json!({ "service": "requester", "node": "sini.test" })),
     );
 
     let inbox = TestQueueInbox::new(delivery);
@@ -278,7 +282,7 @@ async fn oracle_3_bounded_retry_give_up() {
         })
         .to_string(),
         "envelope",
-        Some(serde_json::json!({ "kind": "local" })),
+        Some(serde_json::json!({ "service": "requester", "node": "sini.test" })),
     );
 
     let inbox = TestQueueInbox::new(delivery);

@@ -34,6 +34,7 @@ matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-a
 proptest = "1.6"
 tempfile = "3.17"
 wiremock = "0.6"
+rcgen = { version = "0.14.10", features = ["pem", "ring"] }
 
 [profile.release]
 opt-level = 2

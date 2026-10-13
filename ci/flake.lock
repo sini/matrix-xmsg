@@ -669,7 +669,8 @@
     "root": {
       "inputs": {
         "gen-harness": "gen-harness",
-        "nixpkgs": "nixpkgs_6"
+        "nixpkgs": "nixpkgs_6",
+        "xmsg": "xmsg"
       }
     },
     "treefmt-nix": {
@@ -712,6 +713,27 @@
       "original": {
         "owner": "numtide",
         "repo": "treefmt-nix",
+        "type": "github"
+      }
+    },
+    "xmsg": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791879633,
+        "narHash": "sha256-1XKdH6AJDabVjLWaNe+iuFMamryHAi9YhO8EqfyEO48=",
+        "owner": "sini",
+        "repo": "xmsg",
+        "rev": "948a8a6be7e5aaf73640f94eaf93ecf9427a1efa",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sini",
+        "repo": "xmsg",
+        "rev": "948a8a6be7e5aaf73640f94eaf93ecf9427a1efa",
         "type": "github"
       }
     }

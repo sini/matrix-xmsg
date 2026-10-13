@@ -89,7 +89,8 @@ impl MockXmsgSockets {
                                             if val.get("harness").and_then(|h| h.as_str()) == Some("svc") {
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
-                                                    "sessionId": "matrix-xmsg",
+                                                    "address": "matrix-xmsg@sini.test",
+                                                    "node": "sini.test",
                                                 });
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;
@@ -175,7 +176,7 @@ fn test_config() -> Config {
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
-        guard_ref: "svc:genie-guard".to_string(),
+        guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         inbox_retry_budget: 10,
@@ -191,8 +192,8 @@ fn test_config() -> Config {
 // ---------------------------------------------------------------------------
 // Oracle 1:
 // With xmsgSocket set, a send reaches the agent.sock stub with expected
-// action, ref, text, and push_replies=true.
-// Mutant: fall back or send without push_replies => RED.
+// action, to and text, and nothing else (MA: `to`, no `ref`, no `push_replies`).
+// Mutant: send the retired `ref` or `push_replies` fields => RED.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn oracle_1_send_reaches_socket_stub() {
@@ -217,10 +218,11 @@ async fn oracle_1_send_reaches_socket_stub() {
         "Expected exactly 1 request to agent.sock stub"
     );
     let req = &sends[0];
-    assert_eq!(req["action"], "send");
-    assert_eq!(req["ref"], "claude");
-    assert_eq!(req["text"], "hello unix expert");
-    assert_eq!(req["push_replies"], true);
+    assert_eq!(
+        req,
+        &serde_json::json!({ "action": "send", "to": "claude", "text": "hello unix expert" }),
+        "the send frame is exactly {{action, to, text}}"
+    );
 }
 
 // ---------------------------------------------------------------------------

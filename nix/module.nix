@@ -104,7 +104,7 @@ in
       example = "/run/user/1000/xmsg";
       description = ''
         Path to the xmsg runtime directory containing register.sock and agent.sock.
-        The bot connects to register.sock as svc:matrix-xmsg and sends forwards on agent.sock.
+        The bot registers on register.sock as the service matrix-xmsg and sends forwards on agent.sock.
         Because svc attests the peer UID, services.matrix-xmsg.dynamicUser must be false,
         and services.matrix-xmsg.user must be configured to the runtime directory's owning user.
         Note: The xmsg daemon instance must pass `--svc-exe matrix-xmsg=<this package's binary>`
@@ -115,7 +115,7 @@ in
     expertRef = lib.mkOption {
       type = lib.types.str;
       default = "claude";
-      description = "Reference name of the expert agent session in xmsg.";
+      description = "The expert's xmsg address: a label, optionally with @<node>.";
     };
 
     historyN = lib.mkOption {

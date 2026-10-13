@@ -44,7 +44,7 @@ fn default_session_live_secs() -> u64 {
 }
 
 fn default_guard_ref() -> String {
-    "svc:genie-guard".to_string()
+    "genie-guard".to_string()
 }
 
 fn default_guard_timeout_secs() -> u64 {
@@ -191,7 +191,7 @@ mod tests {
             owner_mxid = "@owner:example.org"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.guard_ref, "svc:genie-guard");
+        assert_eq!(cfg.guard_ref, "genie-guard");
         assert_eq!(cfg.guard_timeout_secs, 150);
         assert_eq!(cfg.guard_retry_budget, 3);
         assert_eq!(

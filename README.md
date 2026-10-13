@@ -83,16 +83,17 @@
 
 ### 1.5 Svc Inbox & Reply Contract (M13, M17, M18, M20)
 
-- **The Bot as `svc:matrix-xmsg`:** On startup, the bot registers on xmsg's `register.sock` as `svc:matrix-xmsg`. Every forward is sent attested on `agent.sock` (`action: "send"`, `push_replies: true`), routing subsequent replies directly to the bot's service inbox.
+- **The Bot as the service `matrix-xmsg`:** On startup, the bot registers on xmsg's `register.sock` as the service `matrix-xmsg` (a bare name; xmsg lists it as `matrix-xmsg@<node>`). The registration's `ok` frame (`{"status":"ok","address":"matrix-xmsg@<node>","node":"<node>"}`) names the bot's node, which the `open_thread` origin check uses. Every forward is sent on `agent.sock` as `{"action":"send","to":"<expert_ref>","text":...}`, attributed to the service by its process; xmsg pushes every reply to a service's send into its inbox, so there is no `push_replies` field (xmsg A10).
+- **One receive path, routed by `inReplyTo` (AM-3):** Every pushed reply carries `inReplyTo`, the message it answers. A reply to one of the bot's guard requests is that request's verdict: the inbox loop hands it to the guard check waiting on it, and it never reaches the expert path. Every other reply is matched to its forward by `inReplyTo`.
 - **Posting Every Reply (No Deadline):** Every reply arriving in the service inbox is posted to the Matrix thread in order. An agent may follow up by replying again; each reply is posted.
 - **Room State Resolution on Start (M20):** Every room in `config.rooms` is resolved at startup before serving the inbox (verifying client room state and joining if not present, with cold-room direct send fallback). This ensures quiet configured rooms without new sync events are immediately resolvable for posting right after restarts (such as `open_thread` opening posts) without altering sync tokens or compromising backlog suppression (M2 R5).
 - **Inbox Delivery Retry Backoff & Bounded Give-Up (M20):** A delivery whose Matrix posting fails is left unacknowledged so it can be retried, but retried with exponential backoff (1s doubling up to a 5-minute / 300s cap) per delivery rather than hot-looping. The bot logs exactly one line per attempt. After a configurable attempt bound (`inbox_retry_budget`, default 10), the bot permanently gives up on the delivery: it replies to the sender on xmsg with `{"error": "<reason>"}`, sends a single DM notification to the owner, and acknowledges (`ack`) the delivery on the service inbox.
-- **Automatic Reconnect & Re-registration (M18):** When the registration connection to xmsg is lost (due to daemon restarts, upgrades, or errors), the bot automatically reconnects with exponential backoff (starting at 1s, capped at 30s) and re-registers as `svc:matrix-xmsg`, resuming inbox polling without losing unacked deliveries or requiring a bot restart.
+- **Automatic Reconnect & Re-registration (M18):** When the registration connection to xmsg is lost (due to daemon restarts, upgrades, or errors), the bot automatically reconnects with exponential backoff (starting at 1s, capped at 30s) and re-registers as `matrix-xmsg`, resuming inbox polling without losing unacked deliveries or requiring a bot restart.
 - **Silent Decline (`{"silent": true}`):** If an agent replies with `{"silent": true}`, the bot posts nothing to the room, redacts its original `👀` reaction, and reacts with `🫡`.
-- **Thread Resync & Compaction Recovery (`{"resync": true}`) (M17):** An agent session recovering from auto-compaction or context loss may re-request the thread's complete transcript by replying with `{"resync": true}`. The bot treats this as a control (never posted to Matrix) and replies on xmsg with a bootstrap-formatted transcript bounded by `resync_byte_cap` (dropping room background lines before thread lines). The thread cursor advances to the newest line sent with the requesting session ID. Resync requests are rate-limited to at most one per thread per 60 seconds (throttled requests receive `{"resync": "throttled", "retry_after": <s>}`); unknown messages receive `{"resync": "unknown"}`.
+- **Thread Resync & Compaction Recovery (`{"resync": true}`) (M17):** An agent session recovering from auto-compaction or context loss may re-request the thread's complete transcript by replying with `{"resync": true}`. The bot treats this as a control (never posted to Matrix) and replies on xmsg with a bootstrap-formatted transcript bounded by `resync_byte_cap` (dropping room background lines before thread lines). The thread cursor advances to the newest line sent with the requesting session's ID, read from its sender label (`label · id@node`, the ID being the part before `@node`). Resync requests are rate-limited to at most one per thread per 60 seconds (throttled requests receive `{"resync": "throttled", "retry_after": <s>}`); unknown messages receive `{"resync": "unknown"}`.
 - **Delivery & Ack Guarantees:** A reply is acknowledged (`ack`) on `register.sock` only after its Matrix notice post succeeds (or resync reply is dispatched). Crashes or failures cause re-delivery rather than lost replies.
 - **Answer Timeout:** If no reply arrives within `answer_timeout_secs`, the bot sends an owner DM notification once. This state is tracked in the SQLite store and survives bot restarts. (`answer_deadline_secs` is retired).
-- **Session Changes:** A forward's re-bootstrap envelope carries `supersedes="<delta message id>"` on its context block. The receiving agent should answer only the bootstrap and ignore the superseded message; the bot records both message IDs so a reply to either is attributed to the thread.
+- **Session Changes (M16):** The thread cursor records the ID each forward resolved to, read from the `address` (`id@node`) in `send`'s result. When a delta forward resolves to a different ID than the cursor's (a new conversation behind `expert_ref`; a resumed conversation keeps its ID), the bot immediately re-bootstraps. A forward's re-bootstrap envelope carries `supersedes="<delta message id>"` on its context block. The receiving agent should answer only the bootstrap and ignore the superseded message; the bot records both message IDs so a reply to either is attributed to the thread.
 
 ### 1.6 Strict ASCII Sender Mapping
 
@@ -104,16 +105,16 @@ Matrix IDs (`@alice:example.org`) are converted to sanitized ASCII identifiers (
 
 ### 1.7 Solicited Threads & Guard Integration (M15)
 
-A local session on the xmsg bus can solicit Matrix threads by asking the bot to open a thread on its behalf:
+A sender on the bot's own xmsg node can solicit Matrix threads by asking the bot to open a thread on its behalf:
 
 - **Opening a Thread (`open_thread`):** A message delivered to the bot's service inbox carrying `{"open_thread": {"room": "<room_id>", "text": "<text>"}}` initiates thread creation.
-  - **Local Origin Enforcement:** The request must carry an xmsg origin with `kind: "local"`. Messages from any other origin (or lacking local origin) are refused with an error reply and post nothing to Matrix.
+  - **Origin by Node:** The request's xmsg `origin` (`{id or service, node, label}`) must name the bot's own node, as the registration's `ok` frame gave it. A request from another node, or with no origin, is refused with an error reply and posts nothing to Matrix.
   - **Room Allowlist & Size Cap:** The requested `room` must be present in `config.rooms` and the text is capped at `size_cap_bytes`. Non-allowlisted rooms are refused with an error reply.
   - **Opening Post:** The bot posts top-level in the requested room: `On behalf of @<localpart>: <text>`, where `<localpart>` is parsed from `config.owner_mxid`.
   - **Binding & Reply:** The bot records `(root_event_id, room_id, request_message_id, opened_at)` in the SQLite `solicited_threads` table and replies to `request_message_id` with `{"root": "<root_event_id>", "permalink": "https://matrix.to/#/<room_id>/<root_event_id>"}`.
 - **Bound Thread Routing & Guard Pipeline:**
   - Admitted lines occurring inside a bound thread are routed to the requesting session via `reply_message` to `request_message_id` (rather than `expert_ref`).
-  - Prior to relaying, each line is sent to `config.guard_ref` (`svc:genie-guard`) with `push_replies: false`. The bot long-polls `http.sock` at `/v1/messages/{id}/replies?wait=...` bounded by `guard_timeout_secs` (default 150s) to receive the guard's reply.
+  - Prior to relaying, each line is sent to `config.guard_ref` (default the bare service name `genie-guard`). The guard's verdict arrives pushed into the bot's service inbox and is routed to the waiting check by `inReplyTo` (a pending-request map keyed by the guard request's message ID), bounded by `guard_timeout_secs` (default 150s). When two guards are in view, a bare `genie-guard` is `ambiguous` and the check fails loudly, naming the code; set `guard_ref = "genie-guard@<node>"` (the deployment's choice).
   - **Guard Verdicts & Strict Parsing:**
     - `allow`: Relays the original envelope text.
     - `rewrite`: Relays `cleaned_text` with `"rewritten": true` in the context line.
@@ -157,8 +158,8 @@ trusted_mxids = ["@alice:example.org", "@bob:example.org"]
 owner_mxid = "@owner:example.org"
 admission = "trusted" # "trusted" (default) or "public"
 xmsg_socket = "/run/user/1000/xmsg"
-expert_ref = "claude"
-guard_ref = "svc:genie-guard"
+expert_ref = "claude" # a label, optionally with @<node>
+guard_ref = "genie-guard" # a bare service name; "genie-guard@<node>" when two are in view
 guard_timeout_secs = 150
 guard_retry_budget = 3
 history_n = 30
@@ -254,7 +255,7 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
 
 The bot runs as a non-DynamicUser service (e.g. `user = "sini"`), connecting directly to xmsg's runtime directory (`xmsgSocket`, typically `/run/user/1000/xmsg`). When `user` is set to an existing host account (anything other than the default `"matrix-xmsg"`), the module does not declare `users.users` or `users.groups`, avoiding collision with the user's existing home directory and attributes, and defaults `serviceConfig.Group` to the user's primary group unless `group` is explicitly specified.
 
-On startup, the bot registers on `register.sock` as `svc:matrix-xmsg`. xmsg verifies the caller's peer UID and validates the executable against `--svc-exe matrix-xmsg=<path>`. Forwards are sent attested on `agent.sock` (`push_replies: true`), routing subsequent replies directly into the bot's service inbox loop.
+On startup, the bot registers on `register.sock` as the service `matrix-xmsg`. xmsg verifies the caller's peer UID and validates the executable against `--svc-exe matrix-xmsg=<path>`. Forwards and guard requests are sent on `agent.sock`, attributed to the service by its process, and every reply to them is pushed into the bot's service inbox loop.
 
 ---
 
@@ -283,8 +284,14 @@ nix build -L .#checks.x86_64-linux.image
 ## 5. Verification & Testing
 
 ```bash
-# 1. Run Cargo tests
+# 1. Run Cargo tests (the integration oracles in tests/gate_ma_integration.rs skip without XMSG_BIN)
 nix develop --command cargo test --all-targets
+
+# 1a. Run the integration oracles against a real xmsg serve
+XMSG_BIN=/path/to/xmsg MA_XMSG_REQUIRED=1 nix develop --command cargo test --test gate_ma_integration
+
+# 1b. The same, as the ci/ check: XMSG_BIN from ci/'s pinned `xmsg` input, and a missing binary fails
+nix build -L ./ci#checks.x86_64-linux.integration
 
 # 2. Check Formatting and Clippy
 nix develop --command cargo fmt --check

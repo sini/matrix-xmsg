@@ -99,7 +99,8 @@ impl MockXmsgSockets {
                                             if val.get("harness").and_then(|h| h.as_str()) == Some("svc") {
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
-                                                    "sessionId": "matrix-xmsg",
+                                                    "address": "matrix-xmsg@sini.test",
+                                                    "node": "sini.test",
                                                 });
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;
@@ -191,7 +192,7 @@ fn test_config(socket_dir: &Path) -> Config {
         answer_timeout_secs: 10,
         session_live_secs: 3600,
         resync_byte_cap: 65536,
-        guard_ref: "svc:genie-guard".to_string(),
+        guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         inbox_retry_budget: 10,
@@ -533,11 +534,11 @@ async fn oracle_3_reply_post_failure_not_acked_and_posted_on_redelivery() {
 
 // ---------------------------------------------------------------------------
 // Oracle 4:
-// Sends carry push_replies:true on agent.sock.
-// Mutant: send without push_replies => RED.
+// Sends on agent.sock name the expert in `to` and carry no `push_replies` (MA, A10).
+// Mutant: send the retired `ref` or `push_replies` fields => RED.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn oracle_4_sends_carry_push_replies_true_on_agent_sock() {
+async fn oracle_4_sends_use_to_and_carry_no_push_replies() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockXmsgSockets::start(tmp.path()).await;
     let config = test_config(tmp.path());
@@ -571,10 +572,10 @@ async fn oracle_4_sends_carry_push_replies_true_on_agent_sock() {
     );
     let req = &sends[0];
     assert_eq!(req["action"], "send");
-    assert_eq!(req["ref"], "claude");
-    assert_eq!(
-        req["push_replies"], true,
-        "Sends on agent.sock must carry push_replies:true"
+    assert_eq!(req["to"], "claude");
+    assert!(
+        req.get("ref").is_none() && req.get("push_replies").is_none(),
+        "Sends on agent.sock carry neither ref nor push_replies: {req}"
     );
 }
 

@@ -178,7 +178,8 @@ impl MockXmsgSockets {
                                                 registration_count.fetch_add(1, Ordering::SeqCst);
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
-                                                    "sessionId": "matrix-xmsg",
+                                                    "address": "matrix-xmsg@sini.test",
+                                                    "node": "sini.test",
                                                 });
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;
@@ -270,7 +271,7 @@ fn test_config(socket_dir: &Path) -> Config {
         answer_timeout_secs: 10,
         session_live_secs: 3600,
         resync_byte_cap: 65536,
-        guard_ref: "svc:genie-guard".to_string(),
+        guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         inbox_retry_budget: 10,

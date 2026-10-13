@@ -112,7 +112,7 @@ fn test_config() -> Config {
         answer_timeout_secs: 10,
         session_live_secs: 3600,
         resync_byte_cap: 65536,
-        guard_ref: "svc:genie-guard".to_string(),
+        guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         inbox_retry_budget: 10,
@@ -195,6 +195,7 @@ async fn oracle_1_resync_reply_produces_transcript_reply_and_nothing_in_room() {
 
     // Asker sends {"resync": true}
     let delivery = SvcDelivery {
+        in_reply_to: None,
         message_id: "01RESYNC00001".to_string(),
         from_name: "session-oracle1".to_string(),
         origin: None,
@@ -316,6 +317,7 @@ async fn oracle_2_thread_longer_than_history_n_returned_in_full_paged() {
 
     let fwd_id = "01M17FWD000001";
     let delivery = SvcDelivery {
+        in_reply_to: None,
         message_id: "01RESYNC00002".to_string(),
         from_name: "session-oracle2".to_string(),
         origin: None,
@@ -420,6 +422,7 @@ async fn oracle_3_over_byte_cap_background_lines_dropped_first_and_envelope_trun
 
     let fwd_id = "01M17FWD000001";
     let delivery = SvcDelivery {
+        in_reply_to: None,
         message_id: "01RESYNC00003".to_string(),
         from_name: "session-oracle3".to_string(),
         origin: None,
@@ -503,6 +506,7 @@ async fn oracle_4_after_resync_next_forward_is_delta_from_newest_line_sent() {
 
     // Resync requested by session at t=4030
     let delivery = SvcDelivery {
+        in_reply_to: None,
         message_id: "01RESYNC00004".to_string(),
         from_name: "session-oracle4".to_string(),
         origin: None,
@@ -589,6 +593,7 @@ async fn oracle_5_second_resync_within_60s_is_throttled() {
 
     // Resync 1 at t=5000 => Success
     let delivery1 = SvcDelivery {
+        in_reply_to: None,
         message_id: "01RESYNC00005_1".to_string(),
         from_name: "session-oracle5".to_string(),
         origin: None,
@@ -613,6 +618,7 @@ async fn oracle_5_second_resync_within_60s_is_throttled() {
 
     // Resync 2 at t=5035 (35 seconds later < 60s) => Throttled
     let delivery2 = SvcDelivery {
+        in_reply_to: None,
         message_id: "01RESYNC00005_2".to_string(),
         from_name: "session-oracle5".to_string(),
         origin: None,
@@ -653,6 +659,7 @@ async fn oracle_5_second_resync_within_60s_is_throttled() {
 
     // Resync 3 at t=5065 (65 seconds after first resync > 60s) => Success
     let delivery3 = SvcDelivery {
+        in_reply_to: None,
         message_id: "01RESYNC00005_3".to_string(),
         from_name: "session-oracle5".to_string(),
         origin: None,
@@ -688,6 +695,7 @@ async fn test_resync_unknown_forward_message_responds_unknown() {
     let xmsg = MockResyncXmsgClient::new(Some("session-unknown"));
 
     let delivery = SvcDelivery {
+        in_reply_to: None,
         message_id: "01RESYNC_UNK".to_string(),
         from_name: "session-unknown".to_string(),
         origin: None,

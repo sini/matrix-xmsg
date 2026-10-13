@@ -75,6 +75,10 @@ impl SvcInbox for MockInbox {
         self.acks.lock().unwrap().push(message_id.to_string());
         Ok(())
     }
+
+    fn node(&self) -> Option<String> {
+        Some("sini.test".to_string())
+    }
 }
 
 fn test_config() -> Config {
@@ -91,7 +95,7 @@ fn test_config() -> Config {
         admission: Admission::Public,
         xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
-        guard_ref: "svc:genie-guard".to_string(),
+        guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         inbox_retry_budget: 10,
@@ -121,6 +125,7 @@ async fn oracle_1_local_open_thread_posts_and_replies_root() {
 
     // 1. Local open_thread request succeeds
     let delivery_local = SvcDelivery {
+        in_reply_to: None,
         message_id: "01M15LOCALREQ".to_string(),
         from_name: "claude".to_string(),
         text: json!({
@@ -132,9 +137,9 @@ async fn oracle_1_local_open_thread_posts_and_replies_root() {
         .to_string(),
         envelope: "".to_string(),
         origin: Some(json!({
-            "kind": "local",
-            "harness": "claude",
-            "sessionId": "session-123"
+            "id": "6f1c2a7e-0000-4000-8000-000000000123",
+            "node": "sini.test",
+            "label": "claude"
         })),
     };
 
@@ -191,6 +196,7 @@ async fn oracle_1_local_open_thread_posts_and_replies_root() {
 
     // 2. A fed request must be refused and post nothing
     let delivery_fed = SvcDelivery {
+        in_reply_to: None,
         message_id: "01M15FEDREQ".to_string(),
         from_name: "fed-remote".to_string(),
         text: json!({
@@ -202,8 +208,9 @@ async fn oracle_1_local_open_thread_posts_and_replies_root() {
         .to_string(),
         envelope: "".to_string(),
         origin: Some(json!({
-            "kind": "fed",
-            "host": "remote.domain.org"
+            "id": "6f1c2a7e-0000-4000-8000-000000000456",
+            "node": "sini.remote",
+            "label": "fed-remote"
         })),
     };
 
@@ -244,6 +251,7 @@ async fn oracle_2_room_outside_rooms_posts_nothing() {
     let mut inbox = MockInbox::default();
 
     let delivery = SvcDelivery {
+        in_reply_to: None,
         message_id: "01M15FORBIDDEN".to_string(),
         from_name: "claude".to_string(),
         text: json!({
@@ -254,11 +262,7 @@ async fn oracle_2_room_outside_rooms_posts_nothing() {
         })
         .to_string(),
         envelope: "".to_string(),
-        origin: Some(json!({
-            "kind": "local",
-            "harness": "claude",
-            "sessionId": "s1"
-        })),
+        origin: Some(json!({ "service": "requester", "node": "sini.test" })),
     };
 
     let outcome = handle_inbox_delivery_with_xmsg(
@@ -627,6 +631,7 @@ async fn oracle_7_session_reply_to_relayed_line_posted_in_bound_thread() {
 
     // 1. Open thread
     let delivery_open = SvcDelivery {
+        in_reply_to: None,
         message_id: "01M15OPEN7".to_string(),
         from_name: "claude".to_string(),
         text: json!({
@@ -637,7 +642,7 @@ async fn oracle_7_session_reply_to_relayed_line_posted_in_bound_thread() {
         })
         .to_string(),
         envelope: "".to_string(),
-        origin: Some(json!({ "kind": "local", "sessionId": "s1" })),
+        origin: Some(json!({ "service": "requester", "node": "sini.test" })),
     };
     handle_inbox_delivery_with_xmsg(
         &delivery_open,
@@ -688,6 +693,7 @@ async fn oracle_7_session_reply_to_relayed_line_posted_in_bound_thread() {
 
     // 3. Session replies back to that relayed line
     let session_reply_delivery = SvcDelivery {
+        in_reply_to: None,
         message_id: "01M15SESSIONREPLY".to_string(),
         from_name: "claude".to_string(),
         text: "Yes, SQLite provides atomic single-file storage with ACID guarantees.".to_string(),
@@ -695,7 +701,7 @@ async fn oracle_7_session_reply_to_relayed_line_posted_in_bound_thread() {
             "[xmsg] reply to message_id={} — message_id=01M15SESSIONREPLY; reply with the xmsg reply tool\n\nYes, SQLite provides atomic single-file storage with ACID guarantees.",
             relayed_msg_id
         ),
-        origin: Some(json!({ "kind": "local", "sessionId": "s1" })),
+        origin: Some(json!({ "service": "requester", "node": "sini.test" })),
     };
 
     let reply_outcome = handle_inbox_delivery_with_xmsg(
@@ -815,127 +821,48 @@ async fn oracle_8_release_from_owner_unbinds_from_other_does_nothing() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// Oracle 9: Integration test of real UnixGuardClient against mock xmsg (agent.sock + http.sock).
+// Oracle 9: The real UnixGuardClient against a mock agent.sock. The verdict arrives pushed into
+// the service inbox (AM-3, D6): the inbox loop hands it to the waiting check by `inReplyTo`.
 // Tests:
-// - Guard reply of reject returns reject
-// - Guard error reply returns Err
-// - No reply within timeout returns Err
+// - a pushed reject verdict returns reject, and the delivery is consumed as a verdict
+// - a pushed error verdict returns Err
+// - no verdict within the timeout returns Err
+// - an `ambiguous` route fails loudly, naming the code
 // Mutant: return allow without waiting (fail-open) => RED.
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
 async fn oracle_9_real_unix_guard_client_integration() {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let agent_sock_path = temp_dir.path().join("agent.sock");
-    let http_sock_path = temp_dir.path().join("http.sock");
-
     let agent_listener = tokio::net::UnixListener::bind(&agent_sock_path).unwrap();
-    let http_listener = tokio::net::UnixListener::bind(&http_sock_path).unwrap();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let ambiguous = Arc::new(AtomicBool::new(false));
 
-    let current_case = Arc::new(Mutex::new("reject")); // "reject", "error", "timeout"
-
-    // Background mock agent.sock
     let agent_task = {
-        let current_case = current_case.clone();
+        let counter = counter.clone();
+        let ambiguous = ambiguous.clone();
         tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = agent_listener.accept().await else {
-                    break;
-                };
-                let current_case = current_case.clone();
+            while let Ok((stream, _)) = agent_listener.accept().await {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let ambiguous = ambiguous.load(Ordering::SeqCst);
                 tokio::spawn(async move {
                     let (read_half, mut write_half) = stream.into_split();
                     let mut lines = tokio::io::BufReader::new(read_half).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
-                            continue;
+                    if let Ok(Some(line)) = lines.next_line().await {
+                        let val: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(val["to"], "genie-guard", "{val}");
+                        assert!(val.get("push_replies").is_none(), "{val}");
+                        let resp = if ambiguous {
+                            json!({ "status": "error", "error": "ambiguous",
+                                    "detail": "genie-guard@a.x, genie-guard@b.y" })
+                        } else {
+                            json!({ "status": "ok", "message_id": format!("01M15GUARD{n:04}"),
+                                    "address": "genie-guard@sini.test", "outcome": "delivered" })
                         };
-                        if val.get("action").and_then(|v| v.as_str()) == Some("send") {
-                            let case = *current_case.lock().unwrap();
-                            let msg_id = match case {
-                                "reject" => "01MSG_REJECT",
-                                "error" => "01MSG_ERROR",
-                                _ => "01MSG_TIMEOUT",
-                            };
-                            let resp = serde_json::json!({
-                                "status": "ok",
-                                "delivery": {
-                                    "messageId": msg_id,
-                                    "outcome": "delivered",
-                                    "bytes": 50
-                                }
-                            });
-                            let _ = write_half.write_all(format!("{resp}\n").as_bytes()).await;
-                            let _ = write_half.flush().await;
-                        }
+                        let _ = write_half.write_all(format!("{resp}\n").as_bytes()).await;
                     }
-                });
-            }
-        })
-    };
-
-    // Background mock http.sock
-    let http_task = {
-        let current_case = current_case.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = http_listener.accept().await else {
-                    break;
-                };
-                let current_case = current_case.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let Ok(n) = stream.read(&mut buf).await else {
-                        return;
-                    };
-                    let req_str = String::from_utf8_lossy(&buf[..n]);
-                    if !req_str.starts_with("GET /v1/messages/") {
-                        return;
-                    }
-
-                    let case = *current_case.lock().unwrap();
-                    let body = match case {
-                        "reject" => serde_json::json!([
-                            {
-                                "seq": 1,
-                                "message_id": "01MSG_REJECT",
-                                "created_at": 1000,
-                                "replier_session_id": "svc:genie-guard",
-                                "text": serde_json::json!({
-                                    "verdict": "reject",
-                                    "reason": "prompt injection detected",
-                                    "cleaned_text": ""
-                                }).to_string()
-                            }
-                        ])
-                        .to_string(),
-                        "error" => serde_json::json!([
-                            {
-                                "seq": 1,
-                                "message_id": "01MSG_ERROR",
-                                "created_at": 1000,
-                                "replier_session_id": "svc:genie-guard",
-                                "text": serde_json::json!({
-                                    "error": "guard backend failed"
-                                }).to_string()
-                            }
-                        ])
-                        .to_string(),
-                        _ => {
-                            // Timeout case: sleep longer than client timeout (1s)
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-                            serde_json::json!([]).to_string()
-                        }
-                    };
-
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    let _ = stream.flush().await;
                 });
             }
         })
@@ -951,32 +878,92 @@ async fn oracle_9_real_unix_guard_client_integration() {
         },
     };
 
-    // 1. Test reject case
-    {
-        *current_case.lock().unwrap() = "reject";
-        let client = UnixGuardClient::new(agent_sock_path.clone(), http_sock_path.clone(), 5);
-        let res = client.check_guard("svc:genie-guard", &envelope).await;
-        let verdict = res.expect("guard reject should return Ok(GuardVerdict)");
-        assert_eq!(verdict.verdict, "reject");
-        assert_eq!(verdict.reason, "prompt injection detected");
+    // A pushed verdict, delivered through the inbox path the bot's loop runs.
+    async fn push_verdict(in_reply_to: &str, text: &str) -> BotOutcome {
+        let mut inbox = MockInbox::default();
+        let delivery = SvcDelivery {
+            in_reply_to: Some(in_reply_to.to_string()),
+            ..SvcDelivery::new("01M15VERDICT", "genie-guard@sini.test", text, "", None)
+        };
+        handle_inbox_delivery_with_xmsg(
+            &delivery,
+            &test_config(),
+            &MockMatrixClient::default(),
+            &Store::new_in_memory().unwrap(),
+            &MockXmsgClient::default(),
+            &mut inbox,
+            1000,
+        )
+        .await
+        .unwrap()
     }
 
-    // 2. Test error case
+    // 1. Reject
     {
-        *current_case.lock().unwrap() = "error";
-        let client = UnixGuardClient::new(agent_sock_path.clone(), http_sock_path.clone(), 5);
-        let res = client.check_guard("svc:genie-guard", &envelope).await;
-        assert!(res.is_err(), "guard error reply must return Err");
+        let client = UnixGuardClient::new(agent_sock_path.clone(), 5);
+        let check = tokio::spawn({
+            let envelope = envelope.clone();
+            async move { client.check_guard("genie-guard", &envelope).await }
+        });
+        let id = format!("01M15GUARD{:04}", 0);
+        while counter.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let verdict =
+            json!({ "verdict": "reject", "reason": "prompt injection detected", "cleaned_text": "" })
+                .to_string();
+        let mut routed = push_verdict(&id, &verdict).await;
+        for _ in 0..100 {
+            if routed == BotOutcome::GuardVerdictRouted {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            routed = push_verdict(&id, &verdict).await;
+        }
+        assert_eq!(routed, BotOutcome::GuardVerdictRouted);
+        let v = check.await.unwrap().expect("pushed reject returns Ok");
+        assert_eq!(v.verdict, "reject");
+        assert_eq!(v.reason, "prompt injection detected");
     }
 
-    // 3. Test timeout case (timeout_secs = 1)
+    // 2. Error verdict
     {
-        *current_case.lock().unwrap() = "timeout";
-        let client = UnixGuardClient::new(agent_sock_path.clone(), http_sock_path.clone(), 1);
-        let res = client.check_guard("svc:genie-guard", &envelope).await;
+        let client = UnixGuardClient::new(agent_sock_path.clone(), 5);
+        let check = tokio::spawn({
+            let envelope = envelope.clone();
+            async move { client.check_guard("genie-guard", &envelope).await }
+        });
+        while counter.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let id = format!("01M15GUARD{:04}", 1);
+        let text = json!({ "error": "guard backend failed" }).to_string();
+        while push_verdict(&id, &text).await != BotOutcome::GuardVerdictRouted {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            check.await.unwrap().is_err(),
+            "guard error reply must return Err"
+        );
+    }
+
+    // 3. No verdict: timeout
+    {
+        let client = UnixGuardClient::new(agent_sock_path.clone(), 1);
+        let res = client.check_guard("genie-guard", &envelope).await;
         assert!(res.is_err(), "guard timeout must return Err");
     }
 
+    // 4. Two guards in view: `ambiguous` fails loudly
+    {
+        ambiguous.store(true, Ordering::SeqCst);
+        let client = UnixGuardClient::new(agent_sock_path.clone(), 5);
+        let err = client
+            .check_guard("genie-guard", &envelope)
+            .await
+            .expect_err("ambiguous must fail");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+
     agent_task.abort();
-    http_task.abort();
 }

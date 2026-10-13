@@ -6,10 +6,22 @@
     # snapshot of the tree (den-hoag-lbtnv D1). So `outputs` below applies `../flake.nix`'s own
     # `outputs` to the `nixpkgs` declared here, line for line as `../flake.nix` declares it.
     nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+    # The real xmsg the integration oracles run (tests/gate_ma_integration.rs), pinned by
+    # revision: xmsg main after XA4 (the four-tool surface, the register.sock `ok` frame with
+    # `node`, pushed replies with `inReplyTo`). The addressing plan's re-verify step moves it.
+    xmsg = {
+      url = "github:sini/xmsg/948a8a6be7e5aaf73640f94eaf93ecf9427a1efa";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    inputs@{ gen-harness, nixpkgs, ... }:
+    inputs@{
+      gen-harness,
+      nixpkgs,
+      xmsg,
+      ...
+    }:
     let
       # The published surface of THIS tree.
       matrix-xmsg = (import ../flake.nix).outputs {
@@ -37,6 +49,18 @@
             { pkgs, system, ... }:
             {
               checks.package = matrix-xmsg.packages.${system}.default;
+              # The integration oracles against the real `xmsg serve`. MA_XMSG_REQUIRED makes
+              # a missing XMSG_BIN fail every oracle rather than skip it. xmsg's own suite is
+              # not this check's subject, so its package is built without it.
+              checks.integration = matrix-xmsg.packages.${system}.default.overrideAttrs {
+                pname = "matrix-xmsg-integration";
+                XMSG_BIN = "${xmsg.packages.${system}.default.overrideAttrs { doCheck = false; }}/bin/xmsg";
+                MA_XMSG_REQUIRED = "1";
+                cargoTestFlags = [
+                  "--test"
+                  "gate_ma_integration"
+                ];
+              };
             };
         }
       ];

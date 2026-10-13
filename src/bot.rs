@@ -7,8 +7,8 @@ use crate::matrix::{is_bot_mentioned, MatrixClient};
 use crate::sender_map::map_sender_mxid;
 use crate::store::{ForwardedMessageRecord, Store};
 use crate::xmsg::{
-    parse_in_reply_to_id, GuardClient, GuardContent, GuardEnvelope, GuardLine, SvcDelivery,
-    SvcInbox, XmsgClient,
+    parse_in_reply_to_id, route_guard_reply, sender_id, GuardClient, GuardContent, GuardEnvelope,
+    GuardLine, SvcDelivery, SvcInbox, XmsgClient,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +38,8 @@ pub enum BotOutcome {
     OpenThreadRefusal,
     GuardRejected,
     GuardFailed,
+    /// A pushed guard verdict, handed to the guard check that waits on it.
+    GuardVerdictRouted,
     Unbound,
     IgnoredReleaseNotOwner,
 }
@@ -944,17 +946,19 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
     inbox: &mut I,
     now_secs: i64,
 ) -> Result<BotOutcome, AppError> {
-    // 1. Origin check: must be kind == "local"
-    let is_local = delivery
+    // 1. Origin check: the sender's node must be this bot's own node, as the registration's
+    //    `ok` frame named it (A12's origin shape `{id or service, node, label}`).
+    let own_node = inbox.node();
+    let origin_node = delivery
         .origin
         .as_ref()
-        .and_then(|o| o.get("kind"))
-        .and_then(|k| k.as_str())
-        == Some("local");
+        .and_then(|o| o.get("node"))
+        .and_then(|n| n.as_str());
+    let is_local = own_node.is_some() && origin_node == own_node.as_deref();
 
     if !is_local {
         let reply_json = serde_json::json!({
-            "error": "unauthorized origin: open_thread requires kind: 'local'"
+            "error": "unauthorized origin: open_thread requires a sender on this bot's own node"
         })
         .to_string();
         let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
@@ -1065,6 +1069,15 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
     inbox: &mut I,
     now_secs: i64,
 ) -> Result<BotOutcome, AppError> {
+    // A pushed reply to a guard request is that request's verdict (AM-3): the guard check
+    // waiting on it consumes it, and it never reaches the expert path below.
+    if let Some(ref in_reply_to) = delivery.in_reply_to {
+        if route_guard_reply(in_reply_to, &delivery.text).await {
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::GuardVerdictRouted);
+        }
+    }
+
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(delivery.text.trim()) {
         if let Some(open_thread_val) = val.get("open_thread") {
             return handle_open_thread(
@@ -1089,7 +1102,10 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
     };
 
     if is_resync {
-        let orig_id = match parse_in_reply_to_id(&delivery.envelope)
+        let orig_id = match delivery
+            .in_reply_to
+            .as_deref()
+            .or_else(|| parse_in_reply_to_id(&delivery.envelope))
             .or_else(|| parse_in_reply_to_id(&delivery.text))
         {
             Some(id) => id.to_string(),
@@ -1168,10 +1184,10 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
             .map(|m| m.event_id.as_str())
             .unwrap_or(&forward.thread_root_id);
 
-        let asker_session_id = send_resp
-            .session_id
-            .as_deref()
-            .or((!delivery.from_name.is_empty()).then_some(delivery.from_name.as_str()));
+        // The asker's ID, read from its label (`label · id@node`, A12).
+        let asker_session_id = (!delivery.from_name.is_empty())
+            .then(|| sender_id(&delivery.from_name))
+            .or(send_resp.session_id.as_deref());
 
         store.set_thread_cursor(
             &forward.thread_root_id,
@@ -1184,7 +1200,10 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
         return Ok(BotOutcome::Resynced);
     }
 
-    let orig_id = match parse_in_reply_to_id(&delivery.envelope)
+    let orig_id = match delivery
+        .in_reply_to
+        .as_deref()
+        .or_else(|| parse_in_reply_to_id(&delivery.envelope))
         .or_else(|| parse_in_reply_to_id(&delivery.text))
     {
         Some(id) => id.to_string(),
