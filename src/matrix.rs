@@ -331,6 +331,132 @@ async fn is_owner_member_of_room(
     false
 }
 
+/// Extracts matrix.to user mention links, validates MXIDs, deduplicates them,
+/// refuses room mentions, and transforms bare matrix.to URLs into Markdown links
+/// so that the Markdown renderer produces HTML pills (<a href="...">display</a>).
+pub fn parse_mentions_and_render_pills(text: &str) -> (String, Vec<matrix_sdk::ruma::OwnedUserId>) {
+    use matrix_sdk::ruma::UserId;
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static LINK_RE: OnceLock<Regex> = OnceLock::new();
+    let re = LINK_RE.get_or_init(|| {
+        Regex::new(r"(?:\[([^\]]+)\]\((https://matrix\.to/#/(@[^\s\)]+))\)|<https://matrix\.to/#/(@[^\s>]+)>|(https://matrix\.to/#/(@[^\s\)]+)))").unwrap()
+    });
+
+    let mut user_ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut output = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for caps in re.captures_iter(text) {
+        let whole_match = caps.get(0).unwrap();
+        output.push_str(&text[last_end..whole_match.start()]);
+
+        if let Some(_disp_match) = caps.get(1) {
+            // Case 1: [display_name](https://matrix.to/#/@...)
+            let raw_mxid = caps.get(3).unwrap().as_str();
+            let clean_mxid = raw_mxid
+                .split('?')
+                .next()
+                .unwrap_or(raw_mxid)
+                .trim_end_matches(['.', ',', ';', ':', '!', '?', '/']);
+            if let Ok(uid) = <&UserId>::try_from(clean_mxid) {
+                let owned = uid.to_owned();
+                if seen.insert(owned.clone()) {
+                    user_ids.push(owned);
+                }
+            }
+            output.push_str(whole_match.as_str());
+        } else if let Some(bracket_mxid) = caps.get(4) {
+            // Case 2: <https://matrix.to/#/@...>
+            let raw_mxid = bracket_mxid.as_str();
+            let clean_mxid = raw_mxid
+                .split('?')
+                .next()
+                .unwrap_or(raw_mxid)
+                .trim_end_matches(['.', ',', ';', ':', '!', '?', '/']);
+            if let Ok(uid) = <&UserId>::try_from(clean_mxid) {
+                let owned = uid.to_owned();
+                if seen.insert(owned.clone()) {
+                    user_ids.push(owned);
+                }
+                output.push_str(&format!("[{clean_mxid}](https://matrix.to/#/{clean_mxid})"));
+            } else {
+                output.push_str(whole_match.as_str());
+            }
+        } else if let Some(_bare_url) = caps.get(5) {
+            // Case 3: bare https://matrix.to/#/@...
+            let raw_mxid = caps.get(6).unwrap().as_str();
+            let clean_mxid = raw_mxid
+                .split('?')
+                .next()
+                .unwrap_or(raw_mxid)
+                .trim_end_matches(['.', ',', ';', ':', '!', '?', '/']);
+            let trailing = &raw_mxid[clean_mxid.len()..];
+            if let Ok(uid) = <&UserId>::try_from(clean_mxid) {
+                let owned = uid.to_owned();
+                if seen.insert(owned.clone()) {
+                    user_ids.push(owned);
+                }
+                output.push_str(&format!(
+                    "[{clean_mxid}](https://matrix.to/#/{clean_mxid}){trailing}"
+                ));
+            } else {
+                output.push_str(whole_match.as_str());
+            }
+        }
+
+        last_end = whole_match.end();
+    }
+
+    output.push_str(&text[last_end..]);
+
+    if text.contains("@room") {
+        tracing::debug!("Explicit @room mention in text was refused by default");
+    }
+
+    (output, user_ids)
+}
+
+/// Constructs a RoomMessageEventContent with Markdown formatting and MSC3952 mentions.
+/// Validates and deduplicates matrix.to user links, renders them as pills,
+/// and unconditionally refuses @room room mentions.
+pub fn build_notice_content(
+    body: &str,
+    direct_mention_user: Option<&str>,
+) -> matrix_sdk::ruma::events::room::message::RoomMessageEventContent {
+    use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+    use matrix_sdk::ruma::events::Mentions;
+    use matrix_sdk::ruma::UserId;
+
+    let (processed_body, mut user_ids) = parse_mentions_and_render_pills(body);
+
+    if let Some(direct_user) = direct_mention_user {
+        if let Ok(uid) = <&UserId>::try_from(direct_user) {
+            let owned = uid.to_owned();
+            if !user_ids.contains(&owned) {
+                user_ids.push(owned);
+            }
+        }
+    }
+
+    let mut content = RoomMessageEventContent::notice_markdown(&processed_body);
+
+    if user_ids.is_empty() {
+        // MSC3952: An empty m.mentions object signals "mentions nobody",
+        // which disables legacy body-based pings in compliant clients.
+        content.mentions = Some(Mentions::new());
+    } else {
+        // Intentional mentions for the extracted user IDs.
+        // Room mentions are refused (Mentions::with_user_ids sets room: false/omitted).
+        content.mentions = Some(Mentions::with_user_ids(user_ids));
+    }
+
+    content
+}
+
 #[async_trait]
 impl MatrixClient for MatrixSdkClient {
     async fn send_notice(
@@ -341,20 +467,13 @@ impl MatrixClient for MatrixSdkClient {
         mention_user: Option<&str>,
     ) -> Result<String, AppError> {
         use matrix_sdk::ruma::events::relation::Thread;
-        use matrix_sdk::ruma::events::room::message::{Relation, RoomMessageEventContent};
-        use matrix_sdk::ruma::events::Mentions;
-        use matrix_sdk::ruma::{EventId, RoomId, UserId};
+        use matrix_sdk::ruma::events::room::message::Relation;
+        use matrix_sdk::ruma::{EventId, RoomId};
 
         let r_id = <&RoomId>::try_from(room_id)
             .map_err(|e| AppError::Matrix(format!("Invalid room ID '{room_id}': {e}")))?;
 
-        let mut content = RoomMessageEventContent::notice_markdown(body);
-
-        if let Some(user_mxid) = mention_user {
-            if let Ok(u_id) = <&UserId>::try_from(user_mxid) {
-                content.mentions = Some(Mentions::with_user_ids([u_id.to_owned()]));
-            }
-        }
+        let mut content = build_notice_content(body, mention_user);
 
         if let Some(root_id_str) = thread_root_id {
             let root_id = <&EventId>::try_from(root_id_str).map_err(|e| {
@@ -412,7 +531,6 @@ impl MatrixClient for MatrixSdkClient {
 
     async fn send_dm(&self, user_id: &str, body: &str) -> Result<String, AppError> {
         use matrix_sdk::ruma::api::client::room::create_room::v3::Request as CreateRoomRequest;
-        use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
         use matrix_sdk::ruma::{RoomId, UserId};
 
         let u_id = <&UserId>::try_from(user_id)
@@ -433,7 +551,7 @@ impl MatrixClient for MatrixSdkClient {
             }
         };
 
-        let content = RoomMessageEventContent::notice_markdown(body);
+        let content = build_notice_content(body, None);
 
         if let Some(ref r_id_str) = cached_room_id {
             if let Ok(r_id) = <&RoomId>::try_from(r_id_str.as_str()) {
@@ -857,6 +975,8 @@ pub struct SentNotice {
     pub thread_root_id: Option<String>,
     pub body: String,
     pub mention_user: Option<String>,
+    pub mentions: Option<Vec<String>>,
+    pub formatted_body: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -926,12 +1046,45 @@ impl MatrixClient for MockMatrixClient {
             }
         }
 
+        let (processed_body, extracted_user_ids) = parse_mentions_and_render_pills(body);
+        let mut final_mentions = Vec::new();
+        if let Some(user) = mention_user {
+            final_mentions.push(user.to_string());
+        }
+        for uid in extracted_user_ids {
+            let s = uid.to_string();
+            if !final_mentions.contains(&s) {
+                final_mentions.push(s);
+            }
+        }
+
+        let mention_user_record = mention_user
+            .map(|s| s.to_string())
+            .or_else(|| final_mentions.first().cloned());
+
+        let notice_content =
+            matrix_sdk::ruma::events::room::message::RoomMessageEventContent::notice_markdown(
+                &processed_body,
+            );
+        let formatted = match &notice_content.msgtype {
+            matrix_sdk::ruma::events::room::message::MessageType::Notice(n) => {
+                n.formatted.as_ref().map(|f| f.body.clone())
+            }
+            _ => None,
+        };
+
         let mut list = self.sent_notices.lock().unwrap();
         list.push(SentNotice {
             room_id: room_id.to_string(),
             thread_root_id: thread_root_id.map(|s| s.to_string()),
             body: body.to_string(),
-            mention_user: mention_user.map(|s| s.to_string()),
+            mention_user: mention_user_record,
+            mentions: if final_mentions.is_empty() {
+                None
+            } else {
+                Some(final_mentions)
+            },
+            formatted_body: formatted,
         });
         Ok(format!("$mock_event_{}", list.len()))
     }
@@ -1111,5 +1264,80 @@ mod tests {
         ));
         assert!(!is_bot_mentioned("@genie.bot hi", None, None, bot_mxid));
         assert!(!is_bot_mentioned("@genie/x", None, None, bot_mxid));
+    }
+
+    #[test]
+    fn test_parse_mentions_and_pills() {
+        use super::*;
+
+        // 1. Markdown link [vic](https://matrix.to/#/@vborja:matrix.org)
+        let (p1, u1) =
+            parse_mentions_and_render_pills("Hello [vic](https://matrix.to/#/@vborja:matrix.org)!");
+        assert_eq!(p1, "Hello [vic](https://matrix.to/#/@vborja:matrix.org)!");
+        assert_eq!(u1.len(), 1);
+        assert_eq!(u1[0].as_str(), "@vborja:matrix.org");
+
+        // 2. Bare URL
+        let (p2, u2) =
+            parse_mentions_and_render_pills("Ask https://matrix.to/#/@vborja:matrix.org for help");
+        assert_eq!(
+            p2,
+            "Ask [@vborja:matrix.org](https://matrix.to/#/@vborja:matrix.org) for help"
+        );
+        assert_eq!(u2.len(), 1);
+        assert_eq!(u2[0].as_str(), "@vborja:matrix.org");
+
+        // 3. Autolink with angle brackets <https://...>
+        let (p3, u3) =
+            parse_mentions_and_render_pills("See <https://matrix.to/#/@vborja:matrix.org>");
+        assert_eq!(
+            p3,
+            "See [@vborja:matrix.org](https://matrix.to/#/@vborja:matrix.org)"
+        );
+        assert_eq!(u3.len(), 1);
+        assert_eq!(u3[0].as_str(), "@vborja:matrix.org");
+
+        // 4. Deduplication
+        let (_p4, u4) = parse_mentions_and_render_pills(
+            "[vic](https://matrix.to/#/@vborja:matrix.org) and [vic again](https://matrix.to/#/@vborja:matrix.org)"
+        );
+        assert_eq!(u4.len(), 1);
+        assert_eq!(u4[0].as_str(), "@vborja:matrix.org");
+
+        // 5. Invalid MXID
+        let (_p5, u5) = parse_mentions_and_render_pills("[bad](https://matrix.to/#/@invalid)");
+        assert!(u5.is_empty());
+
+        // 6. Plain text without links
+        let (p6, u6) =
+            parse_mentions_and_render_pills("Just regular text with @vborja:matrix.org plain name");
+        assert_eq!(p6, "Just regular text with @vborja:matrix.org plain name");
+        assert!(u6.is_empty());
+    }
+
+    #[test]
+    fn test_build_notice_content_mentions() {
+        use super::*;
+
+        // With mention
+        let c1 = build_notice_content("Hello [vic](https://matrix.to/#/@vborja:matrix.org)", None);
+        let val1 = serde_json::to_value(&c1).unwrap();
+        assert_eq!(val1["m.mentions"]["user_ids"][0], "@vborja:matrix.org");
+        assert!(val1["formatted_body"]
+            .as_str()
+            .unwrap()
+            .contains("<a href=\"https://matrix.to/#/@vborja:matrix.org\">vic</a>"));
+        assert!(val1["m.mentions"]["room"].is_null() || val1["m.mentions"]["room"] == false);
+
+        // Without mention
+        let c2 = build_notice_content("Just a plain answer", None);
+        let val2 = serde_json::to_value(&c2).unwrap();
+        assert!(val2["m.mentions"]["user_ids"].is_null()); // empty object {}
+        assert_eq!(val2["m.mentions"], serde_json::json!({}));
+
+        // With @room
+        let c3 = build_notice_content("Attention @room!", None);
+        let val3 = serde_json::to_value(&c3).unwrap();
+        assert!(val3["m.mentions"]["room"].is_null() || val3["m.mentions"]["room"] == false);
     }
 }
