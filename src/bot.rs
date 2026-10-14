@@ -128,28 +128,31 @@ pub fn parse_reaction_control(key: &str) -> Option<ControlAction> {
     }
 }
 
-/// Returns true if a delivery payload from an expert / supervisor represents an approval request.
-/// Checks for an explicit JSON marker (`"approval": true` or `"approval_request": true`),
-/// or the standard approval notice prefix `"Approval requested:"` in the delivery or rendered text.
-pub fn is_approval_delivery(delivery_text: &str, rendered_text: &str) -> bool {
+/// Returns true if a delivery payload represents an approval request.
+/// A delivery from genie-agent is wrapped in a structured envelope `{"text": <string>, "approval"?: true}`.
+/// Reads `approval` only from the envelope's top level, requiring both a top-level `"text"` string
+/// and `"approval": true` (or `"approval_request": true`). Model text only ever goes inside `text`,
+/// so a model reply literally emitting `{"approval": true}` arrives nested as `{"text": "{\"approval\": true}"}`
+/// and cannot mint an approval request (Unit C10).
+pub fn is_approval_delivery(delivery_text: &str, _rendered_text: &str) -> bool {
     let trimmed = delivery_text.trim();
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
         if let Some(obj) = val.as_object() {
-            if obj
+            let has_text = obj.contains_key("text");
+            let has_approval = obj
                 .get("approval")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
                 || obj
                     .get("approval_request")
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-            {
+                    .unwrap_or(false);
+            if has_text && has_approval {
                 return true;
             }
         }
     }
-    rendered_text.trim().starts_with("Approval requested:")
-        || trimmed.starts_with("Approval requested:")
+    false
 }
 
 /// Renders an expert reply. If the reply is JSON `{"silent": true}`, returns `None`
@@ -1420,7 +1423,34 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
         }
     };
 
-    match format_expert_reply(&delivery.text) {
+    let (text_to_format, envelope_is_approval, envelope_is_escalate): (String, bool, bool) =
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(delivery.text.trim()) {
+            if let Some(obj) = val.as_object() {
+                if let Some(inner_text) = obj.get("text").and_then(|v| v.as_str()) {
+                    let is_appr = obj
+                        .get("approval")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                        || obj
+                            .get("approval_request")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                    let is_esc = obj
+                        .get("escalate")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    (inner_text.to_string(), is_appr, is_esc)
+                } else {
+                    (delivery.text.clone(), false, false)
+                }
+            } else {
+                (delivery.text.clone(), false, false)
+            }
+        } else {
+            (delivery.text.clone(), false, false)
+        };
+
+    match format_expert_reply(&text_to_format) {
         None => {
             // Declined ({"silent": true})
             if forward.reply_count == 0 {
@@ -1446,7 +1476,10 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
             inbox.ack(&delivery.message_id).await?;
             Ok(BotOutcome::Declined)
         }
-        Some((rendered_reply, is_escalate)) => {
+        Some((rendered_reply, is_esc_inner)) => {
+            let is_escalate = envelope_is_escalate || is_esc_inner;
+            let is_approval =
+                envelope_is_approval || is_approval_delivery(&delivery.text, &rendered_reply);
             if is_escalate {
                 let dm_text = format!(
                     "[matrix-xmsg] Expert requested escalation in room {} thread {} for message {}",
@@ -1454,7 +1487,6 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
                 );
                 matrix.send_dm(&config.owner_mxid, &dm_text).await?;
 
-                let is_approval = is_approval_delivery(&delivery.text, &rendered_reply);
                 let sent_ev_id = matrix
                     .send_notice(
                         &forward.room_id,
@@ -1475,7 +1507,6 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
                 inbox.ack(&delivery.message_id).await?;
                 Ok(BotOutcome::RepliedAndEscalated)
             } else {
-                let is_approval = is_approval_delivery(&delivery.text, &rendered_reply);
                 let sent_ev_id = matrix
                     .send_notice(
                         &forward.room_id,
