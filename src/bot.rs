@@ -102,6 +102,7 @@ pub struct IncomingReactionEvent {
 pub enum ControlAction {
     Accept,
     Deeper,
+    Approve,
 }
 
 impl ControlAction {
@@ -109,6 +110,7 @@ impl ControlAction {
         match self {
             Self::Accept => "accept",
             Self::Deeper => "deeper",
+            Self::Approve => "approve",
         }
     }
 }
@@ -119,9 +121,35 @@ pub fn parse_reaction_control(key: &str) -> Option<ControlAction> {
         Some(ControlAction::Accept)
     } else if trimmed.contains('🔍') || trimmed.contains('🔎') {
         Some(ControlAction::Deeper)
+    } else if trimmed.contains('🔓') {
+        Some(ControlAction::Approve)
     } else {
         None
     }
+}
+
+/// Returns true if a delivery payload from an expert / supervisor represents an approval request.
+/// Checks for an explicit JSON marker (`"approval": true` or `"approval_request": true`),
+/// or the standard approval notice prefix `"Approval requested:"` in the delivery or rendered text.
+pub fn is_approval_delivery(delivery_text: &str, rendered_text: &str) -> bool {
+    let trimmed = delivery_text.trim();
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(obj) = val.as_object() {
+            if obj
+                .get("approval")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || obj
+                    .get("approval_request")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    rendered_text.trim().starts_with("Approval requested:")
+        || trimmed.starts_with("Approval requested:")
 }
 
 /// Renders an expert reply. If the reply is JSON `{"silent": true}`, returns `None`
@@ -402,6 +430,27 @@ pub async fn handle_incoming_event_with_guard(
                 event.thread_root_id.is_some() && event.body.trim() == "!escalate";
             let is_thread_deeper = event.thread_root_id.is_some() && event.body.trim() == "!deeper";
             let is_thread_trust = event.thread_root_id.is_some() && event.body.trim() == "!trust";
+            let is_approve_command = event.body.trim() == "!approve";
+            let approval_target = if is_approve_command {
+                if let Some(ref in_reply_to) = event.in_reply_to_event_id {
+                    if store.is_approval_request(in_reply_to)? {
+                        Some(in_reply_to.clone())
+                    } else {
+                        None
+                    }
+                } else if let Some(ref root) = event.thread_root_id {
+                    if store.is_approval_request(root)? {
+                        Some(root.clone())
+                    } else {
+                        store.get_latest_approval_request_in_thread(root)?
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let is_approval_reply = approval_target.is_some();
             let is_mentioned = is_bot_mentioned(
                 &event.body,
                 event.formatted_body.as_deref(),
@@ -417,8 +466,11 @@ pub async fn handle_incoming_event_with_guard(
             } else {
                 false
             };
-            let is_addressed =
-                is_mentioned || is_reply_to_bot || is_thread_escalate || is_thread_deeper;
+            let is_addressed = is_mentioned
+                || is_reply_to_bot
+                || is_thread_escalate
+                || is_thread_deeper
+                || is_approval_reply;
 
             let is_engaged_thread = if let Some(ref root) = event.thread_root_id {
                 store.is_thread_engaged(root)?
@@ -513,6 +565,64 @@ pub async fn handle_incoming_event_with_guard(
                     "sender_id": event.sender_mxid,
                     "tier": "trusted",
                     "event_id": event.event_id,
+                })
+                .to_string();
+
+                xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
+                    .await?;
+
+                return Ok(BotOutcome::ControlEmitted);
+            }
+
+            // Handle !approve control command (Unit M12 approval)
+            if is_approve_command {
+                let Some(target_id) = approval_target else {
+                    // 🔓 or !approve on a message that isn't a bot approval request is ignored
+                    return Ok(BotOutcome::IgnoredNoMention);
+                };
+
+                let is_trusted = config.is_user_trusted(&event.sender_mxid);
+                if !is_trusted {
+                    return Ok(BotOutcome::IgnoredUntrustedUser);
+                }
+
+                let is_new = store.record_control_if_new(
+                    &target_id,
+                    &event.sender_mxid,
+                    "approve",
+                    now_secs,
+                )?;
+
+                if !is_new {
+                    return Ok(BotOutcome::ControlDebounced);
+                }
+
+                if let Err(e) = matrix
+                    .send_reaction(&event.room_id, &event.event_id, "🔓")
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to send approve reaction for event {}: {}",
+                        event.event_id,
+                        e
+                    );
+                }
+
+                let mapped_sender = map_sender_mxid(&event.sender_mxid);
+                let thread_id = event
+                    .thread_root_id
+                    .as_deref()
+                    .map(String::from)
+                    .or_else(|| store.get_approval_request_thread(&target_id).ok().flatten())
+                    .unwrap_or_else(|| thread_root.clone());
+
+                let payload = serde_json::json!({
+                    "thread_id": thread_id,
+                    "control": "approve",
+                    "sender": mapped_sender,
+                    "sender_id": event.sender_mxid,
+                    "tier": "trusted",
+                    "target": target_id,
                 })
                 .to_string();
 
@@ -1102,6 +1212,9 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
 
     // 5. Record bot message and bind solicited thread
     store.record_bot_message(&root_event_id, &root_event_id, now_secs)?;
+    if is_approval_delivery(&delivery.text, capped_text) {
+        let _ = store.record_approval_request(&root_event_id, &root_event_id, now_secs);
+    }
     store.bind_solicited_thread(&root_event_id, &room, &delivery.message_id, now_secs)?;
 
     // Record forward record for opening message so replies to request_message_id also route to thread
@@ -1341,6 +1454,7 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
                 );
                 matrix.send_dm(&config.owner_mxid, &dm_text).await?;
 
+                let is_approval = is_approval_delivery(&delivery.text, &rendered_reply);
                 let sent_ev_id = matrix
                     .send_notice(
                         &forward.room_id,
@@ -1350,10 +1464,18 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
                     )
                     .await?;
                 let _ = store.record_bot_message(&sent_ev_id, &forward.thread_root_id, now_secs);
+                if is_approval {
+                    let _ = store.record_approval_request(
+                        &sent_ev_id,
+                        &forward.thread_root_id,
+                        now_secs,
+                    );
+                }
                 store.increment_reply_count(&orig_id)?;
                 inbox.ack(&delivery.message_id).await?;
                 Ok(BotOutcome::RepliedAndEscalated)
             } else {
+                let is_approval = is_approval_delivery(&delivery.text, &rendered_reply);
                 let sent_ev_id = matrix
                     .send_notice(
                         &forward.room_id,
@@ -1363,6 +1485,13 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
                     )
                     .await?;
                 let _ = store.record_bot_message(&sent_ev_id, &forward.thread_root_id, now_secs);
+                if is_approval {
+                    let _ = store.record_approval_request(
+                        &sent_ev_id,
+                        &forward.thread_root_id,
+                        now_secs,
+                    );
+                }
                 store.increment_reply_count(&orig_id)?;
                 inbox.ack(&delivery.message_id).await?;
                 Ok(BotOutcome::Replied)
@@ -1543,10 +1672,62 @@ pub async fn handle_incoming_reaction(
         return Ok(BotOutcome::IgnoredRoom);
     }
 
-    // 2. Control Recognition Gate: Only ✅ and 🔍 (and 🔎) are controls
+    // 2. Control Recognition Gate: Only ✅ and 🔍 (and 🔎) and 🔓 are controls
     let Some(control) = parse_reaction_control(&reaction.key) else {
         return Ok(BotOutcome::IgnoredNoMention);
     };
+
+    if control == ControlAction::Approve {
+        // Must be a reaction on an approval request message posted by the bot
+        let is_approval = store.is_approval_request(&reaction.relates_to_event_id)?;
+        if !is_approval {
+            return Ok(BotOutcome::IgnoredNoMention);
+        }
+
+        // Accepted ONLY from a trusted sender; from anyone else it's dropped and never leaves the bot
+        let is_trusted = config.is_user_trusted(&reaction.sender_mxid);
+        if !is_trusted {
+            return Ok(BotOutcome::IgnoredUntrustedUser);
+        }
+
+        let thread_id = store
+            .get_approval_request_thread(&reaction.relates_to_event_id)?
+            .or_else(|| {
+                store
+                    .get_bot_message_thread(&reaction.relates_to_event_id)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_else(|| reaction.relates_to_event_id.clone());
+
+        let now_secs = reaction.timestamp_ms / 1000;
+        let is_new = store.record_control_if_new(
+            &reaction.relates_to_event_id,
+            &reaction.sender_mxid,
+            "approve",
+            now_secs,
+        )?;
+
+        if !is_new {
+            return Ok(BotOutcome::ControlDebounced);
+        }
+
+        let mapped_sender = map_sender_mxid(&reaction.sender_mxid);
+        let payload = serde_json::json!({
+            "thread_id": thread_id,
+            "control": "approve",
+            "sender": mapped_sender,
+            "sender_id": reaction.sender_mxid,
+            "tier": "trusted",
+            "target": reaction.relates_to_event_id,
+        })
+        .to_string();
+
+        xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
+            .await?;
+
+        return Ok(BotOutcome::ControlEmitted);
+    }
 
     // 3. Message check: Must be a reaction on a message the bot posted
     let Some(thread_id) = store.get_bot_message_thread(&reaction.relates_to_event_id)? else {

@@ -166,7 +166,13 @@ impl Store {
                 message_id TEXT PRIMARY KEY,
                 attempts INTEGER NOT NULL,
                 last_attempt_at INTEGER NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS approval_requests (
+                event_id TEXT PRIMARY KEY,
+                thread_root_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_approval_requests_thread ON approval_requests(thread_root_id);",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
 
@@ -399,6 +405,66 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT event_id FROM bot_messages WHERE thread_root_id = ?1 ORDER BY timestamp DESC LIMIT 1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![thread_root_id], |row| row.get(0));
+        match res {
+            Ok(ev) => Ok(Some(ev)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Records an event_id posted by the bot as an approval request in a thread.
+    pub fn record_approval_request(
+        &self,
+        event_id: &str,
+        thread_root_id: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        self.record_bot_message(event_id, thread_root_id, now)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO approval_requests (event_id, thread_root_id, created_at) VALUES (?1, ?2, ?3)",
+            params![event_id, thread_root_id, now],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to record approval request: {e}")))?;
+        Ok(())
+    }
+
+    /// Checks if a message event_id is an approval request posted by the bot.
+    pub fn is_approval_request(&self, event_id: &str) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT 1 FROM approval_requests WHERE event_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let exists = stmt
+            .exists(params![event_id])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(exists)
+    }
+
+    /// Retrieves the thread_root_id for an approval request.
+    pub fn get_approval_request_thread(&self, event_id: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT thread_root_id FROM approval_requests WHERE event_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![event_id], |row| row.get(0));
+        match res {
+            Ok(thread) => Ok(Some(thread)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Retrieves the latest approval request event_id in a thread.
+    pub fn get_latest_approval_request_in_thread(
+        &self,
+        thread_root_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT event_id FROM approval_requests WHERE thread_root_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1")
             .map_err(|e| AppError::Store(e.to_string()))?;
         let res = stmt.query_row(params![thread_root_id], |row| row.get(0));
         match res {
