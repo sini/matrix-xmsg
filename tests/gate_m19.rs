@@ -118,6 +118,58 @@ fn oracle_1_skill_frontmatter_and_protocol_keywords() {
     }
 }
 
+/// Oracle M23:
+/// The shipped `matrix` skill's §2 "Answering" carries both owner rules:
+/// (a) Address or credit a person with a matrix.to mention `[name](https://matrix.to/#/<sender mxid>)`
+///     built from the envelope's sender mxid; never use a bare name; mention only the people a reply
+///     is for, never the whole thread.
+/// (b) Attribution: a PR body may credit a reporter by handle; code, code comments and commit messages
+///     carry no handle ("reported in Matrix").
+/// Mutant: drop either rule from §2 "Answering" => RED.
+#[test]
+fn oracle_m23_answering_carries_mention_and_attribution_rules() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let skill_path = manifest_dir.join("skills/matrix/SKILL.md");
+    let content = fs::read_to_string(&skill_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", skill_path.display()));
+
+    let s2_start = content
+        .find("## 2. Answering")
+        .expect("SKILL.md must contain '## 2. Answering'");
+    let after_s2 = &content[s2_start..];
+    let s2_end = after_s2.find("\n## 3.").unwrap_or(after_s2.len());
+    let s2 = &after_s2[..s2_end];
+
+    // Rule (a): matrix.to mention built from sender mxid, never bare name, only people reply is for, never whole thread
+    assert!(
+        s2.contains("[name](https://matrix.to/#/<sender mxid>)"),
+        "§2 Answering must specify the matrix.to mention template '[name](https://matrix.to/#/<sender mxid>)'"
+    );
+    assert!(
+        s2.contains("Never use a bare name"),
+        "§2 Answering must forbid bare names"
+    );
+    assert!(
+        s2.contains("Mention only the people a reply is for, never the whole thread"),
+        "§2 Answering must restrict mentions to the people a reply is for, never the whole thread"
+    );
+
+    // Rule (b): PR body may credit reporter by handle; code, code comments and commit messages carry no handle ("reported in Matrix")
+    assert!(
+        s2.contains("A PR body may credit a reporter by handle"),
+        "§2 Answering must state that a PR body may credit a reporter by handle"
+    );
+    assert!(
+        s2.contains("Code, code comments and commit messages carry no handle"),
+        "§2 Answering must state that code, code comments and commit messages carry no handle"
+    );
+    assert!(
+        s2.contains("reported in Matrix"),
+        "§2 Answering must specify writing 'reported in Matrix'"
+    );
+}
+
+
 /// Oracle 2:
 /// `send_notice`'s cold-room join fallback is restricted to rooms in `config.rooms`.
 /// A send_notice to an unconfigured room id does not join it.

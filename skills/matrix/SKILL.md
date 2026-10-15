@@ -25,6 +25,8 @@ Inbound messages from the bot arrive with a structured envelope:
 Reply to inbound messages using the xmsg `reply` tool directed to the message ID:
 
 - **Posting:** Every reply arriving in the bot's service inbox is posted to the Matrix thread. Replies can be sent at any time, and sending multiple sequential replies is supported.
+- **Mentions:** Address or credit a person with a matrix.to mention, `[name](https://matrix.to/#/<sender mxid>)`, built from the envelope's sender mxid (`sender_id`). Never use a bare name. Mention only the people a reply is for, never the whole thread.
+- **Attribution:** A PR body may credit a reporter by handle. Code, code comments and commit messages carry no handle; write `"reported in Matrix"`.
 - **Trust promotion (`!trust`):** An authenticated trusted sender posting `!trust` in an engaged thread promotes the thread's trust tier. The bot reacts 🔒 and forwards the control payload carrying the sender's injective `sender_id`.
 - **Silent decline (`{"silent": true}`):** If an inbound message requires no response, reply with `{"silent": true}`. The bot posts nothing to Matrix, swaps its initial 👀 reaction for 🫡, and skips owner escalation.
 - **Thread resync (`{"resync": true}`):** If session context is lost (e.g. after harness auto-compaction), reply with `{"resync": true}`. The bot returns the thread's full bounded transcript over xmsg (throttled to once per thread per 60 seconds); this is never posted to Matrix.
