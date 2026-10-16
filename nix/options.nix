@@ -232,7 +232,7 @@
 
       answerTimeoutSecs = lib.mkOption {
         type = lib.types.ints.unsigned;
-        default = 300;
+        default = 600;
         description = "Timeout in seconds to wait for an expert reply before escalating.";
       };
 

@@ -67,7 +67,7 @@ fn default_size_cap_bytes() -> usize {
 }
 
 fn default_answer_timeout_secs() -> u64 {
-    300
+    600
 }
 
 fn default_session_live_secs() -> u64 {
@@ -443,6 +443,20 @@ mod tests {
             cfg.xmsg_agent_socket(),
             PathBuf::from("/tmp/test-xmsg/agent.sock")
         );
+    }
+
+    #[test]
+    fn test_answer_timeout_secs_default_m29() {
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = []
+            owner_mxid = "@owner:example.org"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.answer_timeout_secs, 600);
     }
 
     #[test]

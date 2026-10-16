@@ -171,12 +171,16 @@ in
         hmNamed = matrix-xmsg.homeManagerModules ? matrix-xmsg;
         nixosDefault = matrix-xmsg.nixosModules ? default;
         nixosNamed = matrix-xmsg.nixosModules ? matrix-xmsg;
+        hmAnswerTimeoutSecs = linuxCfg.services.matrix-xmsg.answerTimeoutSecs;
+        nixosAnswerTimeoutSecs = (nixosEval { }).config.services.matrix-xmsg.answerTimeoutSecs;
       };
       expected = {
         hmDefault = true;
         hmNamed = true;
         nixosDefault = true;
         nixosNamed = true;
+        hmAnswerTimeoutSecs = 600;
+        nixosAnswerTimeoutSecs = 600;
       };
     };
 

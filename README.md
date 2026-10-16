@@ -20,7 +20,7 @@
   - Downstream admission, size cap, rate limits, claims, ACK reactions (👀), and edit handling apply identically.
 - **Relay Acknowledgement & Late Answers (M9):**
   - **ACK Reaction (👀):** When an addressed message (`addressed: true`) is accepted by xmsg, the bot reacts to the event with 👀 (`m.reaction`) to signal work has begun. Unaddressed follows and dropped/refused messages receive no reaction.
-  - **Late Answers & Deadline:** If the expert reply does not arrive within `answer_timeout_secs` (default 300s), an owner DM is sent, but the bot continues waiting up to `answer_deadline_secs` (default 3600s). If the reply arrives before the deadline, it is posted to the thread as normal. Past the deadline, the bot stops waiting and posts a user-facing timeout notice.
+  - **Late Answers & Deadline:** If the expert reply does not arrive within `answer_timeout_secs` (default 600s), an owner DM is sent, but the bot continues waiting up to `answer_deadline_secs` (default 3600s). If the reply arrives before the deadline, it is posted to the thread as normal. Past the deadline, the bot stops waiting and posts a user-facing timeout notice.
 - **Admission Modes:**
   - `trusted` (default): Messages from non-allowlisted senders are dropped **silently**. The bot never responds or sends an error notice, preventing oracle attacks where attackers probe for valid allowlisted usernames.
   - `public`: Any room member's top-level question is relayed to the expert session; in engaged threads, the original thread asker and trusted senders are admitted, while bystanders are silently ignored.
@@ -173,7 +173,7 @@ history_byte_cap = 12288
 rate_limit_count = 10
 rate_limit_window_secs = 600
 size_cap_bytes = 4096
-answer_timeout_secs = 300
+answer_timeout_secs = 600
 session_live_secs = 3600
 resync_byte_cap = 65536
 db_path = "/var/lib/matrix-xmsg/matrix-xmsg.db"
@@ -275,7 +275,7 @@ When imported alongside `xmsg.homeManagerModules.xmsg`, the module automatically
 | `rateLimitCount`          | `uint`                     | `10`                           | Max queries permitted per user per window.                                                                                                                                                            |
 | `rateLimitWindowSecs`     | `uint`                     | `600`                          | Sliding window duration in seconds.                                                                                                                                                                   |
 | `sizeCapBytes`            | `uint`                     | `4096`                         | Max body size of queries accepted.                                                                                                                                                                    |
-| `answerTimeoutSecs`       | `uint`                     | `300`                          | Timeout before escalating to owner via DM.                                                                                                                                                            |
+| `answerTimeoutSecs`       | `uint`                     | `600`                          | Timeout before escalating to owner via DM.                                                                                                                                                            |
 | `sessionLiveSecs`         | `uint`                     | `3600`                         | Duration in seconds before an idle thread/session context is re-bootstrapped.                                                                                                                         |
 | `resyncByteCap`           | `uint`                     | `65536`                        | Maximum byte size of resync transcript payload.                                                                                                                                                       |
 | `dbPath`                  | `path`                     | `"${stateDir}/matrix-xmsg.db"` | Path to SQLite database (created mode `0600`).                                                                                                                                                        |
