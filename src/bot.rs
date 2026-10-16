@@ -5,7 +5,7 @@ use crate::context::{
 use crate::error::AppError;
 use crate::matrix::{is_bot_mentioned, MatrixClient};
 use crate::sender_map::map_sender_mxid;
-use crate::store::{ForwardedMessageRecord, Store};
+use crate::store::{BotReplyEventRecord, ForwardedMessageRecord, Store};
 use crate::xmsg::{
     parse_in_reply_to_id, route_guard_reply, sender_id, GuardClient, GuardContent, GuardEnvelope,
     GuardLine, SvcDelivery, SvcInbox, XmsgClient,
@@ -50,7 +50,7 @@ fn forward_key(purpose: &str, event_id: &str) -> String {
         return key;
     }
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = std::hash::DefaultHasher::new();
     event_id.hash(&mut h);
     format!("matrix-xmsg:{purpose}:#{:016x}", h.finish())
 }
@@ -86,6 +86,10 @@ pub enum BotOutcome {
     GuardVerdictRouted,
     Unbound,
     IgnoredReleaseNotOwner,
+    Redacted,
+    RedactRefused,
+    Edited,
+    EditRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -912,12 +916,19 @@ pub async fn handle_incoming_event_with_guard(
             }
         };
 
+        let relay_session = session_id.clone().or_else(|| {
+            store
+                .get_forward_session(&solicited.request_message_id)
+                .ok()
+                .flatten()
+        });
+
         // Advance cursor
         store.set_thread_cursor(
             &thread_root,
             &trigger_msg.event_id,
             now_secs,
-            session_id.as_deref(),
+            relay_session.as_deref(),
         )?;
 
         store.record_thread_message(&thread_root, &relayed_message_id, now_secs)?;
@@ -934,6 +945,7 @@ pub async fn handle_incoming_event_with_guard(
             reply_count: 0,
         };
         store.record_forwarded_message(&forward_rec)?;
+        store.set_forward_session(&relayed_message_id, relay_session.as_deref())?;
         drop(gate);
 
         if is_addressed {
@@ -962,6 +974,7 @@ pub async fn handle_incoming_event_with_guard(
     })
     .await?;
     let delta_message_id = send_resp.message_id;
+    let delta_session_id = send_resp.session_id.clone();
     let mut session_id = send_resp.session_id;
     let mut rebootstrap_message_id: Option<String> = None;
 
@@ -1039,6 +1052,7 @@ pub async fn handle_incoming_event_with_guard(
         reply_count: 0,
     };
     store.record_forwarded_message(&delta_forward_rec)?;
+    store.set_forward_session(&delta_message_id, delta_session_id.as_deref())?;
 
     if let Some(ref r_msg_id) = rebootstrap_message_id {
         let boot_forward_rec = ForwardedMessageRecord {
@@ -1054,6 +1068,7 @@ pub async fn handle_incoming_event_with_guard(
             reply_count: 0,
         };
         store.record_forwarded_message(&boot_forward_rec)?;
+        store.set_forward_session(r_msg_id, session_id.as_deref())?;
     }
     drop(gate);
 
@@ -1234,6 +1249,8 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
         reply_count: 0,
     };
     store.record_forwarded_message(&forward_rec)?;
+    let open_session = origin_session_id(delivery);
+    store.set_forward_session(&delivery.message_id, open_session.as_deref())?;
 
     // 6. Reply with root and permalink
     let permalink = format!("https://matrix.to/#/{room}/{root_event_id}");
@@ -1249,6 +1266,277 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
     Ok(BotOutcome::OpenThreadSuccess)
 }
 
+/// Extracts the bare attested ID or service name (`"<id-or-service>"`) strictly from
+/// `delivery.origin` (never from `from_name` or `origin.label`, which are self-chosen).
+pub fn origin_session_id(delivery: &SvcDelivery) -> Option<String> {
+    let origin = delivery.origin.as_ref()?;
+    origin
+        .get("service")
+        .or_else(|| origin.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extracts the attested authoring principal (`"<id-or-service>@<node>"`) strictly from
+/// `delivery.origin` (never from `from_name` or `origin.label`, which are self-chosen).
+/// Returns `None` if `origin` is absent or lacks an attested key or node.
+pub fn origin_author_key(delivery: &SvcDelivery) -> Option<String> {
+    let origin = delivery.origin.as_ref()?;
+    let key = origin_session_id(delivery)?;
+    let node = origin
+        .get("node")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(format!("{key}@{node}"))
+}
+
+/// Checks whether a forwarded message's recorded recipient session matches `delivery.origin`.
+fn forward_received_by_caller(fwd_session: Option<&str>, delivery: &SvcDelivery) -> bool {
+    let Some(caller_key) = origin_author_key(delivery) else {
+        return false;
+    };
+    let Some(caller_id) = origin_session_id(delivery) else {
+        return false;
+    };
+    let Some(rec_sess) = fwd_session.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if rec_sess.contains('@') {
+        rec_sess == caller_key
+    } else {
+        sender_id(rec_sess) == caller_id
+    }
+}
+
+async fn handle_redact_request<I: SvcInbox + ?Sized>(
+    delivery: &SvcDelivery,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    xmsg: &dyn XmsgClient,
+    inbox: &mut I,
+) -> Result<BotOutcome, AppError> {
+    drop(store.forward_gate.write().await);
+
+    let target_id = match obj
+        .get("redact")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id,
+        None => {
+            let reply_json = serde_json::json!({
+                "error": "missing or empty 'redact' reply message id"
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::RedactRefused);
+        }
+    };
+
+    let rec = match store.get_bot_reply_event(target_id)? {
+        Some(r) => r,
+        None => {
+            let reply_json = serde_json::json!({
+                "error": format!("unknown reply message id '{target_id}'")
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::RedactRefused);
+        }
+    };
+
+    let caller_key = origin_author_key(delivery);
+
+    if let Some(req_by_val) = obj.get("requested_by") {
+        let Some(req_by_id) = req_by_val
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            let reply_json = serde_json::json!({
+                "error": "invalid or empty 'requested_by' forward message id"
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::RedactRefused);
+        };
+
+        let Some(req_fwd) = store.get_forwarded_message(req_by_id)? else {
+            let reply_json = serde_json::json!({
+                "error": format!("unknown requested_by forward message id '{req_by_id}'")
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::RedactRefused);
+        };
+
+        let fwd_session = store.get_forward_session(req_by_id)?;
+        if !forward_received_by_caller(fwd_session.as_deref(), delivery) {
+            let reply_json = serde_json::json!({
+                "error": format!(
+                    "unauthorized: requested_by forward '{req_by_id}' was not received by the requesting agent"
+                )
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::RedactRefused);
+        }
+
+        let is_trusted_requester = config.is_user_trusted(&req_fwd.sender_mxid);
+        let is_asker_requester =
+            !rec.answered_mxid.is_empty() && req_fwd.sender_mxid == rec.answered_mxid;
+        if !is_trusted_requester && !is_asker_requester {
+            let reply_json = serde_json::json!({
+                "error": format!(
+                    "unauthorized: sender '{}' of '{req_by_id}' may not redact reply '{target_id}'",
+                    req_fwd.sender_mxid
+                )
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::RedactRefused);
+        }
+    } else if rec.author_principal.is_empty()
+        || caller_key.as_deref() != Some(rec.author_principal.as_str())
+    {
+        let reply_json = serde_json::json!({
+            "error": format!(
+                "unauthorized: only the authoring principal may redact reply '{target_id}'"
+            )
+        })
+        .to_string();
+        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::RedactRefused);
+    }
+
+    let reason = obj
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    matrix
+        .redact_event(&rec.room_id, &rec.event_id, reason)
+        .await?;
+    inbox.ack(&delivery.message_id).await?;
+    Ok(BotOutcome::Redacted)
+}
+
+async fn handle_edit_request<I: SvcInbox + ?Sized>(
+    delivery: &SvcDelivery,
+    raw_json_text: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    xmsg: &dyn XmsgClient,
+    inbox: &mut I,
+) -> Result<BotOutcome, AppError> {
+    if obj.contains_key("requested_by") {
+        let reply_json = serde_json::json!({
+            "error": "unauthorized: edit is author-only and does not accept 'requested_by'"
+        })
+        .to_string();
+        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::EditRefused);
+    }
+
+    let target_id = match obj
+        .get("edit")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id,
+        None => {
+            let reply_json = serde_json::json!({
+                "error": "missing or empty 'edit' reply message id"
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::EditRefused);
+        }
+    };
+
+    let rec = match store.get_bot_reply_event(target_id)? {
+        Some(r) => r,
+        None => {
+            let reply_json = serde_json::json!({
+                "error": format!("unknown reply message id '{target_id}'")
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::EditRefused);
+        }
+    };
+
+    let caller_key = origin_author_key(delivery);
+    if caller_key.is_none()
+        || rec.author_principal.is_empty()
+        || caller_key.as_deref() != Some(rec.author_principal.as_str())
+    {
+        let reply_json = serde_json::json!({
+            "error": format!(
+                "unauthorized: only the authoring principal may edit reply '{target_id}'"
+            )
+        })
+        .to_string();
+        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::EditRefused);
+    }
+
+    let has_answer = obj
+        .get("answer")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if !has_answer {
+        let reply_json = serde_json::json!({
+            "error": "missing or empty 'answer' in edit request"
+        })
+        .to_string();
+        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::EditRefused);
+    }
+
+    let rendered_new_body = match format_expert_reply(raw_json_text) {
+        Some((rendered, _)) => rendered,
+        None => {
+            let reply_json = serde_json::json!({
+                "error": "edit request cannot be silent"
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::EditRefused);
+        }
+    };
+
+    matrix
+        .edit_notice(&rec.room_id, &rec.event_id, &rendered_new_body)
+        .await?;
+    inbox.ack(&delivery.message_id).await?;
+    Ok(BotOutcome::Edited)
+}
+
 pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
     delivery: &SvcDelivery,
     config: &Config,
@@ -1257,7 +1545,7 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
     xmsg: &dyn XmsgClient,
     inbox: &mut I,
     now_secs: i64,
-) -> Result<BotOutcome, AppError> {
+ ) -> Result<BotOutcome, AppError> {
     // A pushed reply to a guard request is that request's verdict (AM-3): the guard check
     // waiting on it consumes it, and it never reaches the expert path below.
     if let Some(ref in_reply_to) = delivery.in_reply_to {
@@ -1280,6 +1568,49 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
                 now_secs,
             )
             .await;
+        }
+        if let Some(obj) = val.as_object() {
+            if obj.contains_key("redact") {
+                return handle_redact_request(delivery, obj, config, matrix, store, xmsg, inbox)
+                    .await;
+            }
+            if obj.contains_key("edit") {
+                return handle_edit_request(
+                    delivery,
+                    delivery.text.trim(),
+                    obj,
+                    matrix,
+                    store,
+                    xmsg,
+                    inbox,
+                )
+                .await;
+            }
+            if let Some(inner_text) = obj.get("text").and_then(|v| v.as_str()) {
+                if let Ok(inner_val) = serde_json::from_str::<serde_json::Value>(inner_text.trim())
+                {
+                    if let Some(inner_obj) = inner_val.as_object() {
+                        if inner_obj.contains_key("redact") {
+                            return handle_redact_request(
+                                delivery, inner_obj, config, matrix, store, xmsg, inbox,
+                            )
+                            .await;
+                        }
+                        if inner_obj.contains_key("edit") {
+                            return handle_edit_request(
+                                delivery,
+                                inner_text.trim(),
+                                inner_obj,
+                                matrix,
+                                store,
+                                xmsg,
+                                inbox,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1480,6 +1811,7 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
             let is_escalate = envelope_is_escalate || is_esc_inner;
             let is_approval =
                 envelope_is_approval || is_approval_delivery(&delivery.text, &rendered_reply);
+            let author_principal = origin_author_key(delivery).unwrap_or_default();
             if is_escalate {
                 let dm_text = format!(
                     "[matrix-xmsg] Expert requested escalation in room {} thread {} for message {}",
@@ -1496,6 +1828,15 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
                     )
                     .await?;
                 let _ = store.record_bot_message(&sent_ev_id, &forward.thread_root_id, now_secs);
+                let _ = store.record_bot_reply_event(&BotReplyEventRecord {
+                    reply_message_id: delivery.message_id.clone(),
+                    room_id: forward.room_id.clone(),
+                    event_id: sent_ev_id.clone(),
+                    thread_root_id: forward.thread_root_id.clone(),
+                    author_principal,
+                    answered_mxid: forward.sender_mxid.clone(),
+                    created_at: now_secs,
+                });
                 if is_approval {
                     let _ = store.record_approval_request(
                         &sent_ev_id,
@@ -1516,6 +1857,15 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
                     )
                     .await?;
                 let _ = store.record_bot_message(&sent_ev_id, &forward.thread_root_id, now_secs);
+                let _ = store.record_bot_reply_event(&BotReplyEventRecord {
+                    reply_message_id: delivery.message_id.clone(),
+                    room_id: forward.room_id.clone(),
+                    event_id: sent_ev_id.clone(),
+                    thread_root_id: forward.thread_root_id.clone(),
+                    author_principal,
+                    answered_mxid: forward.sender_mxid.clone(),
+                    created_at: now_secs,
+                });
                 if is_approval {
                     let _ = store.record_approval_request(
                         &sent_ev_id,

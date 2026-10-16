@@ -36,6 +36,11 @@ Reply to inbound messages using the xmsg `reply` tool directed to the message ID
   - `gaps`: String array (`["..."]`), rendered as `gaps: ...` or `gaps: none`.
   - `tier`: `"expert"` or integer `> 1`, adds `[expert review]` header and metadata label.
   - `escalate`: Boolean, flags the message for escalation (also triggered by trailing `[escalate]`).
+- **Redacting or editing your own posts:** Every `reply` call returns an xmsg message ID that names the Matrix event the bot posted for it. You can send (either as a fresh `send` to `matrix-xmsg` or as a `reply`) a structured request naming that reply message ID:
+  - `{"redact": "<reply message id>", "requested_by": "<forwarded message id>", "reason": "<optional>"}`: redacts that Matrix event. `requested_by` and `reason` are optional; without `requested_by`, only the xmsg principal that authored the original reply may redact it. When someone in the thread asks for a post to be removed, send `redact` with `requested_by` set to their message. The bot decides whether they may.
+  - `{"edit": "<reply message id>", "answer": "<new body>"}`: replaces that Matrix event in place (`m.replace`), rendered like a normal reply. Edits are author-only (`requested_by` is refused).
+  - **Removal means `redact`, never `edit`:** Matrix keeps an edit's earlier text in its history.
+  - **Redaction limits:** A redaction does not reach bridged networks or notifications already delivered, so don't post private details in the first place.
 - **Plain-text replies:** Replies lacking JSON are posted directly as plain markdown.
 
 ## 3. Opening a Thread

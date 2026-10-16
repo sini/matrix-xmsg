@@ -41,6 +41,16 @@ pub trait MatrixClient: Send + Sync {
         reason: Option<&str>,
     ) -> Result<(), AppError>;
 
+    /// Edits an existing bot event in a room using an `m.replace` replacement relation.
+    async fn edit_notice(
+        &self,
+        _room_id: &str,
+        _target_event_id: &str,
+        _new_body: &str,
+    ) -> Result<String, AppError> {
+        Ok("$mock_edit_event".to_string())
+    }
+
     /// Fetches a single event by ID in a room.
     async fn fetch_event(
         &self,
@@ -706,15 +716,96 @@ impl MatrixClient for MatrixSdkClient {
         let e_id = <&EventId>::try_from(event_id)
             .map_err(|e| AppError::Matrix(format!("Invalid event ID '{event_id}': {e}")))?;
 
-        let room = self.client.get_room(r_id).ok_or_else(|| {
-            AppError::Matrix(format!("Room not found in client state: {room_id}"))
-        })?;
+        if let Some(room) = self.client.get_room(r_id) {
+            room.redact(e_id, reason, None)
+                .await
+                .map_err(|e| AppError::Matrix(format!("Failed to redact event: {e}")))?;
+            return Ok(());
+        }
 
-        room.redact(e_id, reason, None)
+        // Cold room fallback: attempt to join/resolve into client state (restricted to configured rooms)
+        let is_configured = self.configured_rooms.lock().unwrap().contains(room_id);
+        if is_configured {
+            if let Ok(room) = self.client.join_room_by_id(r_id).await {
+                room.redact(e_id, reason, None)
+                    .await
+                    .map_err(|e| AppError::Matrix(format!("Failed to redact event: {e}")))?;
+                return Ok(());
+            }
+        }
+
+        // Direct HTTP redact fallback (e.g. after bot restart before room is synced into SDK state)
+        use matrix_sdk::ruma::api::client::redact::redact_event::v3::Request as RedactEventRequest;
+        use matrix_sdk::ruma::TransactionId;
+
+        let mut req = RedactEventRequest::new(r_id.to_owned(), e_id.to_owned(), TransactionId::new());
+        req.reason = reason.map(str::to_string);
+        self.client
+            .send(req)
             .await
             .map_err(|e| AppError::Matrix(format!("Failed to redact event: {e}")))?;
 
         Ok(())
+    }
+
+    async fn edit_notice(
+        &self,
+        room_id: &str,
+        target_event_id: &str,
+        new_body: &str,
+    ) -> Result<String, AppError> {
+        use matrix_sdk::ruma::events::room::message::ReplacementMetadata;
+        use matrix_sdk::ruma::{EventId, RoomId};
+
+        let r_id = <&RoomId>::try_from(room_id)
+            .map_err(|e| AppError::Matrix(format!("Invalid room ID '{room_id}': {e}")))?;
+        let target_id = <&EventId>::try_from(target_event_id).map_err(|e| {
+            AppError::Matrix(format!("Invalid target event ID '{target_event_id}': {e}"))
+        })?;
+
+        let content = build_notice_content(new_body, None)
+            .make_replacement(ReplacementMetadata::new(target_id.to_owned(), None));
+
+        if let Some(room) = self.client.get_room(r_id) {
+            let resp = room
+                .send(content)
+                .await
+                .map_err(|e| AppError::Matrix(format!("Failed to send edit notice: {e}")))?;
+            return Ok(resp.response.event_id.to_string());
+        }
+
+        let is_configured = self.configured_rooms.lock().unwrap().contains(room_id);
+        if is_configured {
+            if let Ok(room) = self.client.join_room_by_id(r_id).await {
+                let resp = room
+                    .send(content)
+                    .await
+                    .map_err(|e| AppError::Matrix(format!("Failed to send edit notice: {e}")))?;
+                return Ok(resp.response.event_id.to_string());
+            }
+        }
+
+        use matrix_sdk::ruma::api::client::message::send_message_event::v3::Request as SendMessageEventRequest;
+        use matrix_sdk::ruma::events::MessageLikeEventType;
+        use matrix_sdk::ruma::TransactionId;
+
+        if let Ok(raw_content) = serde_json::to_string(&content) {
+            if let Ok(raw_val) = matrix_sdk::ruma::serde::Raw::from_json_string(raw_content) {
+                let req = SendMessageEventRequest::new_raw(
+                    r_id.to_owned(),
+                    TransactionId::new(),
+                    MessageLikeEventType::RoomMessage,
+                    raw_val,
+                );
+                if let Ok(resp) = self.client.send(req).await {
+                    return Ok(resp.event_id.to_string());
+                }
+            }
+        }
+
+        Err(AppError::Matrix(format!(
+            "Room not found in client state: {room_id}"
+        )))
     }
 
     async fn fetch_event(
@@ -999,12 +1090,20 @@ pub struct RedactedEvent {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EditedNotice {
+    pub room_id: String,
+    pub target_event_id: String,
+    pub new_body: String,
+}
+
 #[derive(Default)]
 pub struct MockMatrixClient {
     pub sent_notices: Mutex<Vec<SentNotice>>,
     pub sent_dms: Mutex<Vec<SentDm>>,
     pub sent_reactions: Mutex<Vec<SentReaction>>,
     pub redacted_events: Mutex<Vec<RedactedEvent>>,
+    pub edited_notices: Mutex<Vec<EditedNotice>>,
     pub canned_history: Mutex<Vec<EventMessage>>,
     pub canned_events: Mutex<std::collections::HashMap<String, EventMessage>>,
     pub canned_thread_relations: Mutex<std::collections::HashMap<String, Vec<EventMessage>>>,
@@ -1126,6 +1225,21 @@ impl MatrixClient for MockMatrixClient {
             reason: reason.map(|s| s.to_string()),
         });
         Ok(())
+    }
+
+    async fn edit_notice(
+        &self,
+        room_id: &str,
+        target_event_id: &str,
+        new_body: &str,
+    ) -> Result<String, AppError> {
+        let mut list = self.edited_notices.lock().unwrap();
+        list.push(EditedNotice {
+            room_id: room_id.to_string(),
+            target_event_id: target_event_id.to_string(),
+            new_body: new_body.to_string(),
+        });
+        Ok(format!("$mock_edit_{}", list.len()))
     }
 
     async fn fetch_history(

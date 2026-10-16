@@ -140,7 +140,8 @@ impl Store {
                 sent_at INTEGER NOT NULL,
                 ack_reaction_id TEXT,
                 timeout_dm_sent INTEGER NOT NULL DEFAULT 0,
-                reply_count INTEGER NOT NULL DEFAULT 0
+                reply_count INTEGER NOT NULL DEFAULT 0,
+                session_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_forwarded_messages_timeout ON forwarded_messages(addressed, reply_count, timeout_dm_sent, sent_at);
             CREATE TABLE IF NOT EXISTS thread_resyncs (
@@ -172,12 +173,29 @@ impl Store {
                 thread_root_id TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_approval_requests_thread ON approval_requests(thread_root_id);",
+            CREATE INDEX IF NOT EXISTS idx_approval_requests_thread ON approval_requests(thread_root_id);
+            CREATE TABLE IF NOT EXISTS bot_reply_events (
+                reply_message_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                thread_root_id TEXT NOT NULL,
+                author_principal TEXT NOT NULL,
+                answered_mxid TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
 
-        // Migration: add session_id column to thread_cursors if not present
+        // Migrations for pre-existing databases
         let _ = conn.execute("ALTER TABLE thread_cursors ADD COLUMN session_id TEXT;", []);
+        let _ = conn.execute(
+            "ALTER TABLE forwarded_messages ADD COLUMN session_id TEXT;",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE bot_reply_events ADD COLUMN answered_mxid TEXT NOT NULL DEFAULT '';",
+            [],
+        );
 
         Ok(())
     }
@@ -797,6 +815,7 @@ impl Store {
             "thread_resyncs",
             "solicited_threads",
             "guard_retries",
+            "bot_reply_events",
         ];
         let mut total = 0;
         for table in tables {
@@ -1021,6 +1040,109 @@ impl Store {
         .map_err(|e| AppError::Store(e.to_string()))?;
         Ok(())
     }
+
+    /// Records the recipient session ID for a forwarded Matrix message.
+    pub fn set_forward_session(
+        &self,
+        message_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE forwarded_messages SET session_id = ?2 WHERE message_id = ?1",
+            params![message_id, session_id],
+        )
+        .map_err(|e| {
+            AppError::Store(format!(
+                "Failed to record recipient session for {message_id}: {e}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Retrieves the recipient session ID recorded for a forwarded Matrix message.
+    pub fn get_forward_session(&self, message_id: &str) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT session_id FROM forwarded_messages WHERE message_id = ?1")
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![message_id], |row| row.get::<_, Option<String>>(0));
+        match res {
+            Ok(sess) => Ok(sess),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Records the Matrix event posted for an xmsg reply message ID, along with its authoring
+    /// principal and the Matrix sender MXID of the forward the reply answered.
+    pub fn record_bot_reply_event(&self, record: &BotReplyEventRecord) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_reply_events (
+                reply_message_id, room_id, event_id, thread_root_id, author_principal, answered_mxid, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                record.reply_message_id,
+                record.room_id,
+                record.event_id,
+                record.thread_root_id,
+                record.author_principal,
+                record.answered_mxid,
+                record.created_at,
+            ],
+        )
+        .map_err(|e| {
+            AppError::Store(format!(
+                "Failed to record bot reply event {}: {e}",
+                record.reply_message_id
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Looks up the Matrix event posted for an xmsg reply message ID.
+    pub fn get_bot_reply_event(
+        &self,
+        reply_message_id: &str,
+    ) -> Result<Option<BotReplyEventRecord>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT reply_message_id, room_id, event_id, thread_root_id, author_principal, answered_mxid, created_at
+                 FROM bot_reply_events WHERE reply_message_id = ?1",
+            )
+            .map_err(|e| AppError::Store(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(params![reply_message_id])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+
+        if let Some(row) = rows.next().map_err(|e| AppError::Store(e.to_string()))? {
+            Ok(Some(BotReplyEventRecord {
+                reply_message_id: row.get(0).map_err(|e| AppError::Store(e.to_string()))?,
+                room_id: row.get(1).map_err(|e| AppError::Store(e.to_string()))?,
+                event_id: row.get(2).map_err(|e| AppError::Store(e.to_string()))?,
+                thread_root_id: row.get(3).map_err(|e| AppError::Store(e.to_string()))?,
+                author_principal: row.get(4).map_err(|e| AppError::Store(e.to_string()))?,
+                answered_mxid: row.get(5).map_err(|e| AppError::Store(e.to_string()))?,
+                created_at: row.get(6).map_err(|e| AppError::Store(e.to_string()))?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotReplyEventRecord {
+    pub reply_message_id: String,
+    pub room_id: String,
+    pub event_id: String,
+    pub thread_root_id: String,
+    pub author_principal: String,
+    pub answered_mxid: String,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

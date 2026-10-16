@@ -825,6 +825,90 @@ async fn oracle_3_m16_rebootstraps_on_a_new_resolved_id() {
     drop(registration);
 }
 
+// =============================================================================
+// Oracle 4 (M24). Real-xmsg handle proof: an instance's `reply` call over `agent.sock`
+// returns `messageId` (and `pushedMessageId`), which equals the `delivery.message_id` the
+// bot receives on `register.sock` and records in `bot_reply_events`. The instance then
+// sends `{"redact": <returned messageId>}` to `matrix-xmsg` using only the ID its own
+// `reply` call returned, and the bot redacts the posted Matrix event end to end.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a real xmsg: set XMSG_BIN and pass --include-ignored"]
+async fn oracle_4_m24_reply_then_redact_by_returned_message_id() {
+    let Some(bin) = xmsg_bin() else { return };
+    let node = Node::start(
+        &bin,
+        Spec {
+            services: vec!["matrix-xmsg"],
+            ..Default::default()
+        },
+    );
+    let bot = Bot::start(&node).await;
+
+    let expert_inbox = node.tmp.path().join("expert_m24.sock");
+    let expert = Fake::start(json!({
+        "role": "instance",
+        "inbox": expert_inbox,
+        "agent_sock": node.sock("agent.sock"),
+        "reply": "LEAKED-SECRET-CONFIG",
+        "redact_after_reply": {
+            "to": "matrix-xmsg",
+            "reason": "accidental config leak",
+        },
+    }));
+    expert.ready().await;
+    node.instance_file(expert.pid(), ID_EXPERT, "expert", &expert_inbox);
+
+    let xmsg = create_xmsg_client(&bot.config);
+    let outcome = handle_incoming_event(
+        &mention("$ask_m24", None, "@genie show config", 3_000_000),
+        &[],
+        &bot.config,
+        bot.matrix.as_ref(),
+        xmsg.as_ref(),
+        &bot.store,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, BotOutcome::Forwarded);
+
+    // Wait for both the initial notice to be posted AND the subsequent redaction to land!
+    let redacted = eventually("the bot's post to be redacted via returned reply ID", 20, || {
+        let list = bot.matrix.redacted_events.lock().unwrap();
+        list.iter()
+            .find(|r| r.reason.as_deref() == Some("accidental config leak"))
+            .cloned()
+    })
+    .await;
+
+    assert_eq!(redacted.room_id, ROOM);
+    assert_eq!(redacted.event_id, "$mock_event_1");
+
+    // Verify that the ID returned by `xmsg`'s `reply` call in the child process is recorded in
+    // `bot.store.get_bot_reply_event(...)` and maps to `(ROOM, "$mock_event_1")`.
+    let reply_frames = expert.lines("replies.jsonl");
+    assert_eq!(reply_frames.len(), 1, "{reply_frames:?}");
+    let returned_id = reply_frames[0]["reply"]["pushedMessageId"]
+        .as_str()
+        .or_else(|| reply_frames[0]["reply"]["id"].as_str())
+        .or_else(|| reply_frames[0]["messageId"].as_str())
+        .or_else(|| reply_frames[0]["pushedMessageId"].as_str())
+        .expect("reply response must carry pushedMessageId / messageId")
+        .to_string();
+    let rec = bot
+        .store
+        .get_bot_reply_event(&returned_id)
+        .unwrap()
+        .expect("bot store must have recorded the exact ID returned by xmsg reply");
+    assert_eq!(rec.room_id, ROOM);
+    assert_eq!(rec.event_id, "$mock_event_1");
+    assert!(
+        rec.author_principal.starts_with(&format!("{ID_EXPERT}@")),
+        "author_principal must be <instance-id>@<node>: {}",
+        rec.author_principal
+    );
+}
+
 // -----------------------------------------------------------------------------
 // CA fixtures, after xmsg's tests/gate_x16_ca_peers.rs
 // -----------------------------------------------------------------------------
@@ -967,6 +1051,29 @@ mod child {
                 json!({ "action": "reply", "message_id": id, "text": spec["reply"] }),
             );
             append(dir, "replies.jsonl", &resp);
+            if let Some(redact_spec) = spec.get("redact_after_reply") {
+                if let Some(reply_id) = resp["reply"]["pushedMessageId"]
+                    .as_str()
+                    .or_else(|| resp["reply"]["id"].as_str())
+                    .or_else(|| resp["messageId"].as_str())
+                    .or_else(|| resp["pushedMessageId"].as_str())
+                {
+                    std::thread::sleep(Duration::from_millis(300));
+                    let redact_payload = json!({
+                        "redact": reply_id,
+                        "reason": redact_spec["reason"],
+                    });
+                    let redact_resp = agent(
+                        spec["agent_sock"].as_str().unwrap(),
+                        json!({
+                            "action": "send",
+                            "to": redact_spec["to"],
+                            "text": redact_payload.to_string(),
+                        }),
+                    );
+                    append(dir, "redacts.jsonl", &redact_resp);
+                }
+            }
         }
     }
 }
