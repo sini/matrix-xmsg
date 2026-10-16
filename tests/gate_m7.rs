@@ -469,7 +469,7 @@ fn oracle_3b_module_renders_guard_ref() {
           };
           exec = eval.config.systemd.services.matrix-xmsg.serviceConfig.ExecStart;
         in
-        builtins.fromTOML (builtins.readFile (lib.removePrefix "${pkg}/bin/matrix-xmsg --config " exec));
+        builtins.fromTOML (builtins.readFile (lib.last (lib.splitString " --config " exec)));
     in {
       default = (rendered { }).guard_ref or null;
       atNode = (rendered { guardRef = "genie-guard@sini.bitstream"; }).guard_ref or null;
