@@ -28,7 +28,7 @@ let
     reg = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     reg.connect(f"{SOCK_DIR}/register.sock")
     reg_f = reg.makefile("r", encoding="utf-8")
-    send_frame(reg, {"action": "svc", "name": "claude"})
+    send_frame(reg, {"harness": "svc", "name": "claude", "cwd": "/"})
     ok = recv_frame(reg_f)
     if ok.get("status") != "ok":
         raise RuntimeError(f"svc registration failed: {ok}")
@@ -90,9 +90,8 @@ pkgs.testers.nixosTest {
       systemd.services.mock-expert = {
         description = "Mock expert registered on matrix-xmsg's own xmsg node";
         after = [ "matrix-xmsg-xmsg.service" ];
-        requires = [ "matrix-xmsg-xmsg.service" ];
+        wants = [ "matrix-xmsg-xmsg.service" ];
         before = [ "matrix-xmsg.service" ];
-        requiredBy = [ "matrix-xmsg.service" ];
         wantedBy = [ "multi-user.target" ];
         serviceConfig = {
           Type = "simple";
@@ -108,6 +107,7 @@ pkgs.testers.nixosTest {
 
       systemd.services.matrix-xmsg = {
         after = [ "mock-expert.service" ];
+        wants = [ "mock-expert.service" ];
         environment.RUST_LOG = "info";
       };
 
