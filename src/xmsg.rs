@@ -40,6 +40,16 @@ pub fn sender_id(label_or_address: &str) -> &str {
     attested.rsplit_once('@').map_or(attested, |(id, _)| id)
 }
 
+/// The full attested `<id-or-service>@<node>` (or bare `<id>` when no `@node` is present)
+/// in an xmsg sender label or address (A12): strips any leading `label · ` description and
+/// keeps `@<node>`.
+pub fn sender_address(label_or_address: &str) -> &str {
+    label_or_address
+        .rsplit_once(" · ")
+        .map_or(label_or_address, |(_, a)| a)
+        .trim()
+}
+
 /// A delivery received through the xmsg service inbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SvcDelivery {
@@ -407,8 +417,8 @@ impl SvcInbox for ReconnectingSvcInbox {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendResponse {
     pub message_id: String,
-    /// The ID the send resolved to: an instance's `id[~n]` or a service's name, read from the
-    /// `address` (`id@node`) in `send`'s result. `None` for a reply.
+    /// The resolved address (`id[~n]@node` or `service@node`) read from `address` in `send`'s
+    /// result. `None` for a reply.
     pub session_id: Option<String>,
 }
 
@@ -425,7 +435,7 @@ impl From<String> for SendResponse {
     fn from(message_id: String) -> Self {
         Self {
             message_id,
-            session_id: Some("mock-session".to_string()),
+            session_id: Some("mock-session@sini.cortex".to_string()),
         }
     }
 }
@@ -434,7 +444,7 @@ impl From<&str> for SendResponse {
     fn from(message_id: &str) -> Self {
         Self {
             message_id: message_id.to_string(),
-            session_id: Some("mock-session".to_string()),
+            session_id: Some("mock-session@sini.cortex".to_string()),
         }
     }
 }
@@ -443,7 +453,7 @@ impl From<&str> for SendResponse {
 pub trait XmsgClient: Send + Sync {
     /// Sends a message to `expert_ref` via agent.sock (`{"action":"send","to","text"}`).
     /// Replies are pushed into the bot's service inbox (A10).
-    /// Returns the assigned ULID message_id and the resolved receiving ID.
+    /// Returns the assigned ULID message_id and the resolved receiving address (`id@node`).
     async fn send_message(
         &self,
         expert_ref: &str,
@@ -460,7 +470,7 @@ pub trait XmsgClient: Send + Sync {
     ) -> Result<SendResponse, AppError> {
         Ok(SendResponse::new(
             "mock-reply-msg-id",
-            Some("mock-session".to_string()),
+            Some("mock-session@sini.cortex".to_string()),
         ))
     }
 
@@ -544,8 +554,8 @@ async fn agent_call(agent_sock_path: &Path, what: &str, frame: Value) -> Result<
 }
 
 /// Sends `text` to `to` on agent.sock, keyed when `idempotency_key` is set, and returns the
-/// message ID and the resolved ID (`None` while a keyed repeat is `pending`: its address is
-/// empty).
+/// message ID and the resolved address `<id-or-service>@<node>` (`None` while a keyed repeat
+/// is `pending`: its address is empty).
 async fn agent_send(
     agent_sock_path: &Path,
     what: &str,
@@ -569,7 +579,7 @@ async fn agent_send(
         .get("address")
         .and_then(|v| v.as_str())
         .filter(|a| !a.is_empty())
-        .map(|a| sender_id(a).to_string());
+        .map(|a| sender_address(a).to_string());
     Ok(SendResponse {
         message_id,
         session_id,

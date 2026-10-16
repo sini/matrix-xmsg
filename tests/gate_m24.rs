@@ -54,7 +54,7 @@ impl XmsgClient for RecordingXmsgClient {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         Ok(SendResponse::new(
             format!("01M24FWD{n:04}"),
-            Some("author-id-1".to_string()),
+            Some("author-id-1@sini.cortex".to_string()),
         ))
     }
 
@@ -865,7 +865,7 @@ async fn oracle_6a_requested_by_trusted_user_redacts_cross_session() {
         "!public:example.org",
         "$root_6a",
         "@bob:example.org",
-        "author-id-1",
+        "author-id-1@sini.cortex",
     );
 
     Mock::given(method("PUT"))
@@ -879,7 +879,7 @@ async fn oracle_6a_requested_by_trusted_user_redacts_cross_session() {
         .mount(&server)
         .await;
 
-    // Agent 1 (`author-id-1`) posts a reply answering @bob:example.org.
+    // Agent 1 (`author-id-1@sini.cortex`) posts a reply answering @bob:example.org.
     let reply_delivery = SvcDelivery {
         message_id: "01REPLY_6A".to_string(),
         from_name: "claude · author-id-1@sini.cortex".to_string(),
@@ -902,14 +902,14 @@ async fn oracle_6a_requested_by_trusted_user_redacts_cross_session() {
     assert_eq!(out1, BotOutcome::Replied);
 
     // Later, @alice:example.org (in `trusted_mxids`) asks in the thread to remove the post,
-    // and that forward is delivered to a new session (`agent-2`).
+    // and that forward is delivered to a new session (`agent-2@sini.cortex`).
     record_forward_with_sender_and_session(
         &store,
         "01FWD_ALICE_REQ",
         "!public:example.org",
         "$root_6a",
         "@alice:example.org",
-        "agent-2",
+        "agent-2@sini.cortex",
     );
 
     Mock::given(method("PUT"))
@@ -981,7 +981,7 @@ async fn oracle_6b_requested_by_asker_redacts_even_when_untrusted_and_cross_sess
         "!public:example.org",
         "$root_6b",
         "@bob:example.org",
-        "author-id-1",
+        "author-id-1@sini.cortex",
     );
 
     Mock::given(method("PUT"))
@@ -1017,14 +1017,14 @@ async fn oracle_6b_requested_by_asker_redacts_even_when_untrusted_and_cross_sess
     .unwrap();
     assert_eq!(out1, BotOutcome::Replied);
 
-    // Later, Bob himself asks for the bot's answer to him to be removed; delivered to `agent-2`.
+    // Later, Bob himself asks for the bot's answer to him to be removed; delivered to `agent-2@sini.cortex`.
     record_forward_with_sender_and_session(
         &store,
         "01FWD_BOB_REMOVE",
         "!public:example.org",
         "$root_6b",
         "@bob:example.org",
-        "agent-2",
+        "agent-2@sini.cortex",
     );
 
     Mock::given(method("PUT"))
@@ -1097,7 +1097,7 @@ async fn oracle_6c_requested_by_untrusted_non_asker_refused_with_zero_homeserver
         "!public:example.org",
         "$root_6c",
         "@bob:example.org",
-        "author-id-1",
+        "author-id-1@sini.cortex",
     );
 
     Mock::given(method("PUT"))
@@ -1150,7 +1150,7 @@ async fn oracle_6c_requested_by_untrusted_non_asker_refused_with_zero_homeserver
         "!public:example.org",
         "$root_6c",
         "@mallory:example.org",
-        "agent-2",
+        "agent-2@sini.cortex",
     );
     record_forward_with_sender_and_session(
         &store,
@@ -1158,7 +1158,7 @@ async fn oracle_6c_requested_by_untrusted_non_asker_refused_with_zero_homeserver
         "!public:example.org",
         "$root_6c",
         "@mallory:example.org",
-        "author-id-1",
+        "author-id-1@sini.cortex",
     );
 
     // Attempt 1: `agent-2` sends `redact` with `requested_by: "01FWD_MALLORY_REQ1"` AND forged
@@ -1196,7 +1196,7 @@ async fn oracle_6c_requested_by_untrusted_non_asker_refused_with_zero_homeserver
     .unwrap();
     assert_eq!(out2, BotOutcome::RedactRefused);
 
-    // Attempt 2: Even when the authoring agent (`author-id-1`) relays Mallory's request via
+    // Attempt 2: Even when the authoring agent (`author-id-1@sini.cortex`) relays Mallory's request via
     // `requested_by`, the bot sees that `requested_by` came from `@mallory:example.org` and refuses.
     let author_relay_mallory = SvcDelivery {
         message_id: "01REDACT_6C_2".to_string(),
@@ -1241,12 +1241,14 @@ async fn oracle_6c_requested_by_untrusted_non_asker_refused_with_zero_homeserver
 
 // =============================================================================
 // Oracle 6d: A `requested_by` forwarded to a different agent is refused with
-// zero homeserver requests (plus unknown `requested_by` refused, and
-// `requested_by` on `edit` refused).
-// Mutant: skip `forward_received_by_caller` check => RED.
+// zero homeserver requests — including when the caller has the SAME id/service
+// name on a DIFFERENT node (`agent-2@other.node` vs `agent-2@sini.cortex`),
+// plus unknown `requested_by` refused, and `requested_by` on `edit` refused.
+// Mutant 1: skip `forward_received_by_caller` check => RED.
+// Mutant 2: compare only bare `id` instead of full `id@node` => RED.
 // =============================================================================
 #[tokio::test]
-async fn oracle_6d_requested_by_forwarded_to_different_agent_or_edit_refused() {
+async fn oracle_6d_requested_by_forwarded_to_different_agent_or_other_node_or_edit_refused() {
     let server = MockServer::start().await;
     setup_homeserver_with_rooms(&server).await;
 
@@ -1262,7 +1264,7 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_edit_refused() {
         "!public:example.org",
         "$root_6d",
         "@bob:example.org",
-        "author-id-1",
+        "author-id-1@sini.cortex",
     );
 
     Mock::given(method("PUT"))
@@ -1297,10 +1299,10 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_edit_refused() {
     .unwrap();
     assert_eq!(out1, BotOutcome::Replied);
 
-    // Zero subsequent send or redact requests may reach the homeserver.
+    // Zero subsequent send to !public:example.org or any redact requests may reach the homeserver.
     Mock::given(method("PUT"))
         .and(path_regex(
-            r"^/_matrix/client/v3/rooms/.*/(redact|send/m\.room\.message)/.*$",
+            r"^/_matrix/client/v3/rooms/(!public(%3A|:)example\.org/send/m\.room\.message|.*/redact)/.*$",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "event_id": "$should_never_happen_6d"
@@ -1309,14 +1311,14 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_edit_refused() {
         .mount(&server)
         .await;
 
-    // @alice:example.org (trusted) sends a forward that is delivered to `agent-2`, NOT `agent-3`.
+    // @alice:example.org (trusted) sends a forward that is delivered to `agent-2@sini.cortex`.
     record_forward_with_sender_and_session(
         &store,
         "01FWD_ALICE_TO_AGENT2",
         "!public:example.org",
         "$root_6d",
         "@alice:example.org",
-        "agent-2",
+        "agent-2@sini.cortex",
     );
 
     let agent_3_origin = json!({
@@ -1325,7 +1327,7 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_edit_refused() {
         "label": "claude"
     });
 
-    // 1. `agent-3` tries to redact citing `01FWD_ALICE_TO_AGENT2` (which was forwarded to `agent-2`).
+    // 1. `agent-3@sini.cortex` tries to redact citing `01FWD_ALICE_TO_AGENT2` (forwarded to `agent-2@sini.cortex`).
     let wrong_agent_redact = SvcDelivery {
         message_id: "01REDACT_6D_WRONG_AGENT".to_string(),
         from_name: "claude · agent-3@sini.cortex".to_string(),
@@ -1351,7 +1353,39 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_edit_refused() {
     .unwrap();
     assert_eq!(out2, BotOutcome::RedactRefused);
 
-    // 2. Unknown `requested_by` message ID is refused.
+    // 2. Same id/service `agent-2` on ANOTHER node (`agent-2@other.node`) tries to redact citing
+    // `01FWD_ALICE_TO_AGENT2` (which was forwarded to `agent-2@sini.cortex`). Must be refused!
+    let same_id_other_node_origin = json!({
+        "id": "agent-2",
+        "node": "other.node",
+        "label": "claude"
+    });
+    let same_id_other_node_redact = SvcDelivery {
+        message_id: "01REDACT_6D_SAME_ID_OTHER_NODE".to_string(),
+        from_name: "claude · agent-2@other.node".to_string(),
+        text: json!({
+            "redact": "01REPLY_6D",
+            "requested_by": "01FWD_ALICE_TO_AGENT2"
+        })
+        .to_string(),
+        envelope: "".to_string(),
+        origin: Some(same_id_other_node_origin),
+        in_reply_to: None,
+    };
+    let out_other_node = handle_inbox_delivery_with_xmsg(
+        &same_id_other_node_redact,
+        &config,
+        &sdk,
+        &store,
+        &xmsg,
+        &mut inbox,
+        1022,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out_other_node, BotOutcome::RedactRefused);
+
+    // 3. Unknown `requested_by` message ID is refused.
     let unknown_req_by = SvcDelivery {
         message_id: "01REDACT_6D_UNKNOWN_REQ_BY".to_string(),
         from_name: "claude · agent-3@sini.cortex".to_string(),
@@ -1377,7 +1411,7 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_edit_refused() {
     .unwrap();
     assert_eq!(out3, BotOutcome::RedactRefused);
 
-    // 3. `requested_by` on an `edit` is refused (even when sent by `agent-2` who received Alice's forward,
+    // 4. `requested_by` on an `edit` is refused (even when sent by `agent-2@sini.cortex` who received Alice's forward,
     // or by the authoring agent itself).
     let agent_2_origin = json!({
         "id": "agent-2",
@@ -1411,15 +1445,99 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_edit_refused() {
     assert_eq!(out4, BotOutcome::EditRefused);
 
     let replies = xmsg.replies.lock().unwrap();
-    assert_eq!(replies.len(), 3);
+    assert_eq!(replies.len(), 4);
     assert!(replies[0]
         .1
         .contains("was not received by the requesting agent"));
     assert!(replies[1]
         .1
-        .contains("unknown requested_by forward message id"));
+        .contains("was not received by the requesting agent"));
     assert!(replies[2]
         .1
+        .contains("unknown requested_by forward message id"));
+    assert!(replies[3]
+        .1
         .contains("edit is author-only and does not accept 'requested_by'"));
+    drop(replies);
+
+    // 5. Verify `open_thread` records `id@node` in `forwarded_messages.session_id`, so a same-named
+    // service on another node cannot cite the open_thread message ID in `requested_by`.
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/_matrix/client/v3/rooms/!second(%3A|:)example\.org/send/m\.room\.message/.*$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "event_id": "$root_open_6d"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let open_delivery = SvcDelivery {
+        message_id: "01OPEN_THREAD_6D".to_string(),
+        from_name: "svc-opener@sini.cortex".to_string(),
+        text: json!({
+            "open_thread": {
+                "room": "!second:example.org",
+                "text": "Opening thread"
+            }
+        })
+        .to_string(),
+        envelope: "".to_string(),
+        origin: Some(json!({
+            "service": "svc-opener",
+            "node": "sini.cortex"
+        })),
+        in_reply_to: None,
+    };
+    let out_open = handle_inbox_delivery_with_xmsg(
+        &open_delivery,
+        &config,
+        &sdk,
+        &store,
+        &xmsg,
+        &mut inbox,
+        1040,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out_open, BotOutcome::OpenThreadSuccess);
+    assert_eq!(
+        store
+            .get_forward_session("01OPEN_THREAD_6D")
+            .unwrap()
+            .as_deref(),
+        Some("svc-opener@sini.cortex")
+    );
+
+    // Same-named service `svc-opener` on `other.node` tries to redact citing `01OPEN_THREAD_6D` -> refused.
+    let other_node_svc_redact = SvcDelivery {
+        message_id: "01REDACT_6D_OTHER_NODE_SVC".to_string(),
+        from_name: "svc-opener@other.node".to_string(),
+        text: json!({
+            "redact": "01REPLY_6D",
+            "requested_by": "01OPEN_THREAD_6D"
+        })
+        .to_string(),
+        envelope: "".to_string(),
+        origin: Some(json!({
+            "service": "svc-opener",
+            "node": "other.node"
+        })),
+        in_reply_to: None,
+    };
+    let out_other_svc = handle_inbox_delivery_with_xmsg(
+        &other_node_svc_redact,
+        &config,
+        &sdk,
+        &store,
+        &xmsg,
+        &mut inbox,
+        1045,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out_other_svc, BotOutcome::RedactRefused);
 }
+
 

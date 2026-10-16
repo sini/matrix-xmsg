@@ -7,8 +7,8 @@ use crate::matrix::{is_bot_mentioned, MatrixClient};
 use crate::sender_map::map_sender_mxid;
 use crate::store::{BotReplyEventRecord, ForwardedMessageRecord, Store};
 use crate::xmsg::{
-    parse_in_reply_to_id, route_guard_reply, sender_id, GuardClient, GuardContent, GuardEnvelope,
-    GuardLine, SvcDelivery, SvcInbox, XmsgClient,
+    parse_in_reply_to_id, route_guard_reply, GuardClient, GuardContent, GuardEnvelope, GuardLine,
+    SvcDelivery, SvcInbox, XmsgClient,
 };
 
 /// The bound on each attempt of a send made under `Store::forward_gate`, which holds the inbox.
@@ -1249,7 +1249,7 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
         reply_count: 0,
     };
     store.record_forwarded_message(&forward_rec)?;
-    let open_session = origin_session_id(delivery);
+    let open_session = origin_author_key(delivery);
     store.set_forward_session(&delivery.message_id, open_session.as_deref())?;
 
     // 6. Reply with root and permalink
@@ -1293,22 +1293,16 @@ pub fn origin_author_key(delivery: &SvcDelivery) -> Option<String> {
     Some(format!("{key}@{node}"))
 }
 
-/// Checks whether a forwarded message's recorded recipient session matches `delivery.origin`.
+/// Checks whether a forwarded message's recorded recipient session (`"<id-or-service>@<node>"`)
+/// matches `delivery.origin`'s full key (`"<id-or-service>@<node>"`).
 fn forward_received_by_caller(fwd_session: Option<&str>, delivery: &SvcDelivery) -> bool {
     let Some(caller_key) = origin_author_key(delivery) else {
-        return false;
-    };
-    let Some(caller_id) = origin_session_id(delivery) else {
         return false;
     };
     let Some(rec_sess) = fwd_session.map(str::trim).filter(|s| !s.is_empty()) else {
         return false;
     };
-    if rec_sess.contains('@') {
-        rec_sess == caller_key
-    } else {
-        sender_id(rec_sess) == caller_id
-    }
+    crate::xmsg::sender_address(rec_sess) == caller_key
 }
 
 async fn handle_redact_request<I: SvcInbox + ?Sized>(
@@ -1708,9 +1702,14 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
             .map(|m| m.event_id.as_str())
             .unwrap_or(&forward.thread_root_id);
 
-        // The asker's ID, read from its label (`label · id@node`, A12).
-        let asker_session_id = (!delivery.from_name.is_empty())
-            .then(|| sender_id(&delivery.from_name))
+        // The asker's address (`id@node`), from attested origin or its label (`label · id@node`, A12).
+        let asker_origin_key = origin_author_key(delivery);
+        let asker_session_id = asker_origin_key
+            .as_deref()
+            .or_else(|| {
+                (!delivery.from_name.is_empty())
+                    .then(|| crate::xmsg::sender_address(&delivery.from_name))
+            })
             .or(send_resp.session_id.as_deref());
 
         store.set_thread_cursor(

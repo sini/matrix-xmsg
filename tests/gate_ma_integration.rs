@@ -750,8 +750,7 @@ async fn oracle_3_m16_rebootstraps_on_a_new_resolved_id() {
     let registration = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
         .await
         .expect("register");
-    assert!(registration.node().is_some());
-
+    let node_name = registration.node().expect("node");
     let x = SilentInstance::start();
     node.instance_file(x.sleeper.id(), ID_X, "expert", &x.sock);
 
@@ -786,7 +785,7 @@ async fn oracle_3_m16_rebootstraps_on_a_new_resolved_id() {
             .unwrap()
             .session_id
             .as_deref(),
-        Some(ID_X)
+        Some(format!("{ID_X}@{node_name}").as_str())
     );
 
     // The expert's label now names a new conversation, Y.
@@ -820,7 +819,7 @@ async fn oracle_3_m16_rebootstraps_on_a_new_resolved_id() {
             .unwrap()
             .session_id
             .as_deref(),
-        Some(ID_Y)
+        Some(format!("{ID_Y}@{node_name}").as_str())
     );
     drop(registration);
 }
