@@ -146,7 +146,13 @@ impl Store {
                 thread_root_id TEXT PRIMARY KEY,
                 cursor_event_id TEXT NOT NULL,
                 forwarded_at INTEGER NOT NULL,
-                session_id TEXT
+                session_id TEXT,
+                target_ref TEXT
+            );
+            CREATE TABLE IF NOT EXISTS promoted_threads (
+                thread_root_id TEXT PRIMARY KEY,
+                promoted_by TEXT NOT NULL,
+                promoted_at INTEGER NOT NULL
             );CREATE TABLE IF NOT EXISTS forwarded_messages (
                 message_id TEXT PRIMARY KEY,
                 room_id TEXT NOT NULL,
@@ -205,6 +211,7 @@ impl Store {
 
         // Migrations for pre-existing databases
         let _ = conn.execute("ALTER TABLE thread_cursors ADD COLUMN session_id TEXT;", []);
+        let _ = conn.execute("ALTER TABLE thread_cursors ADD COLUMN target_ref TEXT;", []);
         let _ = conn.execute(
             "ALTER TABLE forwarded_messages ADD COLUMN session_id TEXT;",
             [],
@@ -573,20 +580,21 @@ impl Store {
         Ok(())
     }
 
-    /// Retrieves the thread cursor (last forwarded event ID, timestamp, and optional session ID) for a thread root.
+    /// Retrieves the thread cursor (last forwarded event ID, timestamp, optional session ID, and optional target ref) for a thread root.
     pub fn get_thread_cursor(
         &self,
         thread_root_id: &str,
     ) -> Result<Option<ThreadCursor>, AppError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT cursor_event_id, forwarded_at, session_id FROM thread_cursors WHERE thread_root_id = ?1")
+            .prepare("SELECT cursor_event_id, forwarded_at, session_id, target_ref FROM thread_cursors WHERE thread_root_id = ?1")
             .map_err(|e| AppError::Store(e.to_string()))?;
         let res = stmt.query_row(params![thread_root_id], |row| {
             Ok(ThreadCursor {
                 cursor_event_id: row.get(0)?,
                 forwarded_at: row.get(1)?,
                 session_id: row.get(2)?,
+                target_ref: row.get(3)?,
             })
         });
         match res {
@@ -604,14 +612,56 @@ impl Store {
         now: i64,
         session_id: Option<&str>,
     ) -> Result<(), AppError> {
+        self.set_thread_cursor_with_target(thread_root_id, cursor_event_id, now, session_id, None)
+    }
+
+    /// Sets or updates the thread cursor for a thread root with an explicit target expert ref.
+    pub fn set_thread_cursor_with_target(
+        &self,
+        thread_root_id: &str,
+        cursor_event_id: &str,
+        now: i64,
+        session_id: Option<&str>,
+        target_ref: Option<&str>,
+    ) -> Result<(), AppError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO thread_cursors (thread_root_id, cursor_event_id, forwarded_at, session_id) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(thread_root_id) DO UPDATE SET cursor_event_id = ?2, forwarded_at = ?3, session_id = ?4",
-            params![thread_root_id, cursor_event_id, now, session_id],
+            "INSERT INTO thread_cursors (thread_root_id, cursor_event_id, forwarded_at, session_id, target_ref) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(thread_root_id) DO UPDATE SET cursor_event_id = ?2, forwarded_at = ?3, session_id = ?4, target_ref = ?5",
+            params![thread_root_id, cursor_event_id, now, session_id, target_ref],
         )
         .map_err(|e| AppError::Store(e.to_string()))?;
         Ok(())
+    }
+
+    /// Records that a thread was promoted via owner `!trust`.
+    pub fn promote_thread(
+        &self,
+        thread_root_id: &str,
+        promoted_by: &str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO promoted_threads (thread_root_id, promoted_by, promoted_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(thread_root_id) DO UPDATE SET promoted_by = ?2, promoted_at = ?3",
+            params![thread_root_id, promoted_by, now],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Checks whether a thread has been promoted via owner `!trust`.
+    pub fn is_thread_promoted(&self, thread_root_id: &str) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM promoted_threads WHERE thread_root_id = ?1",
+                params![thread_root_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(count > 0)
     }
 
     /// Records a forwarded Matrix message in forwarded_messages.
@@ -1210,6 +1260,7 @@ pub struct ThreadCursor {
     pub cursor_event_id: String,
     pub forwarded_at: i64,
     pub session_id: Option<String>,
+    pub target_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -58,6 +58,39 @@ fn forward_key(purpose: &str, event_id: &str) -> String {
     format!("matrix-xmsg:{purpose}:#{:016x}", h.finish())
 }
 
+fn effective_thread_tier(
+    config: &Config,
+    store: &Store,
+    thread_root: &str,
+    sender_mxid: &str,
+) -> Result<&'static str, AppError> {
+    if store.is_thread_promoted(thread_root)? {
+        Ok("trusted")
+    } else {
+        Ok(compute_sender_tier(
+            sender_mxid,
+            &config.trusted_mxids,
+            Some(&config.owner_mxid),
+        ))
+    }
+}
+
+fn control_target_ref(
+    config: &Config,
+    store: &Store,
+    thread_root: &str,
+    sender_mxid: &str,
+) -> Result<String, AppError> {
+    if let Some(target_ref) = store
+        .get_thread_cursor(thread_root)?
+        .and_then(|c| c.target_ref)
+    {
+        return Ok(target_ref);
+    }
+    let tier = effective_thread_tier(config, store, thread_root, sender_mxid)?;
+    Ok(config.expert_ref_for_tier(tier).to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BotOutcome {
     IgnoredRoom,
@@ -532,13 +565,15 @@ pub async fn handle_incoming_event_with_guard(
                 .to_string();
 
                 let mapped_sender = map_sender_mxid(&event.sender_mxid);
-                xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
+                let target_ref =
+                    control_target_ref(config, store, &thread_root, &event.sender_mxid)?;
+                xmsg.send_message(&target_ref, &mapped_sender, &payload)
                     .await?;
 
                 return Ok(BotOutcome::ControlEmitted);
             }
 
-            // Handle !trust control command in thread (Unit M12 / M20)
+            // Handle !trust control command in thread (Unit M12 / M20 / M28)
             if is_thread_trust {
                 let is_trusted = config.is_user_trusted(&event.sender_mxid);
                 if !is_trusted {
@@ -555,6 +590,8 @@ pub async fn handle_incoming_event_with_guard(
                 if !is_new {
                     return Ok(BotOutcome::ControlDebounced);
                 }
+
+                store.promote_thread(&thread_root, &event.sender_mxid, now_secs)?;
 
                 if let Err(e) = matrix
                     .send_reaction(&event.room_id, &event.event_id, "🔒")
@@ -578,7 +615,8 @@ pub async fn handle_incoming_event_with_guard(
                 })
                 .to_string();
 
-                xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
+                let target_ref = config.expert_ref_for_tier("trusted");
+                xmsg.send_message(target_ref, &mapped_sender, &payload)
                     .await?;
 
                 return Ok(BotOutcome::ControlEmitted);
@@ -636,7 +674,8 @@ pub async fn handle_incoming_event_with_guard(
                 })
                 .to_string();
 
-                xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
+                let target_ref = control_target_ref(config, store, &thread_id, &event.sender_mxid)?;
+                xmsg.send_message(&target_ref, &mapped_sender, &payload)
                     .await?;
 
                 return Ok(BotOutcome::ControlEmitted);
@@ -655,9 +694,20 @@ pub async fn handle_incoming_event_with_guard(
             } else {
                 false
             };
+            let is_promoted_thread = if let Some(ref root) = event.thread_root_id {
+                store.is_thread_promoted(root)?
+            } else {
+                false
+            };
             let is_admitted = match config.admission {
-                Admission::Trusted => is_trusted,
-                Admission::Public => is_trusted || is_top_level || is_asker || is_solicited_thread,
+                Admission::Trusted => is_trusted || is_promoted_thread,
+                Admission::Public => {
+                    is_trusted
+                        || is_top_level
+                        || is_asker
+                        || is_solicited_thread
+                        || is_promoted_thread
+                }
             };
             if !is_admitted {
                 return Ok(BotOutcome::IgnoredUntrustedUser);
@@ -742,13 +792,21 @@ pub async fn handle_incoming_event_with_guard(
         return Ok(BotOutcome::EscalatedUserRequest);
     }
 
-    // 7. Context & Envelope Assembly + Guard Screening (M15 & M26)
+    // 7. Context & Envelope Assembly + Guard Screening (M15, M26 & M28)
+    let effective_tier =
+        effective_thread_tier(config, store, &thread_root, &trigger_msg.sender_mxid)?;
+    let target_expert_ref = config.expert_ref_for_tier(effective_tier);
+
     let cursor_opt = store.get_thread_cursor(&thread_root)?;
     let mode = match cursor_opt {
         None => ContextMode::Bootstrap,
         Some(ref cursor) => {
             let elapsed = now_secs.saturating_sub(cursor.forwarded_at);
-            if elapsed >= config.session_live_secs as i64 {
+            let target_changed = cursor
+                .target_ref
+                .as_deref()
+                .is_some_and(|prev_target| prev_target != target_expert_ref);
+            if elapsed >= config.session_live_secs as i64 || target_changed {
                 ContextMode::Bootstrap
             } else {
                 ContextMode::Delta {
@@ -973,7 +1031,7 @@ pub async fn handle_incoming_event_with_guard(
     let gate = store.forward_gate.read().await;
     let key = forward_key("forward", &claim_id);
     let send_resp = bounded_send("Forward to the expert", || {
-        xmsg.send_message_keyed(&config.expert_ref, &mapped_sender, &envelope, &key)
+        xmsg.send_message_keyed(target_expert_ref, &mapped_sender, &envelope, &key)
     })
     .await?;
     let delta_message_id = send_resp.message_id;
@@ -1014,7 +1072,7 @@ pub async fn handle_incoming_event_with_guard(
             let key = forward_key("rebootstrap", &claim_id);
             let boot_resp = bounded_send("Rebootstrap to the expert", || {
                 xmsg.send_message_keyed(
-                    &config.expert_ref,
+                    target_expert_ref,
                     &mapped_sender,
                     &bootstrap_envelope,
                     &key,
@@ -1027,12 +1085,13 @@ pub async fn handle_incoming_event_with_guard(
         }
     }
 
-    // Rule 1 & Rule 3 & Rule 5 & M16: Advance cursor with the new session id
-    store.set_thread_cursor(
+    // Rule 1 & Rule 3 & Rule 5 & M16 & M28: Advance cursor with the new session id and target ref
+    store.set_thread_cursor_with_target(
         &thread_root,
         &trigger_msg.event_id,
         now_secs,
         session_id.as_deref(),
+        Some(target_expert_ref),
     )?;
 
     // Record mapping in SQLite: record both message ids against the thread
@@ -1152,19 +1211,24 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
     inbox: &mut I,
     now_secs: i64,
 ) -> Result<BotOutcome, AppError> {
-    // 1. Origin check: the sender's node must be this bot's own node, as the registration's
-    //    `ok` frame named it (A12's origin shape `{id or service, node, label}`).
+    // 1. Origin check: when `open_thread_nodes` is configured, the sender's node must be in that
+    //    list; otherwise it must be this bot's own node, as the registration's `ok` frame named it
+    //    (A12's origin shape `{id or service, node, label}`).
     let own_node = inbox.node();
     let origin_node = delivery
         .origin
         .as_ref()
         .and_then(|o| o.get("node"))
         .and_then(|n| n.as_str());
-    let is_local = own_node.is_some() && origin_node == own_node.as_deref();
+    let is_authorized_origin = if config.open_thread_nodes.is_empty() {
+        own_node.is_some() && origin_node == own_node.as_deref()
+    } else {
+        origin_node.is_some_and(|n| config.open_thread_nodes.iter().any(|allowed| allowed == n))
+    };
 
-    if !is_local {
+    if !is_authorized_origin {
         let reply_json = serde_json::json!({
-            "error": "unauthorized origin: open_thread requires a sender on this bot's own node"
+            "error": "unauthorized origin: open_thread requires a sender on an allowed node"
         })
         .to_string();
         let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
@@ -2008,11 +2072,15 @@ pub async fn handle_inbox_delivery_with_guard<I: SvcInbox + ?Sized>(
             })
             .or(send_resp.session_id.as_deref());
 
-        store.set_thread_cursor(
+        let existing_target_ref = store
+            .get_thread_cursor(&forward.thread_root_id)?
+            .and_then(|c| c.target_ref);
+        store.set_thread_cursor_with_target(
             &forward.thread_root_id,
             newest_line_id,
             now_secs,
             asker_session_id,
+            existing_target_ref.as_deref(),
         )?;
 
         inbox.ack(&delivery.message_id).await?;
@@ -2399,7 +2467,8 @@ pub async fn handle_incoming_reaction(
         })
         .to_string();
 
-        xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
+        let target_ref = control_target_ref(config, store, &thread_id, &reaction.sender_mxid)?;
+        xmsg.send_message(&target_ref, &mapped_sender, &payload)
             .await?;
 
         return Ok(BotOutcome::ControlEmitted);
@@ -2441,7 +2510,8 @@ pub async fn handle_incoming_reaction(
     .to_string();
 
     let mapped_sender = map_sender_mxid(&reaction.sender_mxid);
-    xmsg.send_message(&config.expert_ref, &mapped_sender, &payload)
+    let target_ref = control_target_ref(config, store, &thread_id, &reaction.sender_mxid)?;
+    xmsg.send_message(&target_ref, &mapped_sender, &payload)
         .await?;
 
     Ok(BotOutcome::ControlEmitted)
@@ -2715,6 +2785,9 @@ pub fn register_event_handlers_full(
                         incoming.thread_root_id.is_some() && incoming.body.trim() == "!escalate";
                     let is_thread_deeper =
                         incoming.thread_root_id.is_some() && incoming.body.trim() == "!deeper";
+                    let is_thread_trust =
+                        incoming.thread_root_id.is_some() && incoming.body.trim() == "!trust";
+                    let is_approve_command = incoming.body.trim() == "!approve";
                     let is_mentioned = is_bot_mentioned(
                         &incoming.body,
                         incoming.formatted_body.as_deref(),
@@ -2742,6 +2815,8 @@ pub fn register_event_handlers_full(
                     };
                     if !is_thread_escalate
                         && !is_thread_deeper
+                        && !is_thread_trust
+                        && !is_approve_command
                         && !is_mentioned
                         && !is_reply_to_bot
                         && !is_engaged_thread
@@ -2753,11 +2828,17 @@ pub fn register_event_handlers_full(
                     // For !deeper or edits, full authorization is checked in handle_incoming_event
                     let is_top_level = incoming.thread_root_id.is_none();
                     let is_trusted = config.is_user_trusted(&incoming.sender_mxid);
+                    let is_promoted_thread = incoming
+                        .thread_root_id
+                        .as_deref()
+                        .and_then(|r| store.is_thread_promoted(r).ok())
+                        .unwrap_or(false);
                     let is_admitted = match config.admission {
-                        Admission::Trusted => is_trusted,
+                        Admission::Trusted => is_trusted || is_promoted_thread,
                         Admission::Public => {
                             is_trusted
                                 || is_top_level
+                                || is_promoted_thread
                                 || incoming.replaces_event_id.is_some()
                                 || incoming
                                     .thread_root_id

@@ -45,6 +45,8 @@ fn config() -> Config {
         admission: Admission::Trusted,
         xmsg_socket: PathBuf::from("/nonexistent/xmsg"),
         expert_ref: "claude".to_string(),
+        expert_refs: None,
+        open_thread_nodes: vec![],
         history_n: 5,
         history_byte_cap: 1024,
         rate_limit_count: 10,

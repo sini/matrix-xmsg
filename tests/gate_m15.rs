@@ -95,6 +95,8 @@ fn test_config() -> Config {
         admission: Admission::Public,
         xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
+        expert_refs: None,
+        open_thread_nodes: vec![],
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,

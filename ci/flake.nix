@@ -98,6 +98,13 @@
                     ;
                   mode = "mutant-no-svcexe";
                 };
+                nixos-own-xmsg = import ../nix/own_xmsg_test.nix {
+                  inherit
+                    pkgs
+                    matrix-xmsg
+                    xmsg
+                    ;
+                };
               };
             };
         }

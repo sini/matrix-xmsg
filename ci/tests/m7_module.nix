@@ -52,9 +52,25 @@ let
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
               };
+              before = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+              };
+              requires = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+              };
+              requiredBy = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+              };
               wantedBy = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
+              };
+              environment = lib.mkOption {
+                type = lib.types.attrsOf lib.types.str;
+                default = { };
               };
               serviceConfig = lib.mkOption {
                 type = lib.types.attrsOf lib.types.unspecified;
@@ -156,6 +172,69 @@ in
           home = "/home/alice";
           user = "alice";
           hasGroup = false;
+        };
+      };
+
+    test-m28-xmsg-enable-requires-package = {
+      expr =
+        builtins.elem
+          "services.matrix-xmsg.xmsg.enable requires services.matrix-xmsg.xmsg.package to be set."
+          (evalConfig {
+            xmsg.enable = true;
+          });
+      expected = true;
+    };
+
+    test-m28-own-xmsg-unit-and-socket-defaults =
+      let
+        res = lib.evalModules {
+          specialArgs = {
+            inherit pkgs;
+          };
+          modules = [
+            baseModule
+            matrixModule
+            {
+              services.matrix-xmsg = {
+                enable = true;
+                package = inputs.matrix-xmsg.packages.x86_64-linux.default;
+                homeserverUrl = "http://localhost:8008";
+                botMxid = "@bot:local";
+                accessTokenFile = "/run/token";
+                rooms = [ "!room:local" ];
+                ownerMxid = "@owner:local";
+                xmsg = {
+                  enable = true;
+                  package = inputs.xmsg.packages.x86_64-linux.default;
+                };
+              };
+            }
+          ];
+        };
+        cfg = res.config.services.matrix-xmsg;
+        xmsgSvc = res.config.systemd.services.matrix-xmsg-xmsg;
+      in
+      {
+        expr = {
+          dynamicUser = cfg.dynamicUser;
+          xmsgSocket = cfg.xmsgSocket;
+          hasXmsgUnit = res.config.systemd.services ? matrix-xmsg-xmsg;
+          xmsgUser = xmsgSvc.serviceConfig.User;
+          runtimeDir = xmsgSvc.serviceConfig.RuntimeDirectory;
+          xdgRuntimeDir = xmsgSvc.environment.XDG_RUNTIME_DIR;
+          requiredBy = xmsgSvc.requiredBy;
+        };
+        expected = {
+          dynamicUser = false;
+          xmsgSocket = "/run/matrix-xmsg-xmsg/xmsg";
+          hasXmsgUnit = true;
+          xmsgUser = "matrix-xmsg";
+          runtimeDir = [
+            "matrix-xmsg-xmsg"
+            "matrix-xmsg-xmsg/xmsg"
+          ];
+          xdgRuntimeDir = "/run/matrix-xmsg-xmsg";
+          requiredBy = [ "matrix-xmsg.service" ];
         };
       };
   };

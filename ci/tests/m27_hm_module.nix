@@ -135,6 +135,11 @@ let
     stateDir = "/tmp/shared-state";
     xmsgSocket = "/tmp/shared-xmsg";
     expertRef = "expert@node";
+    expertRefs = {
+      public = "genie-expert@genie-public.bitstream";
+      trusted = "genie-expert@genie-trusted.bitstream";
+    };
+    openThreadNodes = [ "sini.bitstream" ];
     guardRef = "guard@node";
     guardTimeoutSecs = 99;
     guardRetryBudget = 5;
@@ -183,6 +188,7 @@ in
           "dynamicUser"
           "group"
           "user"
+          "xmsg"
         ] (builtins.attrNames nixosWithOverrides.options.services.matrix-xmsg);
         nixosConfigAttrs = shared.mkConfigAttrs {
           inherit lib;
@@ -198,11 +204,13 @@ in
           "dynamicUser"
           "group"
           "user"
+          "xmsg"
         ] (builtins.attrNames nixosWithOverrides.options.services.matrix-xmsg);
         expectedAttrNames = lib.subtractLists [
           "dynamicUser"
           "group"
           "user"
+          "xmsg"
         ] (builtins.attrNames nixosWithOverrides.options.services.matrix-xmsg);
         nixosConfigAttrs = shared.mkConfigAttrs {
           inherit lib;

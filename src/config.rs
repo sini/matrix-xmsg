@@ -21,20 +21,21 @@ fn darwin_user_temp_dir() -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(s.to_bytes())))
 }
 
-pub fn socket_dir_for_env(xdg_var: Option<&str>) -> PathBuf {
+pub fn socket_dir_for_env(xdg_var: Option<&str>) -> Result<PathBuf, AppError> {
     if let Some(val) = xdg_var.filter(|s| !s.trim().is_empty()) {
-        return PathBuf::from(val).join("xmsg");
+        return Ok(PathBuf::from(val).join("xmsg"));
     }
     #[cfg(target_os = "macos")]
     if let Some(dir) = darwin_user_temp_dir() {
-        return dir.join("xmsg");
+        return Ok(dir.join("xmsg"));
     }
-    PathBuf::from("/run/user/1000/xmsg")
+    Err(AppError::Config(
+        "Neither `xmsg_socket` in config nor `XDG_RUNTIME_DIR` in environment is set; refusing to guess an xmsg socket directory".to_string(),
+    ))
 }
 
 fn default_xmsg_socket() -> PathBuf {
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-    socket_dir_for_env(xdg.as_deref())
+    PathBuf::new()
 }
 
 fn default_expert_ref() -> String {
@@ -117,6 +118,12 @@ pub enum GuardFailureMode {
     Open,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpertRefs {
+    pub public: String,
+    pub trusted: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub homeserver_url: String,
@@ -134,6 +141,12 @@ pub struct Config {
 
     #[serde(default = "default_expert_ref")]
     pub expert_ref: String,
+
+    #[serde(default)]
+    pub expert_refs: Option<ExpertRefs>,
+
+    #[serde(default)]
+    pub open_thread_nodes: Vec<String>,
 
     #[serde(default = "default_guard_ref")]
     pub guard_ref: String,
@@ -185,6 +198,28 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn from_toml_str_with_env(content: &str, xdg_var: Option<&str>) -> Result<Self, AppError> {
+        let mut cfg: Self = toml::from_str(content)
+            .map_err(|e| AppError::Config(format!("Failed to parse TOML config: {e}")))?;
+        if cfg.xmsg_socket.as_os_str().is_empty() {
+            cfg.xmsg_socket = socket_dir_for_env(xdg_var)?;
+        }
+        if let Some(ref refs) = cfg.expert_refs {
+            if refs.public.trim().is_empty() || refs.trusted.trim().is_empty() {
+                return Err(AppError::Config(
+                    "`expert_refs.public` and `expert_refs.trusted` must both be non-empty"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(cfg)
+    }
+
+    pub fn from_toml_str(content: &str) -> Result<Self, AppError> {
+        let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        Self::from_toml_str_with_env(content, xdg.as_deref())
+    }
+
     pub fn from_file(path: &Path) -> Result<Self, AppError> {
         let content = fs::read_to_string(path).map_err(|e| {
             AppError::Config(format!(
@@ -192,8 +227,18 @@ impl Config {
                 path.display()
             ))
         })?;
-        toml::from_str(&content)
-            .map_err(|e| AppError::Config(format!("Failed to parse TOML config: {e}")))
+        Self::from_toml_str(&content)
+    }
+
+    pub fn expert_ref_for_tier(&self, tier: &str) -> &str {
+        if let Some(ref refs) = self.expert_refs {
+            match tier {
+                "trusted" => &refs.trusted,
+                _ => &refs.public,
+            }
+        } else {
+            &self.expert_ref
+        }
     }
 
     pub fn load_access_token(&self) -> Result<String, AppError> {
@@ -267,7 +312,7 @@ mod tests {
             trusted_mxids = []
             owner_mxid = "@owner:example.org"
         "#;
-        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let cfg = Config::from_toml_str_with_env(toml_str, Some("/run/user/1001")).unwrap();
         assert_eq!(cfg.guard_ref, "genie-guard");
         assert_eq!(cfg.guard_timeout_secs, 150);
         assert_eq!(cfg.guard_retry_budget, 3);
@@ -276,7 +321,7 @@ mod tests {
         assert_eq!(cfg.guard_outage_dm_window_secs, 3600);
         assert_eq!(
             cfg.xmsg_http_socket(),
-            default_xmsg_socket().join("http.sock")
+            PathBuf::from("/run/user/1001/xmsg/http.sock")
         );
     }
 
@@ -353,8 +398,8 @@ mod tests {
             trusted_mxids = []
             owner_mxid = "@owner:example.org"
         "#;
-        let cfg: Config = toml::from_str(toml_str).unwrap();
-        let expected_dir = default_xmsg_socket();
+        let cfg = Config::from_toml_str_with_env(toml_str, Some("/run/user/1001")).unwrap();
+        let expected_dir = PathBuf::from("/run/user/1001/xmsg");
         assert_eq!(cfg.xmsg_socket, expected_dir);
         assert_eq!(
             cfg.xmsg_register_socket(),
@@ -366,14 +411,15 @@ mod tests {
     #[test]
     fn test_socket_dir_for_env() {
         assert_eq!(
-            socket_dir_for_env(Some("/run/user/1001")),
+            socket_dir_for_env(Some("/run/user/1001")).unwrap(),
             PathBuf::from("/run/user/1001/xmsg")
         );
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(
-            socket_dir_for_env(None),
-            PathBuf::from("/run/user/1000/xmsg")
-        );
+        {
+            let err = socket_dir_for_env(None).unwrap_err().to_string();
+            assert!(err.contains("xmsg_socket"), "{err}");
+            assert!(err.contains("XDG_RUNTIME_DIR"), "{err}");
+        }
     }
 
     #[test]

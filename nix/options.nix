@@ -89,7 +89,7 @@
         {
           type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
           default = defaultXmsgSocket;
-          example = "/run/user/1000/xmsg";
+          example = "/run/matrix-xmsg-xmsg/xmsg";
           description = ''
             Path to the xmsg runtime directory containing register.sock and agent.sock.
             The bot registers on register.sock as the service matrix-xmsg and sends forwards on agent.sock.
@@ -104,6 +104,41 @@
         type = lib.types.str;
         default = "claude";
         description = "The expert's xmsg address: a label, optionally with @<node>.";
+      };
+
+      expertRefs = lib.mkOption {
+        type = lib.types.nullOr (
+          lib.types.submodule {
+            options = {
+              public = lib.mkOption {
+                type = lib.types.str;
+                example = "genie-expert@genie-public.bitstream";
+                description = "Expert xmsg address for public-tier forwards.";
+              };
+              trusted = lib.mkOption {
+                type = lib.types.str;
+                example = "genie-expert@genie-trusted.bitstream";
+                description = "Expert xmsg address for trusted-tier forwards (including owner and !trust-promoted threads).";
+              };
+            };
+          }
+        );
+        default = null;
+        description = ''
+          Per-tier expert xmsg addresses (`public` and `trusted`).
+          When set, overrides `expertRef`: public-tier forwards address `expertRefs.public`
+          and trusted-tier forwards (including owner and `!trust`-promoted threads) address `expertRefs.trusted`.
+        '';
+      };
+
+      openThreadNodes = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "sini.bitstream" ];
+        description = ''
+          List of xmsg node names permitted to invoke `open_thread`.
+          When empty, only senders on the bot's own xmsg node may invoke `open_thread`.
+        '';
       };
 
       guardRef = lib.mkOption {
@@ -264,6 +299,14 @@
     }
     // lib.optionalAttrs (cfg.xmsgSocket != null) {
       xmsg_socket = toString cfg.xmsgSocket;
+    }
+    // lib.optionalAttrs (cfg.expertRefs != null) {
+      expert_refs = {
+        inherit (cfg.expertRefs) public trusted;
+      };
+    }
+    // lib.optionalAttrs (cfg.openThreadNodes != [ ]) {
+      open_thread_nodes = cfg.openThreadNodes;
     };
 
   mkConfigToml =

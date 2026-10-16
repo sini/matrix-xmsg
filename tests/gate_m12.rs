@@ -73,6 +73,8 @@ fn test_config() -> Config {
         admission: Admission::Public,
         xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
+        expert_refs: None,
+        open_thread_nodes: vec![],
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
