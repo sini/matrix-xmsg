@@ -738,7 +738,8 @@ impl MatrixClient for MatrixSdkClient {
         use matrix_sdk::ruma::api::client::redact::redact_event::v3::Request as RedactEventRequest;
         use matrix_sdk::ruma::TransactionId;
 
-        let mut req = RedactEventRequest::new(r_id.to_owned(), e_id.to_owned(), TransactionId::new());
+        let mut req =
+            RedactEventRequest::new(r_id.to_owned(), e_id.to_owned(), TransactionId::new());
         req.reason = reason.map(str::to_string);
         self.client
             .send(req)

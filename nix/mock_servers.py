@@ -194,24 +194,45 @@ class AgentHandler(socketserver.StreamRequestHandler):
         req = json.loads(line)
         sys.stderr.write(f"[xmsg-mock] agent.sock {req.get('action')}\n")
         if req.get("action") == "send":
-            with open("/tmp/xmsg_query_received.json", "wb") as f:
-                f.write(line)
             n = next(send_ids)
             message_id = f"01TESTMSGID{n:05d}"
-            pushed.put({
-                "action": "deliver",
-                "messageId": f"01TESTREPLY{n:05d}",
-                "fromName": f"expert · mock-claude-session@{NODE}",
-                "text": "pong from expert",
-                "envelope": "",
-                "inReplyTo": message_id,
-            })
-            write_frame(self.wfile, {
-                "status": "ok",
-                "message_id": message_id,
-                "address": f"mock-claude-session@{NODE}",
-                "outcome": "delivered",
-            })
+            to_addr = req.get("to", "")
+            if to_addr.startswith("genie-guard"):
+                pushed.put({
+                    "action": "deliver",
+                    "messageId": f"01TESTGUARD{n:05d}",
+                    "fromName": f"genie-guard@{NODE}",
+                    "text": json.dumps({
+                        "verdict": "allow",
+                        "reason": "clean",
+                        "cleaned_text": "",
+                    }),
+                    "envelope": "",
+                    "inReplyTo": message_id,
+                })
+                write_frame(self.wfile, {
+                    "status": "ok",
+                    "message_id": message_id,
+                    "address": f"genie-guard@{NODE}",
+                    "outcome": "delivered",
+                })
+            else:
+                with open("/tmp/xmsg_query_received.json", "wb") as f:
+                    f.write(line)
+                pushed.put({
+                    "action": "deliver",
+                    "messageId": f"01TESTREPLY{n:05d}",
+                    "fromName": f"expert · mock-claude-session@{NODE}",
+                    "text": "pong from expert",
+                    "envelope": "",
+                    "inReplyTo": message_id,
+                })
+                write_frame(self.wfile, {
+                    "status": "ok",
+                    "message_id": message_id,
+                    "address": f"mock-claude-session@{NODE}",
+                    "outcome": "delivered",
+                })
         else:
             write_frame(self.wfile, {"status": "ok"})
 

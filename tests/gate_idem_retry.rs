@@ -48,6 +48,9 @@ fn config() -> Config {
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
+        screen_mentions: false,
+        guard_failure_mode: matrix_xmsg::config::GuardFailureMode::Closed,
+        guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
         db_path: PathBuf::from(":memory:"),
     }

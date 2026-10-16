@@ -169,7 +169,6 @@ fn oracle_m23_answering_carries_mention_and_attribution_rules() {
     );
 }
 
-
 /// Oracle 2:
 /// `send_notice`'s cold-room join fallback is restricted to rooms in `config.rooms`.
 /// A send_notice to an unconfigured room id does not join it.

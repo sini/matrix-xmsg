@@ -997,6 +997,40 @@ impl Store {
         Ok(())
     }
 
+    /// Checks whether a fail-open guard outage DM may be sent at `now_secs` under `window_secs`.
+    /// If no outage DM was sent within `window_secs`, records `now_secs` in `bot_meta` and returns `Ok(true)`.
+    /// Otherwise returns `Ok(false)`.
+    pub fn check_and_record_guard_outage_dm(
+        &self,
+        now_secs: i64,
+        window_secs: u64,
+    ) -> Result<bool, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let last_dm_opt: Option<i64> = match conn.query_row(
+            "SELECT value FROM bot_meta WHERE key = 'guard_outage_last_dm_at'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(val_str) => val_str.parse::<i64>().ok(),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(AppError::Store(e.to_string())),
+        };
+
+        if let Some(last_dm) = last_dm_opt {
+            if now_secs.saturating_sub(last_dm) < window_secs as i64 {
+                return Ok(false);
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO bot_meta (key, value) VALUES ('guard_outage_last_dm_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![now_secs.to_string()],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(true)
+    }
+
     pub fn get_inbox_retries(&self, message_id: &str) -> Result<Option<(usize, i64)>, AppError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -1532,5 +1566,15 @@ mod tests {
 
         store.clear_inbox_retries(msg_id).unwrap();
         assert_eq!(store.get_inbox_retries(msg_id).unwrap(), None);
+    }
+
+    #[test]
+    fn test_guard_outage_dm_window() {
+        let store = Store::new_in_memory().unwrap();
+        assert!(store.check_and_record_guard_outage_dm(1000, 3600).unwrap());
+        assert!(!store.check_and_record_guard_outage_dm(1010, 3600).unwrap());
+        assert!(!store.check_and_record_guard_outage_dm(4599, 3600).unwrap());
+        assert!(store.check_and_record_guard_outage_dm(4600, 3600).unwrap());
+        assert!(!store.check_and_record_guard_outage_dm(4605, 3600).unwrap());
     }
 }

@@ -109,6 +109,9 @@ fn test_config(homeserver_url: &str, db_path: PathBuf) -> Config {
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
+        screen_mentions: false,
+        guard_failure_mode: matrix_xmsg::config::GuardFailureMode::Closed,
+        guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
         rate_limit_count: 10,
         rate_limit_window_secs: 60,
@@ -245,11 +248,10 @@ async fn oracle_1_author_redact_redacts_right_event_in_right_room_both_arrival_p
         origin: Some(author_origin()),
         in_reply_to: Some("01FWD_PUBLIC".to_string()),
     };
-    let out1 = handle_inbox_delivery_with_xmsg(
-        &reply_pub, &config, &sdk, &store, &xmsg, &mut inbox, 1010,
-    )
-    .await
-    .unwrap();
+    let out1 =
+        handle_inbox_delivery_with_xmsg(&reply_pub, &config, &sdk, &store, &xmsg, &mut inbox, 1010)
+            .await
+            .unwrap();
     assert_eq!(out1, BotOutcome::Replied);
 
     let reply_sec = SvcDelivery {
@@ -260,11 +262,10 @@ async fn oracle_1_author_redact_redacts_right_event_in_right_room_both_arrival_p
         origin: Some(author_origin()),
         in_reply_to: Some("01FWD_SECOND".to_string()),
     };
-    let out2 = handle_inbox_delivery_with_xmsg(
-        &reply_sec, &config, &sdk, &store, &xmsg, &mut inbox, 1020,
-    )
-    .await
-    .unwrap();
+    let out2 =
+        handle_inbox_delivery_with_xmsg(&reply_sec, &config, &sdk, &store, &xmsg, &mut inbox, 1020)
+            .await
+            .unwrap();
     assert_eq!(out2, BotOutcome::Replied);
 
     // No extra acknowledgement reply is sent when posting normal replies.
@@ -447,11 +448,10 @@ async fn oracle_2_different_principal_or_missing_origin_refused_and_homeserver_u
         origin: Some(other_origin_forging_author_label()),
         in_reply_to: Some("01FWD_O2".to_string()),
     };
-    let out_bad_edit = handle_inbox_delivery_with_xmsg(
-        &bad_edit, &config, &sdk, &store, &xmsg, &mut inbox, 1020,
-    )
-    .await
-    .unwrap();
+    let out_bad_edit =
+        handle_inbox_delivery_with_xmsg(&bad_edit, &config, &sdk, &store, &xmsg, &mut inbox, 1020)
+            .await
+            .unwrap();
     assert_eq!(out_bad_edit, BotOutcome::EditRefused);
 
     // 3. Missing origin (`origin: None`), even when `from_name` matches the author's display string: refused!
@@ -1444,21 +1444,22 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_other_node_or_ed
     .unwrap();
     assert_eq!(out4, BotOutcome::EditRefused);
 
-    let replies = xmsg.replies.lock().unwrap();
-    assert_eq!(replies.len(), 4);
-    assert!(replies[0]
-        .1
-        .contains("was not received by the requesting agent"));
-    assert!(replies[1]
-        .1
-        .contains("was not received by the requesting agent"));
-    assert!(replies[2]
-        .1
-        .contains("unknown requested_by forward message id"));
-    assert!(replies[3]
-        .1
-        .contains("edit is author-only and does not accept 'requested_by'"));
-    drop(replies);
+    {
+        let replies = xmsg.replies.lock().unwrap();
+        assert_eq!(replies.len(), 4);
+        assert!(replies[0]
+            .1
+            .contains("was not received by the requesting agent"));
+        assert!(replies[1]
+            .1
+            .contains("was not received by the requesting agent"));
+        assert!(replies[2]
+            .1
+            .contains("unknown requested_by forward message id"));
+        assert!(replies[3]
+            .1
+            .contains("edit is author-only and does not accept 'requested_by'"));
+    }
 
     // 5. Verify `open_thread` records `id@node` in `forwarded_messages.session_id`, so a same-named
     // service on another node cannot cite the open_thread message ID in `requested_by`.
@@ -1539,5 +1540,3 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_other_node_or_ed
     .unwrap();
     assert_eq!(out_other_svc, BotOutcome::RedactRefused);
 }
-
-

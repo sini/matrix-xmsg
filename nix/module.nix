@@ -21,6 +21,9 @@ let
       owner_mxid = cfg.ownerMxid;
       expert_ref = cfg.expertRef;
       guard_ref = cfg.guardRef;
+      screen_mentions = cfg.screenMentions;
+      guard_failure_mode = cfg.guardFailureMode;
+      guard_outage_dm_window_secs = cfg.guardOutageDmWindowSecs;
       history_n = cfg.historyN;
       history_byte_cap = cfg.historyByteCap;
       resync_byte_cap = cfg.resyncByteCap;
@@ -127,6 +130,36 @@ in
         The guard service's xmsg address: a bare name, or `name@node`.
         Set `@node` when two guards are in view: a bare name then resolves `ambiguous`
         and every guard check fails.
+      '';
+    };
+
+    screenMentions = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Whether to screen regular mentions and thread replies through `guardRef` before
+        forwarding to the expert (`solicited` threads opened via `open_thread` are always screened).
+      '';
+    };
+
+    guardFailureMode = lib.mkOption {
+      type = lib.types.enum [
+        "closed"
+        "open"
+      ];
+      default = "closed";
+      description = ''
+        Behavior when the guard service times out or errors:
+        - `"closed"` (default): forward nothing, retry on next delivery up to `guard_retry_budget`, and DM `ownerMxid` once at budget.
+        - `"open"`: forward immediately wrapped in `screened="false"` warning tags and DM `ownerMxid` at most once per `guardOutageDmWindowSecs`.
+      '';
+    };
+
+    guardOutageDmWindowSecs = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 3600;
+      description = ''
+        Rate-limit window in seconds for owner DMs when `guardFailureMode = "open"` and the guard service is unavailable.
       '';
     };
 

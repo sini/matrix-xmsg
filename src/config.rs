@@ -55,6 +55,14 @@ fn default_guard_retry_budget() -> usize {
     3
 }
 
+fn default_screen_mentions() -> bool {
+    true
+}
+
+fn default_guard_outage_dm_window_secs() -> u64 {
+    3600
+}
+
 fn default_inbox_retry_budget() -> usize {
     10
 }
@@ -69,6 +77,14 @@ pub enum Admission {
     #[default]
     Trusted,
     Public,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardFailureMode {
+    #[default]
+    Closed,
+    Open,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +113,15 @@ pub struct Config {
 
     #[serde(default = "default_guard_retry_budget")]
     pub guard_retry_budget: usize,
+
+    #[serde(default = "default_screen_mentions")]
+    pub screen_mentions: bool,
+
+    #[serde(default)]
+    pub guard_failure_mode: GuardFailureMode,
+
+    #[serde(default = "default_guard_outage_dm_window_secs")]
+    pub guard_outage_dm_window_secs: u64,
 
     #[serde(default = "default_inbox_retry_budget")]
     pub inbox_retry_budget: usize,
@@ -194,10 +219,32 @@ mod tests {
         assert_eq!(cfg.guard_ref, "genie-guard");
         assert_eq!(cfg.guard_timeout_secs, 150);
         assert_eq!(cfg.guard_retry_budget, 3);
+        assert!(cfg.screen_mentions);
+        assert_eq!(cfg.guard_failure_mode, GuardFailureMode::Closed);
+        assert_eq!(cfg.guard_outage_dm_window_secs, 3600);
         assert_eq!(
             cfg.xmsg_http_socket(),
             PathBuf::from("/run/user/1000/xmsg/http.sock")
         );
+    }
+
+    #[test]
+    fn test_guard_m26_explicit_options() {
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = []
+            owner_mxid = "@owner:example.org"
+            screen_mentions = false
+            guard_failure_mode = "open"
+            guard_outage_dm_window_secs = 600
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.screen_mentions);
+        assert_eq!(cfg.guard_failure_mode, GuardFailureMode::Open);
+        assert_eq!(cfg.guard_outage_dm_window_secs, 600);
     }
 
     #[test]

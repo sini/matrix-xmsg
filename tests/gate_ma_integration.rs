@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use matrix_xmsg::bot::{handle_incoming_event, handle_incoming_event_with_guard, BotOutcome};
-use matrix_xmsg::config::{Admission, Config};
+use matrix_xmsg::config::{Admission, Config, GuardFailureMode};
 use matrix_xmsg::matrix::{IncomingMatrixEvent, MatrixClient, MockMatrixClient};
 use matrix_xmsg::store::Store;
 use matrix_xmsg::xmsg::{
@@ -273,6 +273,9 @@ impl Node {
             guard_ref: "genie-guard".to_string(),
             guard_timeout_secs: 15,
             guard_retry_budget: 3,
+            screen_mentions: true,
+            guard_failure_mode: GuardFailureMode::Closed,
+            guard_outage_dm_window_secs: 3600,
             inbox_retry_budget: 3,
             db_path: db.to_path_buf(),
         }
@@ -743,7 +746,8 @@ async fn oracle_3_m16_rebootstraps_on_a_new_resolved_id() {
         },
     );
     let db = tempdir().unwrap();
-    let config = node.config(&db.path().join("bot.db"));
+    let mut config = node.config(&db.path().join("bot.db"));
+    config.screen_mentions = false;
     let store = Store::new(&config.db_path).unwrap();
     let matrix = MockMatrixClient::default();
     let xmsg = create_xmsg_client(&config);
@@ -838,11 +842,19 @@ async fn oracle_4_m24_reply_then_redact_by_returned_message_id() {
     let node = Node::start(
         &bin,
         Spec {
-            services: vec!["matrix-xmsg"],
+            services: vec!["matrix-xmsg", "genie-guard"],
             ..Default::default()
         },
     );
     let bot = Bot::start(&node).await;
+
+    let verdict = json!({ "verdict": "allow", "reason": "clean", "cleaned_text": "" });
+    let guard = Fake::start(json!({
+        "role": "service", "name": "genie-guard",
+        "register_sock": node.sock("register.sock"), "agent_sock": node.sock("agent.sock"),
+        "reply": verdict.to_string(),
+    }));
+    guard.ready().await;
 
     let expert_inbox = node.tmp.path().join("expert_m24.sock");
     let expert = Fake::start(json!({
@@ -872,12 +884,16 @@ async fn oracle_4_m24_reply_then_redact_by_returned_message_id() {
     assert_eq!(outcome, BotOutcome::Forwarded);
 
     // Wait for both the initial notice to be posted AND the subsequent redaction to land!
-    let redacted = eventually("the bot's post to be redacted via returned reply ID", 20, || {
-        let list = bot.matrix.redacted_events.lock().unwrap();
-        list.iter()
-            .find(|r| r.reason.as_deref() == Some("accidental config leak"))
-            .cloned()
-    })
+    let redacted = eventually(
+        "the bot's post to be redacted via returned reply ID",
+        20,
+        || {
+            let list = bot.matrix.redacted_events.lock().unwrap();
+            list.iter()
+                .find(|r| r.reason.as_deref() == Some("accidental config leak"))
+                .cloned()
+        },
+    )
     .await;
 
     assert_eq!(redacted.room_id, ROOM);

@@ -3,7 +3,7 @@ use matrix_xmsg::bot::{
     handle_inbox_delivery_with_xmsg, handle_incoming_event_with_guard, BotOutcome,
     IncomingMatrixEvent,
 };
-use matrix_xmsg::config::{Admission, Config};
+use matrix_xmsg::config::{Admission, Config, GuardFailureMode};
 use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::store::Store;
@@ -98,6 +98,9 @@ fn test_config() -> Config {
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
+        screen_mentions: true,
+        guard_failure_mode: GuardFailureMode::Closed,
+        guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
         history_n: 10,
         history_byte_cap: 12 * 1024,
