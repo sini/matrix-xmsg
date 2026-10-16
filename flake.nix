@@ -9,11 +9,10 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
+        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-    in
-    {
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "matrix-xmsg";
@@ -52,7 +51,7 @@
           tag = "latest";
           contents = [
             pkgs.cacert
-            self.packages.${pkgs.system}.default
+            packages.${pkgs.stdenv.hostPlatform.system}.default
           ];
           extraCommands = ''
             mkdir -p -m 1777 tmp
@@ -61,7 +60,7 @@
           '';
           config = {
             User = "10001:10001";
-            Entrypoint = [ "${self.packages.${pkgs.system}.default}/bin/matrix-xmsg" ];
+            Entrypoint = [ "${packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/matrix-xmsg" ];
             Cmd = [
               "--config"
               "/etc/matrix-xmsg/config.toml"
@@ -78,8 +77,19 @@
           cp -r ${./skills/matrix}/. $out/
         '';
       });
+    in
+    {
+      inherit packages;
 
-      nixosModules.default = import ./nix/module.nix { inherit self; };
+      homeManagerModules = rec {
+        matrix-xmsg = import ./nix/home-manager.nix { inherit packages; };
+        default = matrix-xmsg;
+      };
+
+      nixosModules = rec {
+        matrix-xmsg = import ./nix/module.nix { inherit packages; };
+        default = matrix-xmsg;
+      };
 
       checks = forAllSystems (
         pkgs:
@@ -99,7 +109,7 @@
                 nativeBuildInputs = [ pkgs.python3 ];
               }
               ''
-                python3 ${./nix/check_image.py} ${self.packages.${pkgs.system}.image}
+                python3 ${./nix/check_image.py} ${packages.${pkgs.stdenv.hostPlatform.system}.image}
                 touch $out
               '';
         }

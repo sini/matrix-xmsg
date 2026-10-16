@@ -1,4 +1,7 @@
-{ self }:
+{
+  self ? null,
+  packages ? self.packages,
+}:
 {
   config,
   lib,
@@ -8,249 +11,52 @@
 
 let
   cfg = config.services.matrix-xmsg;
+  shared = import ./options.nix;
 
-  # Format config.toml matching matrix_xmsg::config::Config
-  configToml = (pkgs.formats.toml { }).generate "matrix-xmsg-config.toml" (
-    {
-      homeserver_url = cfg.homeserverUrl;
-      bot_mxid = cfg.botMxid;
-      # Systemd LoadCredential mounts the secret at /run/credentials/matrix-xmsg.service/access-token
-      access_token_file = "/run/credentials/matrix-xmsg.service/access-token";
-      rooms = cfg.rooms;
-      trusted_mxids = cfg.trustedMxids;
-      owner_mxid = cfg.ownerMxid;
-      expert_ref = cfg.expertRef;
-      guard_ref = cfg.guardRef;
-      screen_mentions = cfg.screenMentions;
-      guard_failure_mode = cfg.guardFailureMode;
-      guard_outage_dm_window_secs = cfg.guardOutageDmWindowSecs;
-      history_n = cfg.historyN;
-      history_byte_cap = cfg.historyByteCap;
-      resync_byte_cap = cfg.resyncByteCap;
-      rate_limit_count = cfg.rateLimitCount;
-      rate_limit_window_secs = cfg.rateLimitWindowSecs;
-      size_cap_bytes = cfg.sizeCapBytes;
-      answer_timeout_secs = cfg.answerTimeoutSecs;
-      session_live_secs = cfg.sessionLiveSecs;
-      inbox_retry_budget = cfg.inboxRetryBudget;
-      db_path = cfg.dbPath;
-    }
-    // lib.optionalAttrs (cfg.xmsgSocket != null) {
-      xmsg_socket = toString cfg.xmsgSocket;
-    }
-  );
+  # Systemd LoadCredential mounts the secret at /run/credentials/matrix-xmsg.service/access-token
+  configToml = shared.mkConfigToml {
+    inherit lib pkgs;
+  } cfg "/run/credentials/matrix-xmsg.service/access-token";
 in
 {
-  options.services.matrix-xmsg = {
-    enable = lib.mkEnableOption "matrix-xmsg Matrix bot backed by an expert agent session";
-
-    package = lib.mkOption {
-      type = lib.types.package;
-      default = self.packages.${pkgs.system}.default;
-      defaultText = lib.literalExpression "self.packages.\${pkgs.system}.default";
-      description = "The matrix-xmsg package to use.";
-    };
-
-    homeserverUrl = lib.mkOption {
-      type = lib.types.str;
-      example = "https://matrix.org";
-      description = "Base URL of the Matrix homeserver.";
-    };
-
-    botMxid = lib.mkOption {
-      type = lib.types.str;
-      example = "@genie:example.org";
-      description = "Full Matrix user ID of the bot.";
-    };
-
-    accessTokenFile = lib.mkOption {
-      type = lib.types.path;
-      example = "/run/secrets/matrix-token";
-      description = ''
+  options.services.matrix-xmsg =
+    (shared.mkCommonOptions {
+      inherit
+        lib
+        pkgs
+        packages
+        cfg
+        ;
+      defaultStateDir = "/var/lib/matrix-xmsg";
+      defaultXmsgSocket = "/run/user/1000/xmsg";
+      accessTokenDescription = ''
         Path to file containing the Matrix access token.
         Loaded securely at service startup via systemd LoadCredential;
         never copied into the world-readable /nix/store.
       '';
-    };
+    })
+    // {
+      user = lib.mkOption {
+        type = lib.types.str;
+        default = "matrix-xmsg";
+        description = "Dedicated system user (used when dynamicUser is false).";
+      };
 
-    rooms = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      example = [ "!roomid:example.org" ];
-      description = ''
-        List of Matrix room IDs the bot is permitted to monitor.
-        Must contain canonical room IDs (starting with '!'), not aliases (starting with '#').
-      '';
-    };
+      group = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Dedicated system group (used when dynamicUser is false). When null and user is matrix-xmsg, defaults to matrix-xmsg. For any other user, systemd uses the user's primary group unless explicitly set.";
+      };
 
-    trustedMxids = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      example = [ "@admin:example.org" ];
-      description = "List of Matrix user IDs trusted to interact with the bot.";
+      dynamicUser = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether to use systemd DynamicUser allocation.";
+      };
     };
-
-    ownerMxid = lib.mkOption {
-      type = lib.types.str;
-      example = "@owner:example.org";
-      description = "Matrix user ID of the bot owner for notifications and direct control.";
-    };
-
-    stateDir = lib.mkOption {
-      type = lib.types.path;
-      default = "/var/lib/matrix-xmsg";
-      description = "Directory for matrix-xmsg persistent state and SQLite database.";
-    };
-
-    xmsgSocket = lib.mkOption {
-      type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
-      default = "/run/user/1000/xmsg";
-      example = "/run/user/1000/xmsg";
-      description = ''
-        Path to the xmsg runtime directory containing register.sock and agent.sock.
-        The bot registers on register.sock as the service matrix-xmsg and sends forwards on agent.sock.
-        Because svc attests the peer UID, services.matrix-xmsg.dynamicUser must be false,
-        and services.matrix-xmsg.user must be configured to the runtime directory's owning user.
-        Note: The xmsg daemon instance must pass `--svc-exe matrix-xmsg=<this package's binary>`
-        to authorize the service registration.
-      '';
-    };
-
-    expertRef = lib.mkOption {
-      type = lib.types.str;
-      default = "claude";
-      description = "The expert's xmsg address: a label, optionally with @<node>.";
-    };
-
-    guardRef = lib.mkOption {
-      type = lib.types.str;
-      default = "genie-guard";
-      example = "genie-guard@sini.bitstream";
-      description = ''
-        The guard service's xmsg address: a bare name, or `name@node`.
-        Set `@node` when two guards are in view: a bare name then resolves `ambiguous`
-        and every guard check fails.
-      '';
-    };
-
-    screenMentions = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = ''
-        Whether to screen regular mentions and thread replies through `guardRef` before
-        forwarding to the expert (`solicited` threads opened via `open_thread` are always screened).
-      '';
-    };
-
-    guardFailureMode = lib.mkOption {
-      type = lib.types.enum [
-        "closed"
-        "open"
-      ];
-      default = "closed";
-      description = ''
-        Behavior when the guard service times out or errors:
-        - `"closed"` (default): forward nothing, retry on next delivery up to `guard_retry_budget`, and DM `ownerMxid` once at budget.
-        - `"open"`: forward immediately wrapped in `screened="false"` warning tags and DM `ownerMxid` at most once per `guardOutageDmWindowSecs`.
-      '';
-    };
-
-    guardOutageDmWindowSecs = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 3600;
-      description = ''
-        Rate-limit window in seconds for owner DMs when `guardFailureMode = "open"` and the guard service is unavailable.
-      '';
-    };
-
-    historyN = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 30;
-      description = "Number of recent room messages to fetch for context framing.";
-    };
-
-    historyByteCap = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 12288;
-      description = "Byte budget cap for message context history.";
-    };
-
-    resyncByteCap = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 65536;
-      description = "Maximum byte budget for thread resync transcripts.";
-    };
-
-    rateLimitCount = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 10;
-      description = "Maximum queries allowed per rate limit window per user.";
-    };
-
-    rateLimitWindowSecs = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 600;
-      description = "Sliding rate limit window in seconds.";
-    };
-
-    sizeCapBytes = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 4096;
-      description = "Maximum message size accepted for processing.";
-    };
-
-    answerTimeoutSecs = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 300;
-      description = "Timeout in seconds to wait for an expert reply before escalating.";
-    };
-
-    sessionLiveSecs = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 3600;
-      description = "Duration in seconds before an idle thread/session context is re-bootstrapped.";
-    };
-
-    inboxRetryBudget = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 10;
-      description = "Maximum attempts to process a failing inbox delivery before giving up and notifying sender and owner.";
-    };
-
-    dbPath = lib.mkOption {
-      type = lib.types.path;
-      default = "${cfg.stateDir}/matrix-xmsg.db";
-      description = "Path to the SQLite database file.";
-    };
-
-    user = lib.mkOption {
-      type = lib.types.str;
-      default = "matrix-xmsg";
-      description = "Dedicated system user (used when dynamicUser is false).";
-    };
-
-    group = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      description = "Dedicated system group (used when dynamicUser is false). When null and user is matrix-xmsg, defaults to matrix-xmsg. For any other user, systemd uses the user's primary group unless explicitly set.";
-    };
-
-    dynamicUser = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = "Whether to use systemd DynamicUser allocation.";
-    };
-  };
 
   config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = lib.all (r: lib.hasPrefix "!" r) cfg.rooms;
-        message = ''
-          services.matrix-xmsg.rooms must contain Matrix room IDs (starting with '!'), not aliases (starting with '#').
-          Aliases must be resolved to room IDs before configuring matrix-xmsg.
-        '';
-      }
+    assertions = (shared.mkCommonAssertions { inherit lib cfg; }) ++ [
       {
         assertion = cfg.xmsgSocket != null -> !cfg.dynamicUser;
         message = "services.matrix-xmsg: when xmsgSocket is configured, dynamicUser must be false because the socket's UID check requires running as the socket's owner. Configure services.matrix-xmsg.user to the socket's owning user.";
@@ -279,7 +85,7 @@ in
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/matrix-xmsg --config ${configToml}";
+        ExecStart = "${lib.getExe cfg.package} --config ${configToml}";
         Restart = "on-failure";
         RestartSec = "5s";
 

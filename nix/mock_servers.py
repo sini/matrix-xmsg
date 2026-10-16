@@ -286,14 +286,17 @@ def run_matrix_server():
 
 if __name__ == "__main__":
     t1 = threading.Thread(target=run_matrix_server, daemon=True)
-    os.makedirs(SOCK_DIR, exist_ok=True)
-    os.chmod(SOCK_DIR, 0o755)
-    t2 = threading.Thread(target=run_unix_server, args=("register.sock", RegisterHandler), daemon=True)
-    t3 = threading.Thread(target=run_unix_server, args=("agent.sock", AgentHandler), daemon=True)
     t1.start()
-    t2.start()
-    t3.start()
-    print(f"Mock servers listening on 127.0.0.1:8008 (Matrix) and {SOCK_DIR} (xmsg)")
+    if os.environ.get("MOCK_MATRIX_ONLY") == "1":
+        print("Mock Matrix server listening on 127.0.0.1:8008 (Matrix only)")
+    else:
+        os.makedirs(SOCK_DIR, exist_ok=True)
+        os.chmod(SOCK_DIR, 0o755)
+        t2 = threading.Thread(target=run_unix_server, args=("register.sock", RegisterHandler), daemon=True)
+        t3 = threading.Thread(target=run_unix_server, args=("agent.sock", AgentHandler), daemon=True)
+        t2.start()
+        t3.start()
+        print(f"Mock servers listening on 127.0.0.1:8008 (Matrix) and {SOCK_DIR} (xmsg)")
     sys.stdout.flush()
     while True:
         time.sleep(1)

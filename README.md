@@ -183,11 +183,14 @@ The access token is loaded from `access_token_file` at runtime and is never logg
 
 ---
 
-## 3. NixOS Deployment (`services.matrix-xmsg`)
+## 3. NixOS & Home-Manager Deployment (`services.matrix-xmsg`)
 
-The flake exports a NixOS module as `nixosModules.default` under the `services.matrix-xmsg` option namespace.
+The flake exports two modules sharing the same `services.matrix-xmsg` option set (`nix/options.nix`):
 
-### 3.1 Host Configuration Example
+- `nixosModules.default` (`nixosModules.matrix-xmsg`): system service for NixOS servers.
+- `homeManagerModules.default` (`homeManagerModules.matrix-xmsg`): user service (`systemd.user.services.matrix-xmsg` on Linux, `launchd.agents.matrix-xmsg` on macOS) for laptops and macOS hosts alongside `xmsg.homeManagerModules.xmsg`.
+
+### 3.1 NixOS Host Configuration Example
 
 ```nix
 { config, pkgs, inputs, ... }:
@@ -208,6 +211,32 @@ The flake exports a NixOS module as `nixosModules.default` under the `services.m
     expertRef = "claude";
     dynamicUser = false;
     user = "sini";
+  };
+}
+```
+
+### 3.1b Home-Manager Configuration Example (Linux & macOS)
+
+When imported alongside `xmsg.homeManagerModules.xmsg`, the module automatically registers `programs.xmsg.server.svcExe.matrix-xmsg`, defaults `stateDir` to `${config.xdg.stateHome}/matrix-xmsg`, and inherits `xmsgSocket` from `programs.xmsg.server.httpSocket` (or uses `$XDG_RUNTIME_DIR/xmsg` on Linux and the Darwin user temp directory on macOS):
+
+```nix
+{ inputs, ... }:
+{
+  imports = [
+    inputs.xmsg.homeManagerModules.xmsg
+    inputs.matrix-xmsg.homeManagerModules.default
+  ];
+
+  programs.xmsg.enable = true;
+
+  services.matrix-xmsg = {
+    enable = true;
+    homeserverUrl = "https://matrix.example.org";
+    botMxid = "@genie:example.org";
+    accessTokenFile = "/run/secrets/matrix-token"; # mode 0600 or 0400 required at startup
+    rooms = [ "!support:example.org" ];
+    trustedMxids = [ "@alice:example.org" ];
+    ownerMxid = "@owner:example.org";
   };
 }
 ```

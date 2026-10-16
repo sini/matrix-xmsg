@@ -27,8 +27,25 @@ impl Store {
     pub fn new(path: &Path) -> Result<Self, AppError> {
         #[cfg(unix)]
         {
+            use std::os::unix::fs::DirBuilderExt;
             use std::os::unix::fs::OpenOptionsExt;
             use std::os::unix::fs::PermissionsExt;
+
+            if let Some(parent) = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty() && !p.exists())
+            {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)
+                    .map_err(|e| {
+                        AppError::Store(format!(
+                            "Failed to create database parent directory {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
+            }
 
             // Atomically create file with 0600 permissions if it does not exist
             let _ = std::fs::OpenOptions::new()
@@ -1576,5 +1593,28 @@ mod tests {
         assert!(!store.check_and_record_guard_outage_dm(4599, 3600).unwrap());
         assert!(store.check_and_record_guard_outage_dm(4600, 3600).unwrap());
         assert!(!store.check_and_record_guard_outage_dm(4605, 3600).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_store_new_creates_missing_parent_dir_with_0700_and_db_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let nested_dir = tmp.path().join("state").join("matrix-xmsg");
+        let db_path = nested_dir.join("matrix-xmsg.db");
+        assert!(!nested_dir.exists());
+
+        let _store = Store::new(&db_path).unwrap();
+        assert!(nested_dir.exists());
+        assert!(db_path.exists());
+
+        let dir_mode = std::fs::metadata(&nested_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let db_mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(db_mode, 0o600);
     }
 }

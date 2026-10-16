@@ -14,6 +14,12 @@
       url = "github:sini/xmsg/f27791bd2095be9bdfec02639f01a17b9188cce0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # The flake modules are evaluated against home-manager at nix-config's pin (its
+    # `home-manager-unstable` node), matching xmsg/ci/flake.nix.
+    home-manager = {
+      url = "github:nix-community/home-manager/fae6e9e42c3b762ab47635cddcfaf6f52374a61b";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -21,6 +27,7 @@
       gen-harness,
       nixpkgs,
       xmsg,
+      home-manager,
       ...
     }:
     let
@@ -73,6 +80,23 @@
                     "gate_ma_integration"
                   ];
                   checkFlags = [ "--include-ignored" ];
+                };
+                hm-user-service = import ../nix/hm_test.nix {
+                  inherit
+                    pkgs
+                    matrix-xmsg
+                    xmsg
+                    home-manager
+                    ;
+                };
+                hm-user-service-mutant-no-svcexe = import ../nix/hm_test.nix {
+                  inherit
+                    pkgs
+                    matrix-xmsg
+                    xmsg
+                    home-manager
+                    ;
+                  mode = "mutant-no-svcexe";
                 };
               };
             };
