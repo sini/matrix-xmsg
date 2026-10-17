@@ -756,22 +756,25 @@
     },
     "xmsg": {
       "inputs": {
+        "crane": [
+          "crane"
+        ],
         "nixpkgs": [
           "nixpkgs"
         ]
       },
       "locked": {
-        "lastModified": 1792206131,
-        "narHash": "sha256-ur1Kh7jraC0CMDWVIoy9zOykE688fWhQfdDG2UFPYoA=",
+        "lastModified": 1792258112,
+        "narHash": "sha256-sq0JHtjnwNzGrlGdlz0z3iz9T0Wddj/tNXaSkAwRBEk=",
         "owner": "sini",
         "repo": "xmsg",
-        "rev": "6e02b71d85cd859e838dc68fbf722298b7feb4f0",
+        "rev": "a6f7adf31516e4ebc56fb409cd302a54c18647b6",
         "type": "github"
       },
       "original": {
         "owner": "sini",
         "repo": "xmsg",
-        "rev": "6e02b71d85cd859e838dc68fbf722298b7feb4f0",
+        "rev": "a6f7adf31516e4ebc56fb409cd302a54c18647b6",
         "type": "github"
       }
     }

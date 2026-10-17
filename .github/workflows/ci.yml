@@ -16,12 +16,16 @@ env:
     root-surface
     treefmt-tree-root
   PACKAGE_CHECKS: >-
+    image
     package
   INTEGRATION_CHECKS: >-
     integration
   VM_CHECKS: >-
     hm-user-service
     hm-user-service-mutant-no-svcexe
+    nixos-module
+    nixos-module-mutant-missing
+    nixos-module-mutant-wrong-token
     nixos-own-xmsg
 
 # One upstream-Nix column, not gen-harness's three-evaluator matrix: this is not a gen library, so
@@ -58,7 +62,14 @@ jobs:
       - name: Assert CI check coverage
         id: coverage
         run: |
-          expected=$(nix eval ./ci#checks.x86_64-linux --apply builtins.attrNames --json | jq -S .)
+          ci_checks=$(nix eval ./ci#checks.x86_64-linux --apply builtins.attrNames --json)
+          root_checks=$(nix eval .#checks.x86_64-linux --apply builtins.attrNames --json)
+          expected=$(jq -S -n --argjson ci "$ci_checks" --argjson root "$root_checks" '($ci + $root) | sort | unique')
+          missing_from_ci=$(jq -S -n --argjson ci "$ci_checks" --argjson root "$root_checks" '$root - $ci')
+          if [ "$missing_from_ci" != "[]" ]; then
+            echo "Root flake checks missing from ./ci#checks: $missing_from_ci" >&2
+            exit 1
+          fi
           read -r -a fast <<< "$FAST_CHECKS"
           read -r -a pkg <<< "$PACKAGE_CHECKS"
           read -r -a integ <<< "$INTEGRATION_CHECKS"
@@ -66,7 +77,7 @@ jobs:
           covered=$(printf '%s\n' "${fast[@]}" "${pkg[@]}" "${integ[@]}" "${vm[@]}" | jq -R . | jq -s 'sort | unique')
           if [ "$expected" != "$covered" ]; then
             echo "CI check coverage mismatch!" >&2
-            echo "Flake checks: $expected" >&2
+            echo "Flake checks (./ci#checks + .#checks): $expected" >&2
             echo "Workflow checks: $covered" >&2
             diff -u <(echo "$expected") <(echo "$covered") >&2 || true
             exit 1

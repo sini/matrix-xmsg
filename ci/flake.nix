@@ -12,8 +12,9 @@
     # before delivery, `reply` taking `idempotency_key`), which every forward send now carries.
     # The addressing plan's re-verify step moves it.
     xmsg = {
-      url = "github:sini/xmsg/6e02b71d85cd859e838dc68fbf722298b7feb4f0";
+      url = "github:sini/xmsg/a6f7adf31516e4ebc56fb409cd302a54c18647b6";
       inputs.nixpkgs.follows = "nixpkgs";
+      inputs.crane.follows = "crane";
     };
     # The flake modules are evaluated against home-manager at nix-config's pin (its
     # `home-manager-unstable` node), matching xmsg/ci/flake.nix.
@@ -53,7 +54,7 @@
         { gen.ci.rootSurface.entry = "not-owed"; }
         # Nor an evaluator matrix: its CI is one upstream-Nix column, not evaluators.yml.
         { gen.ci.evaluators = "not-owed"; }
-        # Surface package build in CI checks (doCheck = true runs cargo test)
+        # Surface root flake checks and package build in CI checks (doCheck = true runs cargo test)
         {
           perSystem =
             {
@@ -63,65 +64,67 @@
               ...
             }:
             {
-              checks = {
-                package = matrix-xmsg.packages.${system}.default;
-              }
-              # The integration oracles against the real `xmsg serve`. They are `#[ignore]`d, so
-              # a plain `cargo test` reports them ignored; this check runs them with
-              # `--include-ignored`, and MA_XMSG_REQUIRED makes a missing XMSG_BIN fail every
-              # oracle rather than skip it. xmsg's own suite is not this check's subject, so its
-              # package is built without it. Linux only: the oracle file is
-              # `#![cfg(target_os = "linux")]`, so elsewhere it would collect 0 tests and pass.
-              // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-                integration = matrix-xmsg.packages.${system}.default.overrideAttrs {
-                  pname = "matrix-xmsg-integration";
-                  XMSG_BIN = "${xmsg.packages.${system}.default.overrideAttrs { doCheck = false; }}/bin/xmsg";
-                  MA_XMSG_REQUIRED = "1";
-                  doNotPostBuildInstallCargoBinaries = true;
-                  passthru = {
-                    xmsgNoCheck = xmsg.packages.${system}.default.overrideAttrs { doCheck = false; };
-                    pkgNoCheck = matrix-xmsg.packages.${system}.default.overrideAttrs { doCheck = false; };
+              checks =
+                (matrix-xmsg.checks.${system} or { })
+                // {
+                  package = matrix-xmsg.packages.${system}.default;
+                }
+                # The integration oracles against the real `xmsg serve`. They are `#[ignore]`d, so
+                # a plain `cargo test` reports them ignored; this check runs them with
+                # `--include-ignored`, and MA_XMSG_REQUIRED makes a missing XMSG_BIN fail every
+                # oracle rather than skip it. xmsg's own suite is not this check's subject, so its
+                # package is built without it. Linux only: the oracle file is
+                # `#![cfg(target_os = "linux")]`, so elsewhere it would collect 0 tests and pass.
+                // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+                  integration = matrix-xmsg.packages.${system}.default.overrideAttrs {
+                    pname = "matrix-xmsg-integration";
+                    XMSG_BIN = "${xmsg.packages.${system}.default.overrideAttrs { doCheck = false; }}/bin/xmsg";
+                    MA_XMSG_REQUIRED = "1";
+                    doNotPostBuildInstallCargoBinaries = true;
+                    passthru = {
+                      xmsgNoCheck = xmsg.packages.${system}.default.overrideAttrs { doCheck = false; };
+                      pkgNoCheck = matrix-xmsg.packages.${system}.default.overrideAttrs { doCheck = false; };
+                    };
+                    buildPhase = ''
+                      runHook preBuild
+                      runHook postBuild
+                    '';
+                    checkPhase = ''
+                      runHook preCheck
+                      cargoWithProfile test --locked --test gate_ma_integration -- --include-ignored
+                      runHook postCheck
+                    '';
+                    installPhase = ''
+                      runHook preInstall
+                      mkdir -p $out
+                      runHook postInstall
+                    '';
                   };
-                  buildPhase = ''
-                    runHook preBuild
-                    runHook postBuild
-                  '';
-                  checkPhase = ''
-                    runHook preCheck
-                    cargoWithProfile test --locked --test gate_ma_integration -- --include-ignored
-                    runHook postCheck
-                  '';
-                  installPhase = ''
-                    runHook preInstall
-                    mkdir -p $out
-                    runHook postInstall
-                  '';
+                  hm-user-service = import ../nix/hm_test.nix {
+                    inherit
+                      pkgs
+                      matrix-xmsg
+                      xmsg
+                      home-manager
+                      ;
+                  };
+                  hm-user-service-mutant-no-svcexe = import ../nix/hm_test.nix {
+                    inherit
+                      pkgs
+                      matrix-xmsg
+                      xmsg
+                      home-manager
+                      ;
+                    mode = "mutant-no-svcexe";
+                  };
+                  nixos-own-xmsg = import ../nix/own_xmsg_test.nix {
+                    inherit
+                      pkgs
+                      matrix-xmsg
+                      xmsg
+                      ;
+                  };
                 };
-                hm-user-service = import ../nix/hm_test.nix {
-                  inherit
-                    pkgs
-                    matrix-xmsg
-                    xmsg
-                    home-manager
-                    ;
-                };
-                hm-user-service-mutant-no-svcexe = import ../nix/hm_test.nix {
-                  inherit
-                    pkgs
-                    matrix-xmsg
-                    xmsg
-                    home-manager
-                    ;
-                  mode = "mutant-no-svcexe";
-                };
-                nixos-own-xmsg = import ../nix/own_xmsg_test.nix {
-                  inherit
-                    pkgs
-                    matrix-xmsg
-                    xmsg
-                    ;
-                };
-              };
             };
         }
       ];

@@ -101,30 +101,37 @@
           '';
         }
       );
+      nixosModules = rec {
+        matrix-xmsg = import ./nix/module.nix { inherit packages; };
+        default = matrix-xmsg;
+      };
+      surface = {
+        inherit packages nixosModules;
+      };
     in
     {
-      inherit packages;
+      inherit packages nixosModules;
 
       homeManagerModules = rec {
         matrix-xmsg = import ./nix/home-manager.nix { inherit packages; };
         default = matrix-xmsg;
       };
 
-      nixosModules = rec {
-        matrix-xmsg = import ./nix/module.nix { inherit packages; };
-        default = matrix-xmsg;
-      };
-
       checks = forAllSystems (
         pkgs:
         nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          nixos-module = import ./nix/test.nix { inherit pkgs self; };
+          nixos-module = import ./nix/test.nix {
+            inherit pkgs;
+            self = surface;
+          };
           nixos-module-mutant-missing = import ./nix/test.nix {
-            inherit pkgs self;
+            inherit pkgs;
+            self = surface;
             mode = "mutant-missing";
           };
           nixos-module-mutant-wrong-token = import ./nix/test.nix {
-            inherit pkgs self;
+            inherit pkgs;
+            self = surface;
             mode = "mutant-wrong-token";
           };
           image =
