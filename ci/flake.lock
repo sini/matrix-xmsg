@@ -745,17 +745,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1791913929,
-        "narHash": "sha256-+OHCJS5x5dl7tEkWc5ljbJ5ptp8AACbxH8c5BciBe9c=",
+        "lastModified": 1792206131,
+        "narHash": "sha256-ur1Kh7jraC0CMDWVIoy9zOykE688fWhQfdDG2UFPYoA=",
         "owner": "sini",
         "repo": "xmsg",
-        "rev": "f27791bd2095be9bdfec02639f01a17b9188cce0",
+        "rev": "6e02b71d85cd859e838dc68fbf722298b7feb4f0",
         "type": "github"
       },
       "original": {
         "owner": "sini",
         "repo": "xmsg",
-        "rev": "f27791bd2095be9bdfec02639f01a17b9188cce0",
+        "rev": "6e02b71d85cd859e838dc68fbf722298b7feb4f0",
         "type": "github"
       }
     }

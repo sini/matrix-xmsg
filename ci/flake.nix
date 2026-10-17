@@ -11,7 +11,7 @@
     # before delivery, `reply` taking `idempotency_key`), which every forward send now carries.
     # The addressing plan's re-verify step moves it.
     xmsg = {
-      url = "github:sini/xmsg/f27791bd2095be9bdfec02639f01a17b9188cce0";
+      url = "github:sini/xmsg/6e02b71d85cd859e838dc68fbf722298b7feb4f0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # The flake modules are evaluated against home-manager at nix-config's pin (its

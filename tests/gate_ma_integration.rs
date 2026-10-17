@@ -297,11 +297,10 @@ impl Node {
             "procStart": live_starttime(pid),
             "messagingSocketPath": inbox.display().to_string(),
         });
-        fs::write(
-            self.sessions.join(format!("{pid}.json")),
-            session.to_string(),
-        )
-        .unwrap();
+        let tmp_path = self.sessions.join(format!(".tmp-{pid}.json"));
+        let dst_path = self.sessions.join(format!("{pid}.json"));
+        fs::write(&tmp_path, session.to_string()).unwrap();
+        fs::rename(&tmp_path, &dst_path).unwrap();
     }
 }
 
