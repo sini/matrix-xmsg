@@ -205,7 +205,7 @@ in
                 ownerMxid = "@owner:local";
                 xmsg = {
                   enable = true;
-                  package = inputs.xmsg.packages.x86_64-linux.default;
+                  package = inputs.xmsg.packages.x86_64-linux.default.overrideAttrs { doCheck = false; };
                 };
               };
             }

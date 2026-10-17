@@ -6,6 +6,7 @@
     # snapshot of the tree (den-hoag-lbtnv D1). So `outputs` below applies `../flake.nix`'s own
     # `outputs` to the `nixpkgs` declared here, line for line as `../flake.nix` declares it.
     nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+    crane.url = "github:ipetkov/crane";
     # The real xmsg the integration oracles run (tests/gate_ma_integration.rs), pinned by
     # revision: xmsg main after its atomic idempotency (the key reserved and the ID minted
     # before delivery, `reply` taking `idempotency_key`), which every forward send now carries.
@@ -26,6 +27,7 @@
     inputs@{
       gen-harness,
       nixpkgs,
+      crane,
       xmsg,
       home-manager,
       ...
@@ -34,7 +36,7 @@
       # The published surface of THIS tree.
       matrix-xmsg = (import ../flake.nix).outputs {
         inherit (inputs) self;
-        inherit nixpkgs;
+        inherit nixpkgs crane;
       };
     in
     gen-harness.lib.mkCi {
@@ -75,11 +77,25 @@
                   pname = "matrix-xmsg-integration";
                   XMSG_BIN = "${xmsg.packages.${system}.default.overrideAttrs { doCheck = false; }}/bin/xmsg";
                   MA_XMSG_REQUIRED = "1";
-                  cargoTestFlags = [
-                    "--test"
-                    "gate_ma_integration"
-                  ];
-                  checkFlags = [ "--include-ignored" ];
+                  doNotPostBuildInstallCargoBinaries = true;
+                  passthru = {
+                    xmsgNoCheck = xmsg.packages.${system}.default.overrideAttrs { doCheck = false; };
+                    pkgNoCheck = matrix-xmsg.packages.${system}.default.overrideAttrs { doCheck = false; };
+                  };
+                  buildPhase = ''
+                    runHook preBuild
+                    runHook postBuild
+                  '';
+                  checkPhase = ''
+                    runHook preCheck
+                    cargoWithProfile test --locked --test gate_ma_integration -- --include-ignored
+                    runHook postCheck
+                  '';
+                  installPhase = ''
+                    runHook preInstall
+                    mkdir -p $out
+                    runHook postInstall
+                  '';
                 };
                 hm-user-service = import ../nix/hm_test.nix {
                   inherit

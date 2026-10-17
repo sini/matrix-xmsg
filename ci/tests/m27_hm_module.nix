@@ -8,6 +8,7 @@ let
     ;
 
   shared = import ../../nix/options.nix;
+  xmsgNoCheck = system: xmsg.packages.${system}.default.overrideAttrs { doCheck = false; };
 
   hmEval =
     system: withXmsg: extra:
@@ -47,7 +48,10 @@ let
               };
             }
             // lib.optionalAttrs withXmsg {
-              programs.xmsg.enable = true;
+              programs.xmsg = {
+                enable = true;
+                package = xmsgNoCheck system;
+              };
             }
           )
           extra
@@ -116,7 +120,7 @@ let
 
   linuxCfg = (hmEval "x86_64-linux" true { }).config;
   linuxExe = lib.getExe matrix-xmsg.packages.x86_64-linux.default;
-  xmsgLinuxExe = lib.getExe xmsg.packages.x86_64-linux.default;
+  xmsgLinuxExe = lib.getExe (xmsgNoCheck "x86_64-linux");
 
   darwinCfg = (hmEval "aarch64-darwin" true { }).config;
   darwinExe = lib.getExe matrix-xmsg.packages.aarch64-darwin.default;

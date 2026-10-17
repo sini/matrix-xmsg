@@ -43,6 +43,9 @@ pkgs.testers.nixosTest {
       # Enable and configure matrix-xmsg
       services.matrix-xmsg = {
         enable = true;
+        package = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs {
+          doCheck = false;
+        };
         homeserverUrl = "http://127.0.0.1:8008";
         botMxid = "@bot:test.local";
         accessTokenFile =

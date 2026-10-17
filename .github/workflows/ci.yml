@@ -6,10 +6,109 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  FAST_CHECKS: >-
+    agents-md-citations
+    ci-plane-coverage
+    ci-self-input
+    default
+    mdformat-plugins
+    root-surface
+    treefmt-tree-root
+  PACKAGE_CHECKS: >-
+    package
+  INTEGRATION_CHECKS: >-
+    integration
+  VM_CHECKS: >-
+    hm-user-service
+    hm-user-service-mutant-no-svcexe
+    nixos-own-xmsg
+
 # One upstream-Nix column, not gen-harness's three-evaluator matrix: this is not a gen library, so
 # evaluator divergence is not what its CI tests.
 jobs:
-  nix:
+  deps:
+    runs-on: ubuntu-latest
+    outputs:
+      vm_checks: ${{ steps.coverage.outputs.vm_checks }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+      - name: Configure Attic substituter
+        env:
+          ATTIC_PUBLIC_KEY: ${{ vars.ATTIC_PUBLIC_KEY }}
+        run: |
+          if [ -z "${ATTIC_PUBLIC_KEY:-}" ]; then
+            echo "ATTIC_PUBLIC_KEY is not set; skipping Attic substituter configuration"
+            exit 0
+          fi
+          sudo mkdir -p /etc/nix
+          {
+            echo "extra-substituters = https://attic.json64.dev/ci"
+            echo "extra-trusted-public-keys = ${ATTIC_PUBLIC_KEY}"
+          } | sudo tee -a /etc/nix/nix.conf >/dev/null
+          if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nix-daemon 2>/dev/null; then
+            sudo systemctl restart nix-daemon
+          fi
+      - name: Assert CI check coverage
+        id: coverage
+        run: |
+          expected=$(nix eval ./ci#checks.x86_64-linux --apply builtins.attrNames --json | jq -S .)
+          read -r -a fast <<< "$FAST_CHECKS"
+          read -r -a pkg <<< "$PACKAGE_CHECKS"
+          read -r -a integ <<< "$INTEGRATION_CHECKS"
+          read -r -a vm <<< "$VM_CHECKS"
+          covered=$(printf '%s\n' "${fast[@]}" "${pkg[@]}" "${integ[@]}" "${vm[@]}" | jq -R . | jq -s 'sort | unique')
+          if [ "$expected" != "$covered" ]; then
+            echo "CI check coverage mismatch!" >&2
+            echo "Flake checks: $expected" >&2
+            echo "Workflow checks: $covered" >&2
+            diff -u <(echo "$expected") <(echo "$covered") >&2 || true
+            exit 1
+          fi
+          echo "All $(echo "$expected" | jq length) checks covered."
+          vm_json=$(printf '%s\n' "${vm[@]}" | jq -R . | jq -sc .)
+          echo "vm_checks=$vm_json" >> "$GITHUB_OUTPUT"
+      - name: ci devShell
+        run: nix eval --raw "./ci#devShells.x86_64-linux.default.drvPath"
+      - name: Fast checks
+        run: |
+          read -r -a fast <<< "$FAST_CHECKS"
+          refs=()
+          for c in "${fast[@]}"; do
+            refs+=("./ci#checks.x86_64-linux.$c")
+          done
+          nix build -L --keep-going --no-link --print-out-paths "${refs[@]}" | tee -a /tmp/attic-paths
+      - name: Build cargoArtifacts and no-check binaries
+        run: |
+          nix build -L --no-link --print-out-paths \
+            .#packages.x86_64-linux.cargoArtifacts \
+            ./ci#checks.x86_64-linux.integration.xmsgNoCheck \
+            ./ci#checks.x86_64-linux.integration.pkgNoCheck \
+            | tee -a /tmp/attic-paths
+      - name: Push to Attic cache
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          if [ -z "${ATTIC_TOKEN:-}" ]; then
+            echo "ATTIC_TOKEN is not set; skipping Attic cache push"
+            exit 0
+          fi
+          if [ ! -s /tmp/attic-paths ]; then
+            echo "No paths to push; skipping Attic cache push"
+            exit 0
+          fi
+          nix shell --inputs-from . nixpkgs#attic-client -c attic login ci https://attic.json64.dev "$ATTIC_TOKEN"
+          nix shell --inputs-from . nixpkgs#attic-client -c xargs -r -a /tmp/attic-paths attic push ci
+
+  package:
+    needs: [deps]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -19,10 +118,157 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           github_access_token: ${{ github.token }}
-      - name: flake checks
-        run: nix flake check ./ci --keep-going
-      - name: ci devShell
-        run: nix eval --raw "./ci#devShells.x86_64-linux.default.drvPath"
+      - name: Configure Attic substituter
+        env:
+          ATTIC_PUBLIC_KEY: ${{ vars.ATTIC_PUBLIC_KEY }}
+        run: |
+          if [ -z "${ATTIC_PUBLIC_KEY:-}" ]; then
+            echo "ATTIC_PUBLIC_KEY is not set; skipping Attic substituter configuration"
+            exit 0
+          fi
+          sudo mkdir -p /etc/nix
+          {
+            echo "extra-substituters = https://attic.json64.dev/ci"
+            echo "extra-trusted-public-keys = ${ATTIC_PUBLIC_KEY}"
+          } | sudo tee -a /etc/nix/nix.conf >/dev/null
+          if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nix-daemon 2>/dev/null; then
+            sudo systemctl restart nix-daemon
+          fi
+      - name: Package check
+        run: |
+          nix build -L --no-link --print-out-paths .#packages.x86_64-linux.cargoArtifacts | tee -a /tmp/attic-paths
+          read -r -a pkg <<< "$PACKAGE_CHECKS"
+          refs=()
+          for c in "${pkg[@]}"; do
+            refs+=("./ci#checks.x86_64-linux.$c")
+          done
+          nix build -L --keep-going --no-link --print-out-paths "${refs[@]}" | tee -a /tmp/attic-paths
+      - name: Push to Attic cache
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          if [ -z "${ATTIC_TOKEN:-}" ]; then
+            echo "ATTIC_TOKEN is not set; skipping Attic cache push"
+            exit 0
+          fi
+          if [ ! -s /tmp/attic-paths ]; then
+            echo "No paths to push; skipping Attic cache push"
+            exit 0
+          fi
+          nix shell --inputs-from . nixpkgs#attic-client -c attic login ci https://attic.json64.dev "$ATTIC_TOKEN"
+          nix shell --inputs-from . nixpkgs#attic-client -c xargs -r -a /tmp/attic-paths attic push ci
+
+  integration:
+    needs: [deps]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+      - name: Configure Attic substituter
+        env:
+          ATTIC_PUBLIC_KEY: ${{ vars.ATTIC_PUBLIC_KEY }}
+        run: |
+          if [ -z "${ATTIC_PUBLIC_KEY:-}" ]; then
+            echo "ATTIC_PUBLIC_KEY is not set; skipping Attic substituter configuration"
+            exit 0
+          fi
+          sudo mkdir -p /etc/nix
+          {
+            echo "extra-substituters = https://attic.json64.dev/ci"
+            echo "extra-trusted-public-keys = ${ATTIC_PUBLIC_KEY}"
+          } | sudo tee -a /etc/nix/nix.conf >/dev/null
+          if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nix-daemon 2>/dev/null; then
+            sudo systemctl restart nix-daemon
+          fi
+      - name: Integration check
+        run: |
+          nix build -L --no-link --print-out-paths \
+            .#packages.x86_64-linux.cargoArtifacts \
+            ./ci#checks.x86_64-linux.integration.xmsgNoCheck \
+            | tee -a /tmp/attic-paths
+          read -r -a integ <<< "$INTEGRATION_CHECKS"
+          refs=()
+          for c in "${integ[@]}"; do
+            refs+=("./ci#checks.x86_64-linux.$c")
+          done
+          nix build -L --keep-going --no-link --print-out-paths "${refs[@]}" | tee -a /tmp/attic-paths
+      - name: Push to Attic cache
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          if [ -z "${ATTIC_TOKEN:-}" ]; then
+            echo "ATTIC_TOKEN is not set; skipping Attic cache push"
+            exit 0
+          fi
+          if [ ! -s /tmp/attic-paths ]; then
+            echo "No paths to push; skipping Attic cache push"
+            exit 0
+          fi
+          nix shell --inputs-from . nixpkgs#attic-client -c attic login ci https://attic.json64.dev "$ATTIC_TOKEN"
+          nix shell --inputs-from . nixpkgs#attic-client -c xargs -r -a /tmp/attic-paths attic push ci
+
+  vm:
+    needs: [deps]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJson(needs.deps.outputs.vm_checks) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+      - name: Configure Attic substituter
+        env:
+          ATTIC_PUBLIC_KEY: ${{ vars.ATTIC_PUBLIC_KEY }}
+        run: |
+          if [ -z "${ATTIC_PUBLIC_KEY:-}" ]; then
+            echo "ATTIC_PUBLIC_KEY is not set; skipping Attic substituter configuration"
+            exit 0
+          fi
+          sudo mkdir -p /etc/nix
+          {
+            echo "extra-substituters = https://attic.json64.dev/ci"
+            echo "extra-trusted-public-keys = ${ATTIC_PUBLIC_KEY}"
+          } | sudo tee -a /etc/nix/nix.conf >/dev/null
+          if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nix-daemon 2>/dev/null; then
+            sudo systemctl restart nix-daemon
+          fi
+      - name: Run VM check (${{ matrix.check }})
+        run: |
+          nix build -L --no-link --print-out-paths \
+            .#packages.x86_64-linux.cargoArtifacts \
+            ./ci#checks.x86_64-linux.integration.xmsgNoCheck \
+            ./ci#checks.x86_64-linux.integration.pkgNoCheck \
+            | tee -a /tmp/attic-paths
+          nix build -L --no-link --print-out-paths "./ci#checks.x86_64-linux.${{ matrix.check }}" | tee -a /tmp/attic-paths
+      - name: Push to Attic cache
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          if [ -z "${ATTIC_TOKEN:-}" ]; then
+            echo "ATTIC_TOKEN is not set; skipping Attic cache push"
+            exit 0
+          fi
+          if [ ! -s /tmp/attic-paths ]; then
+            echo "No paths to push; skipping Attic cache push"
+            exit 0
+          fi
+          nix shell --inputs-from . nixpkgs#attic-client -c attic login ci https://attic.json64.dev "$ATTIC_TOKEN"
+          nix shell --inputs-from . nixpkgs#attic-client -c xargs -r -a /tmp/attic-paths attic push ci
+
   fmt:
     runs-on: ubuntu-latest
     steps:

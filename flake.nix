@@ -1,10 +1,17 @@
 {
   description = "matrix-xmsg: Matrix support bot backed by an expert agent session";
 
-  inputs.nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+  inputs = {
+    nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+    crane.url = "github:ipetkov/crane";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      crane,
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -13,10 +20,10 @@
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      packages = forAllSystems (pkgs: {
-        default = pkgs.rustPlatform.buildRustPackage {
-          pname = "matrix-xmsg";
-          version = "0.1.0";
+      packages = forAllSystems (
+        pkgs:
+        let
+          craneLib = crane.mkLib pkgs;
           src = nixpkgs.lib.cleanSourceWith {
             src = ./.;
             filter =
@@ -35,48 +42,65 @@
                 || nixpkgs.lib.hasSuffix ".nix" base
               );
           };
-          cargoLock.lockFile = ./Cargo.lock;
-          doCheck = true;
-          nativeCheckInputs = [ pkgs.cacert ];
-          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-          meta = {
-            description = "Matrix support bot backed by an expert agent session";
-            mainProgram = "matrix-xmsg";
-            license = nixpkgs.lib.licenses.mit;
+          commonArgs = {
+            pname = "matrix-xmsg";
+            version = "0.1.0";
+            inherit src;
+            strictDeps = true;
+            CARGO_PROFILE = "release";
+            nativeCheckInputs = [ pkgs.cacert ];
+            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
           };
-        };
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        in
+        {
+          inherit cargoArtifacts;
 
-        image = pkgs.dockerTools.buildLayeredImage {
-          name = "ghcr.io/sini/matrix-xmsg";
-          tag = "latest";
-          contents = [
-            pkgs.cacert
-            packages.${pkgs.stdenv.hostPlatform.system}.default
-          ];
-          extraCommands = ''
-            mkdir -p -m 1777 tmp
-            mkdir -p -m 0755 var/lib/matrix-xmsg
-            mkdir -p etc/matrix-xmsg
+          default = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              doCheck = true;
+              meta = {
+                description = "Matrix support bot backed by an expert agent session";
+                mainProgram = "matrix-xmsg";
+                license = nixpkgs.lib.licenses.mit;
+              };
+            }
+          );
+
+          image = pkgs.dockerTools.buildLayeredImage {
+            name = "ghcr.io/sini/matrix-xmsg";
+            tag = "latest";
+            contents = [
+              pkgs.cacert
+              packages.${pkgs.stdenv.hostPlatform.system}.default
+            ];
+            extraCommands = ''
+              mkdir -p -m 1777 tmp
+              mkdir -p -m 0755 var/lib/matrix-xmsg
+              mkdir -p etc/matrix-xmsg
+            '';
+            config = {
+              User = "10001:10001";
+              Entrypoint = [ "${packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/matrix-xmsg" ];
+              Cmd = [
+                "--config"
+                "/etc/matrix-xmsg/config.toml"
+              ];
+              WorkingDir = "/var/lib/matrix-xmsg";
+              Env = [
+                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              ];
+            };
+          };
+
+          matrix-skill = pkgs.runCommand "matrix-skill" { } ''
+            mkdir -p $out
+            cp -r ${./skills/matrix}/. $out/
           '';
-          config = {
-            User = "10001:10001";
-            Entrypoint = [ "${packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/matrix-xmsg" ];
-            Cmd = [
-              "--config"
-              "/etc/matrix-xmsg/config.toml"
-            ];
-            WorkingDir = "/var/lib/matrix-xmsg";
-            Env = [
-              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-            ];
-          };
-        };
-
-        matrix-skill = pkgs.runCommand "matrix-skill" { } ''
-          mkdir -p $out
-          cp -r ${./skills/matrix}/. $out/
-        '';
-      });
+        }
+      );
     in
     {
       inherit packages;
