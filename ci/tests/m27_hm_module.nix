@@ -147,6 +147,7 @@ let
       "!r2:custom.org" = {
         expertRef = "genie";
         screenMentions = false;
+        screenSolicited = false;
       };
     };
     openThreadNodes = [ "sini.bitstream" ];
@@ -154,6 +155,7 @@ let
     guardTimeoutSecs = 99;
     guardRetryBudget = 5;
     screenMentions = false;
+    screenSolicited = false;
     guardFailureMode = "open";
     guardOutageDmWindowSecs = 600;
     historyN = 15;

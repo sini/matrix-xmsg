@@ -62,7 +62,12 @@ fn expert_ref_for_room_tier<'a>(config: &'a Config, room_id: &str, tier: &str) -
 }
 
 fn should_screen_room(config: &Config, room_id: &str, is_solicited: bool) -> bool {
-    is_solicited || route_for(config, room_id).screen_mentions
+    let route = route_for(config, room_id);
+    if is_solicited {
+        route.screen_solicited
+    } else {
+        route.screen_mentions
+    }
 }
 
 fn effective_thread_tier(
@@ -902,7 +907,7 @@ pub async fn handle_incoming_event_with_guard(
     let solicited_opt = store.get_solicited_thread(&thread_root)?;
     let should_screen = should_screen_room(config, &event.room_id, solicited_opt.is_some());
 
-    let (relay_trigger, is_rewritten, is_unscreened, all_trusted_primary) =
+    let (relay_trigger, is_rewritten, is_unscreened, fail_open_warning, all_trusted_primary) =
         match screen_forward_context(
             &trigger_msg,
             room_history,
@@ -940,6 +945,7 @@ pub async fn handle_incoming_event_with_guard(
         mode.clone(),
         is_rewritten,
         is_unscreened,
+        fail_open_warning,
     );
 
     if let Some(solicited) = solicited_opt {
@@ -1058,7 +1064,7 @@ pub async fn handle_incoming_event_with_guard(
             let rebootstrap_mode = ContextMode::Rebootstrap {
                 supersedes: delta_message_id.clone(),
             };
-            let boot_screened = if should_screen && all_trusted_primary {
+            let boot_screened = if all_trusted_primary {
                 screen_forward_context(
                     &trigger_msg,
                     room_history,
@@ -1081,11 +1087,14 @@ pub async fn handle_incoming_event_with_guard(
                     relay_trigger.clone(),
                     is_rewritten,
                     is_unscreened,
+                    fail_open_warning,
                     all_trusted_primary,
                 ))
             };
 
-            if let Some((boot_trigger, boot_rewritten, boot_unscreened, _)) = boot_screened {
+            if let Some((boot_trigger, boot_rewritten, boot_unscreened, boot_fail_open, _)) =
+                boot_screened
+            {
                 let bootstrap_envelope = build_structural_envelope_with_screening(
                     &event.room_id,
                     &thread_root,
@@ -1102,6 +1111,7 @@ pub async fn handle_incoming_event_with_guard(
                     rebootstrap_mode,
                     boot_rewritten,
                     boot_unscreened,
+                    boot_fail_open,
                 );
 
                 let key = forward_key("rebootstrap", &claim_id);
@@ -1762,7 +1772,7 @@ async fn screen_forward_context(
     guard: &dyn GuardClient,
     store: &Store,
     now_secs: i64,
-) -> Result<Result<(EventMessage, bool, bool, bool), BotOutcome>, AppError> {
+) -> Result<Result<(EventMessage, bool, bool, bool, bool), BotOutcome>, AppError> {
     let selected = select_structural_context_messages(
         trigger_msg,
         room_history,
@@ -1784,11 +1794,11 @@ async fn screen_forward_context(
     let all_trusted = config.is_user_trusted(&trigger_msg.sender_mxid)
         && history.iter().all(|l| config.is_user_trusted(&l.sender));
     if all_trusted {
-        return Ok(Ok((trigger_msg.clone(), false, false, true)));
+        return Ok(Ok((trigger_msg.clone(), false, false, false, true)));
     }
 
     if !should_screen {
-        return Ok(Ok((trigger_msg.clone(), false, true, false)));
+        return Ok(Ok((trigger_msg.clone(), false, true, false, false)));
     }
 
     let trigger_tier = compute_sender_tier(
@@ -1822,9 +1832,9 @@ async fn screen_forward_context(
             if verdict.verdict == "rewrite" {
                 let mut rew = trigger_msg.clone();
                 rew.body = verdict.cleaned_text;
-                Ok(Ok((rew, true, false, false)))
+                Ok(Ok((rew, true, false, false, false)))
             } else {
-                Ok(Ok((trigger_msg.clone(), false, false, false)))
+                Ok(Ok((trigger_msg.clone(), false, false, false, false)))
             }
         }
         Err(e) => {
@@ -1867,7 +1877,7 @@ async fn screen_forward_context(
                         );
                         let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
                     }
-                    Ok(Ok((trigger_msg.clone(), false, true, false)))
+                    Ok(Ok((trigger_msg.clone(), false, true, true, false)))
                 }
             }
         }
@@ -1894,26 +1904,6 @@ async fn screen_page_messages(
     store: &Store,
     now_secs: i64,
 ) -> Result<Result<ScreenedPage, BotOutcome>, AppError> {
-    if !should_screen {
-        let lines = page_msgs
-            .iter()
-            .map(|m| {
-                format_context_line_with_screening(
-                    m,
-                    &config.trusted_mxids,
-                    Some(&config.owner_mxid),
-                    None,
-                    Some(false),
-                )
-            })
-            .collect();
-        return Ok(Ok(ScreenedPage {
-            lines,
-            unscreened: true,
-            fail_open_warning: false,
-        }));
-    }
-
     let all_trusted = page_msgs
         .iter()
         .filter(|m| m.sender_mxid != config.bot_mxid)
@@ -1934,6 +1924,26 @@ async fn screen_page_messages(
         return Ok(Ok(ScreenedPage {
             lines,
             unscreened: false,
+            fail_open_warning: false,
+        }));
+    }
+
+    if !should_screen {
+        let lines = page_msgs
+            .iter()
+            .map(|m| {
+                format_context_line_with_screening(
+                    m,
+                    &config.trusted_mxids,
+                    Some(&config.owner_mxid),
+                    None,
+                    Some(false),
+                )
+            })
+            .collect();
+        return Ok(Ok(ScreenedPage {
+            lines,
+            unscreened: true,
             fail_open_warning: false,
         }));
     }

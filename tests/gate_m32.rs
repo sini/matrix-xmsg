@@ -104,6 +104,7 @@ fn test_config() -> Config {
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         screen_mentions: true,
+        screen_solicited: true,
         guard_failure_mode: GuardFailureMode::Closed,
         guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,

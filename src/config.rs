@@ -99,10 +99,6 @@ fn default_session_live_secs() -> u64 {
     3600
 }
 
-fn default_guard_ref() -> String {
-    "genie-guard".to_string()
-}
-
 fn default_guard_timeout_secs() -> u64 {
     150
 }
@@ -112,6 +108,10 @@ fn default_guard_retry_budget() -> usize {
 }
 
 fn default_screen_mentions() -> bool {
+    true
+}
+
+fn default_screen_solicited() -> bool {
     true
 }
 
@@ -157,6 +157,8 @@ pub struct RoomRoute {
     pub expert_refs: Option<ExpertRefs>,
     #[serde(default)]
     pub screen_mentions: Option<bool>,
+    #[serde(default)]
+    pub screen_solicited: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +166,7 @@ pub struct Route<'a> {
     expert_ref: &'a str,
     expert_refs: Option<&'a ExpertRefs>,
     pub screen_mentions: bool,
+    pub screen_solicited: bool,
 }
 
 impl<'a> Route<'a> {
@@ -216,7 +219,7 @@ pub struct Config {
     #[serde(default)]
     pub open_thread_nodes: Vec<String>,
 
-    #[serde(default = "default_guard_ref")]
+    #[serde(default)]
     pub guard_ref: String,
 
     #[serde(default = "default_guard_timeout_secs")]
@@ -227,6 +230,9 @@ pub struct Config {
 
     #[serde(default = "default_screen_mentions")]
     pub screen_mentions: bool,
+
+    #[serde(default = "default_screen_solicited")]
+    pub screen_solicited: bool,
 
     #[serde(default)]
     pub guard_failure_mode: GuardFailureMode,
@@ -347,6 +353,30 @@ impl Config {
             }
         }
 
+        let mentions_on = self.screen_mentions
+            || self
+                .room_routes
+                .values()
+                .any(|r| r.screen_mentions == Some(true));
+        let solicited_on = self.screen_solicited
+            || self
+                .room_routes
+                .values()
+                .any(|r| r.screen_solicited == Some(true));
+        if (mentions_on || solicited_on) && self.guard_ref.trim().is_empty() {
+            let mut active = Vec::new();
+            if mentions_on {
+                active.push("`screen_mentions`");
+            }
+            if solicited_on {
+                active.push("`screen_solicited`");
+            }
+            return Err(AppError::Config(format!(
+                "`guard_ref` must be set when {} is enabled (set `guard_ref` or set both `screen_mentions = false` and `screen_solicited = false`)",
+                active.join(" or ")
+            )));
+        }
+
         Ok(())
     }
 
@@ -388,12 +418,14 @@ impl Config {
                 expert_ref,
                 expert_refs,
                 screen_mentions: rr.screen_mentions.unwrap_or(self.screen_mentions),
+                screen_solicited: rr.screen_solicited.unwrap_or(self.screen_solicited),
             }
         } else {
             Route {
                 expert_ref: &self.expert_ref,
                 expert_refs: self.expert_refs.as_ref(),
                 screen_mentions: self.screen_mentions,
+                screen_solicited: self.screen_solicited,
             }
         }
     }
@@ -468,12 +500,14 @@ mod tests {
             rooms = ["!room:example.org"]
             trusted_mxids = []
             owner_mxid = "@owner:example.org"
+            guard_ref = "genie-guard"
         "#;
         let cfg = Config::from_toml_str_with_env(toml_str, Some("/run/user/1001")).unwrap();
         assert_eq!(cfg.guard_ref, "genie-guard");
         assert_eq!(cfg.guard_timeout_secs, 150);
         assert_eq!(cfg.guard_retry_budget, 3);
         assert!(cfg.screen_mentions);
+        assert!(cfg.screen_solicited);
         assert_eq!(cfg.guard_failure_mode, GuardFailureMode::Closed);
         assert_eq!(cfg.guard_outage_dm_window_secs, 3600);
         assert_eq!(
@@ -492,11 +526,14 @@ mod tests {
             trusted_mxids = []
             owner_mxid = "@owner:example.org"
             screen_mentions = false
+            screen_solicited = false
             guard_failure_mode = "open"
             guard_outage_dm_window_secs = 600
         "#;
-        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let cfg = Config::from_toml_str_with_env(toml_str, Some("/run/user/1001")).unwrap();
         assert!(!cfg.screen_mentions);
+        assert!(!cfg.screen_solicited);
+        assert!(cfg.guard_ref.is_empty());
         assert_eq!(cfg.guard_failure_mode, GuardFailureMode::Open);
         assert_eq!(cfg.guard_outage_dm_window_secs, 600);
     }
@@ -554,6 +591,7 @@ mod tests {
             rooms = ["!room:example.org"]
             trusted_mxids = []
             owner_mxid = "@owner:example.org"
+            guard_ref = "genie-guard"
         "#;
         let cfg = Config::from_toml_str_with_env(toml_str, Some("/run/user/1001")).unwrap();
         let expected_dir = PathBuf::from("/run/user/1001/xmsg");

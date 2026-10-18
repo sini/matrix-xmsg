@@ -237,5 +237,44 @@ in
           requiredBy = [ "matrix-xmsg.service" ];
         };
       };
+
+    test-m30-guard-ref-null-allowed-when-both-switches-off = {
+      expr = evalConfig {
+        xmsgSocket = "/run/xmsg.sock";
+        dynamicUser = false;
+        guardRef = null;
+        screenMentions = false;
+        screenSolicited = false;
+      };
+      expected = [ ];
+    };
+
+    test-m30-guard-ref-null-fails-when-screen-mentions-on = {
+      expr =
+        builtins.elem
+          "services.matrix-xmsg.guardRef must be set when services.matrix-xmsg.screenMentions or services.matrix-xmsg.screenSolicited is enabled (globally or in roomRoutes).\n"
+          (evalConfig {
+            xmsgSocket = "/run/xmsg.sock";
+            dynamicUser = false;
+            guardRef = null;
+            screenMentions = true;
+            screenSolicited = false;
+          });
+      expected = true;
+    };
+
+    test-m30-guard-ref-null-fails-when-screen-solicited-on = {
+      expr =
+        builtins.elem
+          "services.matrix-xmsg.guardRef must be set when services.matrix-xmsg.screenMentions or services.matrix-xmsg.screenSolicited is enabled (globally or in roomRoutes).\n"
+          (evalConfig {
+            xmsgSocket = "/run/xmsg.sock";
+            dynamicUser = false;
+            guardRef = null;
+            screenMentions = false;
+            screenSolicited = true;
+          });
+      expected = true;
+    };
   };
 }

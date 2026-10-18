@@ -165,13 +165,18 @@
                 default = null;
                 description = "Per-room override for screenMentions.";
               };
+              screenSolicited = lib.mkOption {
+                type = lib.types.nullOr lib.types.bool;
+                default = null;
+                description = "Per-room override for screenSolicited.";
+              };
             };
           }
         );
         default = { };
         description = ''
           Per-room routing overrides keyed by Matrix room ID.
-          Unset fields fall back to the global `expertRef`, `expertRefs`, and `screenMentions`.
+          Unset fields fall back to the global `expertRef`, `expertRefs`, `screenMentions`, and `screenSolicited`.
         '';
       };
 
@@ -186,11 +191,12 @@
       };
 
       guardRef = lib.mkOption {
-        type = lib.types.str;
+        type = lib.types.nullOr lib.types.str;
         default = "genie-guard";
         example = "genie-guard@sini.bitstream";
         description = ''
-          The guard service's xmsg address: a bare name, or `name@node`.
+          The guard service's xmsg address: a bare name, `name@node`, or `null` when both
+          `screenMentions` and `screenSolicited` are disabled across all rooms.
           Set `@node` when two guards are in view: a bare name then resolves `ambiguous`
           and every guard check fails.
         '';
@@ -213,7 +219,16 @@
         default = true;
         description = ''
           Whether to screen regular mentions and thread replies through `guardRef` before
-          forwarding to the expert (`solicited` threads opened via `open_thread` are always screened).
+          forwarding to the expert.
+        '';
+      };
+
+      screenSolicited = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Whether to screen messages in `solicited` threads opened via `open_thread` through
+          `guardRef` before relaying to the requesting session.
         '';
       };
 
@@ -352,6 +367,19 @@
           services.matrix-xmsg.roomRoutes keys must all be present in services.matrix-xmsg.rooms.
         '';
       }
+      {
+        assertion =
+          let
+            mentionsOn =
+              cfg.screenMentions || lib.any (r: r.screenMentions == true) (lib.attrValues cfg.roomRoutes);
+            solicitedOn =
+              cfg.screenSolicited || lib.any (r: r.screenSolicited == true) (lib.attrValues cfg.roomRoutes);
+          in
+          !(mentionsOn || solicitedOn) || (cfg.guardRef != null && cfg.guardRef != "");
+        message = ''
+          services.matrix-xmsg.guardRef must be set when services.matrix-xmsg.screenMentions or services.matrix-xmsg.screenSolicited is enabled (globally or in roomRoutes).
+        '';
+      }
     ];
 
   mkConfigAttrs =
@@ -366,10 +394,10 @@
       owner_mxid = cfg.ownerMxid;
       admission = cfg.admission;
       expert_ref = cfg.expertRef;
-      guard_ref = cfg.guardRef;
       guard_timeout_secs = cfg.guardTimeoutSecs;
       guard_retry_budget = cfg.guardRetryBudget;
       screen_mentions = cfg.screenMentions;
+      screen_solicited = cfg.screenSolicited;
       guard_failure_mode = cfg.guardFailureMode;
       guard_outage_dm_window_secs = cfg.guardOutageDmWindowSecs;
       history_n = cfg.historyN;
@@ -388,6 +416,9 @@
       session_live_secs = cfg.sessionLiveSecs;
       inbox_retry_budget = cfg.inboxRetryBudget;
       db_path = toString cfg.dbPath;
+    }
+    // lib.optionalAttrs (cfg.guardRef != null) {
+      guard_ref = cfg.guardRef;
     }
     // lib.optionalAttrs (cfg.xmsgSocket != null) {
       xmsg_socket = toString cfg.xmsgSocket;
@@ -410,6 +441,9 @@
         }
         // lib.optionalAttrs (route.screenMentions != null) {
           screen_mentions = route.screenMentions;
+        }
+        // lib.optionalAttrs (route.screenSolicited != null) {
+          screen_solicited = route.screenSolicited;
         }
       ) cfg.roomRoutes;
     }

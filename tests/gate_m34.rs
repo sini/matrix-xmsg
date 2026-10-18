@@ -37,6 +37,7 @@ fn base_config() -> Config {
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
         screen_mentions: true,
+        screen_solicited: true,
         guard_failure_mode: GuardFailureMode::Closed,
         guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
@@ -142,6 +143,7 @@ async fn oracle_a_two_rooms_routing_and_per_room_screening() {
             expert_ref: Some("genie".to_string()),
             expert_refs: None,
             screen_mentions: Some(false),
+            screen_solicited: None,
         },
     );
 
@@ -348,6 +350,7 @@ async fn oracle_b_per_room_expert_refs_and_screen_only_override() {
         owner_mxid = "@owner:example.org"
         admission = "public"
         xmsg_socket = "/tmp/xmsg"
+        guard_ref = "genie-guard"
         screen_mentions = true
 
         [expert_refs]
@@ -509,6 +512,7 @@ async fn oracle_d_changing_route_on_live_thread_fires_bootstrap_with_supersedes(
             expert_ref: Some("genie-v1".to_string()),
             expert_refs: None,
             screen_mentions: Some(false),
+            screen_solicited: None,
         },
     );
 
@@ -571,6 +575,7 @@ async fn oracle_d_changing_route_on_live_thread_fires_bootstrap_with_supersedes(
             expert_ref: Some("genie-v2".to_string()),
             expert_refs: None,
             screen_mentions: Some(false),
+            screen_solicited: None,
         },
     );
 
