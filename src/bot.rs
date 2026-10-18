@@ -1718,14 +1718,11 @@ fn is_caller_bound_to_forward(
         .and_then(|c| c.session_id.clone())
         .filter(|s| !s.trim().is_empty());
 
-    if cursor_sess.is_some() || fwd_sess.is_some() {
-        let matches_cursor = cursor_sess
-            .as_deref()
-            .is_some_and(|b| caller_matches_bound(delivery, b));
-        let matches_fwd = fwd_sess
-            .as_deref()
-            .is_some_and(|b| caller_matches_bound(delivery, b));
-        return Ok(matches_cursor || matches_fwd);
+    if let Some(ref cs) = cursor_sess {
+        return Ok(caller_matches_bound(delivery, cs));
+    }
+    if let Some(ref fs) = fwd_sess {
+        return Ok(caller_matches_bound(delivery, fs));
     }
 
     if let Some(ref orig) = delivery.origin {
@@ -2389,7 +2386,7 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
         Some(id) => id.to_string(),
         None => {
             let _ = xmsg
-                .reply_message(&delivery.message_id, r#"{"context": "unknown"}"#)
+                .reply_message(&delivery.message_id, r#"{"context":"unknown"}"#)
                 .await;
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::ContextUnknown);
@@ -2400,7 +2397,7 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
         Some(f) => f,
         None => {
             let _ = xmsg
-                .reply_message(&delivery.message_id, r#"{"context": "unknown"}"#)
+                .reply_message(&delivery.message_id, r#"{"context":"unknown"}"#)
                 .await;
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::ContextUnknown);
@@ -2410,7 +2407,7 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
     // §4 rule 3: Session authorization
     if !is_caller_bound_to_forward(delivery, &forward, store)? {
         let _ = xmsg
-            .reply_message(&delivery.message_id, r#"{"context": "unknown"}"#)
+            .reply_message(&delivery.message_id, r#"{"context":"unknown"}"#)
             .await;
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::ContextUnknown);
@@ -2491,6 +2488,20 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                     .max(100);
                 let room_history = matrix.fetch_history(&forward.room_id, fetch_count).await?;
 
+                let trigger_ts_ms: i64 = if let Some(trig_ev) = room_history
+                    .iter()
+                    .find(|m| m.event_id == forward.event_id)
+                {
+                    trig_ev.timestamp_ms
+                } else if let Some(trig_ev) = matrix
+                    .fetch_event(&forward.room_id, &forward.event_id)
+                    .await?
+                {
+                    trig_ev.timestamp_ms
+                } else {
+                    forward.sent_at.saturating_mul(1000)
+                };
+
                 let (prior_slice, ref_ts_ms): (Vec<EventMessage>, i64) =
                     if let Some(pos) = room_history.iter().position(|m| m.event_id == before_id) {
                         let ts = room_history[pos].timestamp_ms;
@@ -2534,10 +2545,11 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                 // §4 rule 4: sender-filtered lines only within sender_window_secs before the trigger
                 if let Some(sender_mxid) = sender_filter {
                     let window_ms = (config.sender_window_secs as i64).saturating_mul(1000);
-                    let cutoff_ts = ref_ts_ms.saturating_sub(window_ms);
+                    let cutoff_ts = trigger_ts_ms.saturating_sub(window_ms);
                     filtered.retain(|m| {
                         m.sender_mxid == sender_mxid
                             && m.timestamp_ms >= cutoff_ts
+                            && m.timestamp_ms <= trigger_ts_ms
                             && m.timestamp_ms <= ref_ts_ms
                     });
                 }

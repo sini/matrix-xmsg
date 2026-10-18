@@ -720,6 +720,13 @@ async fn oracle_3_context_request_forms_and_bounds() {
             thread_root_id: None,
         },
         EventMessage {
+            event_id: "$r_just_after_old".to_string(),
+            sender_mxid: "@bob:example.org".to_string(),
+            timestamp_ms: 510_000, // 10s after $r_old_alice
+            body: "Bob line just after Alice ancient line".to_string(),
+            thread_root_id: None,
+        },
+        EventMessage {
             event_id: "$r1".to_string(),
             sender_mxid: "@alice:example.org".to_string(),
             timestamp_ms: 1_200_000,
@@ -907,9 +914,9 @@ async fn oracle_3_context_request_forms_and_bounds() {
     assert!(rep2.contains("Top-level room line 1"), "{rep2}");
     assert!(rep2.contains("Top-level room line 2"), "{rep2}");
 
-    // Also verify sender window drops $r_old_alice when before is $r2 (1_300_000) and sender_window_secs is 500s:
-    let mut short_win_cfg = config.clone();
-    short_win_cfg.sender_window_secs = 500; // cutoff = 1_300_000 - 500_000 = 800_000 > 500_000 ($r_old_alice)
+    // Also verify sender window is anchored at the trigger ($trig_ctx at 2_000_000, cutoff 1_100_000),
+    // NOT at `before`: with `before` set to $r_just_after_old (510_000, just 10s after $r_old_alice
+    // at 500_000), $r_old_alice is older than the trigger-anchored window and must NOT be returned.
     let req2b = SvcDelivery {
         in_reply_to: Some(fwd_id.to_string()),
         message_id: "01M33CTX2B".to_string(),
@@ -919,7 +926,7 @@ async fn oracle_3_context_request_forms_and_bounds() {
             "context": {
                 "scope": "room",
                 "sender": "@alice:example.org",
-                "before": "$r2",
+                "before": "$r_just_after_old",
                 "limit": 10
             }
         })
@@ -927,23 +934,15 @@ async fn oracle_3_context_request_forms_and_bounds() {
         envelope: String::new(),
     };
     let out2b = handle_inbox_delivery_with_guard(
-        &req2b,
-        &short_win_cfg,
-        &matrix,
-        &store,
-        &xmsg,
-        &guard,
-        &mut inbox,
-        2007,
+        &req2b, &config, &matrix, &store, &xmsg, &guard, &mut inbox, 2007,
     )
     .await
     .unwrap();
     assert_eq!(out2b, BotOutcome::ContextAnswered);
     let rep2b = xmsg.replies.lock().unwrap().last().unwrap().1.clone();
-    assert!(rep2b.contains("Top-level room line 1"), "{rep2b}");
     assert!(
         !rep2b.contains("Alice ancient room line"),
-        "sender-filtered room context must drop lines older than sender_window_secs: {rep2b}"
+        "sender-filtered room context must anchor sender_window_secs at the trigger, not at before: {rep2b}"
     );
 
     // 3. Form 3: scope="event" returns the target event + its m.in_reply_to parent, NEVER the whole thread
@@ -1534,4 +1533,467 @@ async fn oracle_5_context_screening_across_all_m30_modes() {
     .await
     .unwrap();
     assert_eq!(out_fc, BotOutcome::GuardFailed);
+}
+
+// -------------------------------------------------------------------------------------------------
+// Oracle (f): Real `xmsg serve` integration cell:
+// A bound session sends `{"context":{"scope":"room"}}` as a reply to its forward and gets the
+// answer on the reply path; a second session's identical request gets `{"context":"unknown"}`.
+// -------------------------------------------------------------------------------------------------
+#[cfg(target_os = "linux")]
+mod real_xmsg_oracle_f {
+    use super::*;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use matrix_xmsg::bot::handle_incoming_event;
+    use matrix_xmsg::matrix::MatrixClient;
+    use matrix_xmsg::xmsg::{create_xmsg_client, ReconnectingSvcInbox};
+    use serde_json::Value;
+    use tempfile::{tempdir, TempDir};
+
+    const REQUIRED: &str = "MA_XMSG_REQUIRED";
+    const CHILD_ENV: &str = "M33_CHILD";
+    const CHILD_TEST: &str = "real_xmsg_oracle_f::m33_child_entry";
+    const ROOM: &str = "!support:example.org";
+    const ID_BOUND: &str = "e1e1e1e1-0000-4000-8000-0000000000e1";
+    const ID_OTHER: &str = "b2b2b2b2-0000-4000-8000-0000000000b2";
+
+    fn xmsg_bin() -> Option<PathBuf> {
+        match std::env::var_os("XMSG_BIN") {
+            Some(p) => Some(PathBuf::from(p)),
+            None => {
+                assert!(
+                    std::env::var_os(REQUIRED).is_none(),
+                    "XMSG_BIN is unset but {REQUIRED} is set: this run must exercise a real xmsg"
+                );
+                eprintln!("XMSG_BIN unset: skipping oracle_f (set XMSG_BIN and pass --include-ignored)");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn m33_child_entry() {
+        if std::env::var_os(CHILD_ENV).is_none() && std::env::var_os(REQUIRED).is_some() {
+            assert!(
+                std::env::args().any(|a| a == "--include-ignored" || a == "--ignored"),
+                "{REQUIRED} is set but oracle_f is #[ignore]d: pass --include-ignored"
+            );
+        }
+        serve_if_child();
+    }
+
+    fn live_starttime(pid: u32) -> String {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("proc stat");
+        let after = &stat[stat.rfind(')').expect("comm") + 1..];
+        after
+            .split_whitespace()
+            .nth(19)
+            .expect("starttime")
+            .to_string()
+    }
+
+    async fn eventually<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..secs * 20 {
+            if let Some(v) = f() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out after {secs}s waiting for {what}");
+    }
+
+    struct Node {
+        tmp: TempDir,
+        run: PathBuf,
+        sessions: PathBuf,
+        child: Child,
+    }
+
+    impl Node {
+        fn start(bin: &Path, services: &[&str]) -> Node {
+            for _ in 0..5 {
+                if let Some(node) = Node::try_start(bin, services) {
+                    return node;
+                }
+            }
+            panic!("xmsg serve did not start in 5 attempts");
+        }
+
+        fn try_start(bin: &Path, services: &[&str]) -> Option<Node> {
+            let tmp = tempdir().unwrap();
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let run = tmp.path().join("run");
+            let sessions = tmp.path().join("sessions");
+            for d in [&run, &sessions] {
+                fs::create_dir_all(d).unwrap();
+                fs::set_permissions(d, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let exe = std::env::current_exe().unwrap();
+            let mut cmd = Command::new(bin);
+            cmd.env("XDG_RUNTIME_DIR", &run)
+                .arg("serve")
+                .arg("--db-path")
+                .arg(tmp.path().join("xmsg.db"))
+                .arg("--sessions-dir")
+                .arg(&sessions)
+                .arg("--http-sock")
+                .arg(run.join("http.sock"))
+                .arg("--agent-sock")
+                .arg(run.join("agent.sock"))
+                .arg("--register-sock")
+                .arg(run.join("register.sock"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            for name in services {
+                cmd.arg("--svc-exe")
+                    .arg(format!("{name}={}", exe.display()));
+            }
+            let mut child = cmd.spawn().expect("spawn xmsg serve");
+            for _ in 0..400 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return None;
+                }
+                let up = ["http.sock", "agent.sock", "register.sock"]
+                    .iter()
+                    .all(|s| run.join(s).exists());
+                if up {
+                    return Some(Node {
+                        tmp,
+                        run,
+                        sessions,
+                        child,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let _ = child.kill();
+            panic!("xmsg serve never served");
+        }
+
+        fn sock(&self, name: &str) -> PathBuf {
+            self.run.join(name)
+        }
+
+        fn http_recipients(&self) -> String {
+            let mut s = UnixStream::connect(self.sock("http.sock")).expect("http.sock");
+            s.write_all(b"GET /v1/recipients HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        }
+
+        fn instance_file(&self, pid: u32, id: &str, label: &str, inbox: &Path) {
+            let session = json!({
+                "pid": pid,
+                "sessionId": id,
+                "name": label,
+                "cwd": "/w",
+                "status": "idle",
+                "kind": "interactive",
+                "startedAt": 1,
+                "updatedAt": 2,
+                "procStart": live_starttime(pid),
+                "messagingSocketPath": inbox.display().to_string(),
+            });
+            let tmp_path = self.sessions.join(format!(".tmp-{pid}.json"));
+            let dst_path = self.sessions.join(format!("{pid}.json"));
+            fs::write(&tmp_path, session.to_string()).unwrap();
+            fs::rename(&tmp_path, &dst_path).unwrap();
+        }
+    }
+
+    impl Drop for Node {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    struct Fake {
+        dir: TempDir,
+        proc: Child,
+    }
+
+    impl Fake {
+        fn start(spec: Value) -> Fake {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("spec.json"), spec.to_string()).unwrap();
+            let proc = Command::new(std::env::current_exe().unwrap())
+                .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads", "1"])
+                .env(CHILD_ENV, dir.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn child");
+            Fake { dir, proc }
+        }
+
+        fn pid(&self) -> u32 {
+            self.proc.id()
+        }
+
+        async fn ready(&self) {
+            let ready = self.dir.path().join("ready");
+            eventually("a fake to be ready", 20, || ready.exists().then_some(())).await;
+        }
+
+        fn lines(&self, name: &str) -> Vec<Value> {
+            fs::read_to_string(self.dir.path().join(name))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect()
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            let _ = self.proc.kill();
+            let _ = self.proc.wait();
+        }
+    }
+
+    fn append(dir: &Path, name: &str, v: &Value) {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(name))
+            .unwrap();
+        writeln!(f, "{v}").unwrap();
+    }
+
+    fn agent(sock: &str, frame: Value) -> Value {
+        let mut s = UnixStream::connect(sock).unwrap();
+        writeln!(s, "{frame}").unwrap();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn serve_if_child() {
+        let Ok(dir) = std::env::var(CHILD_ENV) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let spec: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("spec.json")).unwrap()).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(spec["inbox"].as_str().unwrap()).unwrap();
+        fs::write(dir.join("ready"), "").unwrap();
+
+        let mut replied_once = false;
+        for stream in listener.incoming() {
+            let mut buf = String::new();
+            stream.unwrap().read_to_string(&mut buf).unwrap();
+            append(&dir, "deliveries.jsonl", &json!({ "line": buf }));
+            if !replied_once {
+                if let Some(reply_text) = spec["reply_once"].as_str() {
+                    if spec["wait_for_go"].as_bool() == Some(true) {
+                        while !dir.join("go").exists() {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                    let key = "message_id=";
+                    let Some(at) = buf.rfind(key) else { continue };
+                    let id: String = buf[at + key.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric())
+                        .collect();
+                    replied_once = true;
+                    let resp = agent(
+                        spec["agent_sock"].as_str().unwrap(),
+                        json!({
+                            "action": "reply",
+                            "message_id": id,
+                            "text": reply_text,
+                        }),
+                    );
+                    append(
+                        &dir,
+                        "replies.jsonl",
+                        &json!({ "forward_id": id, "resp": resp }),
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real xmsg: set XMSG_BIN and pass --include-ignored"]
+    async fn oracle_f_real_xmsg_context_reply_and_session_binding() {
+        let Some(bin) = xmsg_bin() else { return };
+        let node = Node::start(&bin, &["matrix-xmsg", "genie-guard"]);
+
+        let db_dir = tempdir().unwrap();
+        let mut cfg = test_config();
+        cfg.xmsg_socket = node.run.clone();
+        cfg.db_path = db_dir.path().join("bot.db");
+        let config = Arc::new(cfg);
+        let store = Arc::new(Store::new(&config.db_path).unwrap());
+        let matrix = Arc::new(MockMatrixClient::default());
+        matrix.canned_room_history.lock().unwrap().insert(
+            ROOM.to_string(),
+            vec![EventMessage {
+                event_id: "$r_live_1".to_string(),
+                sender_mxid: "@alice:example.org".to_string(),
+                timestamp_ms: 1_900_000,
+                body: "Real xmsg room context line".to_string(),
+                thread_root_id: None,
+            }],
+        );
+
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let inbox = ReconnectingSvcInbox::new(config.xmsg_register_socket(), "matrix-xmsg")
+            .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+        let dyn_matrix: Arc<dyn MatrixClient> = matrix.clone();
+        tokio::spawn(matrix_xmsg::bot::run_inbox_loop(
+            inbox,
+            config.clone(),
+            dyn_matrix,
+            store.clone(),
+            create_xmsg_client(&config),
+            rx,
+        ));
+        eventually("the bot to register on real xmsg", 20, || {
+            node.http_recipients()
+                .contains("\"matrix-xmsg@")
+                .then_some(())
+        })
+        .await;
+
+        let req_json = json!({ "context": { "scope": "room" } }).to_string();
+
+        // Start session `other` (`ID_OTHER`), which receives an initial forward on thread `$trig_f`
+        // and waits for `go` before replying.
+        let other_inbox = node.tmp.path().join("other.sock");
+        let other = Fake::start(json!({
+            "inbox": other_inbox,
+            "agent_sock": node.sock("agent.sock"),
+            "reply_once": req_json,
+            "wait_for_go": true,
+        }));
+        other.ready().await;
+        node.instance_file(other.pid(), ID_OTHER, "claude", &other_inbox);
+
+        let xmsg_client = create_xmsg_client(&config);
+        let ev1 = IncomingMatrixEvent {
+            room_id: ROOM.to_string(),
+            event_id: "$trig_f".to_string(),
+            sender_mxid: "@alice:example.org".to_string(),
+            body: "@genie initial question".to_string(),
+            formatted_body: None,
+            mentions: Some(vec!["@genie:example.org".to_string()]),
+            timestamp_ms: 2_000_000,
+            thread_root_id: None,
+            replaces_event_id: None,
+            in_reply_to_event_id: None,
+            is_falling_back: false,
+        };
+        let out1 = handle_incoming_event(&ev1, &[], &config, &*matrix, &*xmsg_client, &store)
+            .await
+            .unwrap();
+        assert_eq!(out1, BotOutcome::Forwarded);
+        eventually("other session to receive initial forward", 20, || {
+            (!other.lines("deliveries.jsonl").is_empty()).then_some(())
+        })
+        .await;
+
+        // Now `bound` (`ID_BOUND`) takes over the `"claude"` label (`other` stays alive under `"claude-old"`).
+        node.instance_file(other.pid(), ID_OTHER, "claude-old", &other_inbox);
+        let bound_inbox = node.tmp.path().join("bound.sock");
+        let bound = Fake::start(json!({
+            "inbox": bound_inbox,
+            "agent_sock": node.sock("agent.sock"),
+            "reply_once": req_json,
+        }));
+        bound.ready().await;
+        node.instance_file(bound.pid(), ID_BOUND, "claude", &bound_inbox);
+
+        // Follow-up mention in thread `$trig_f` binds the thread to `ID_BOUND`.
+        let ev2 = IncomingMatrixEvent {
+            room_id: ROOM.to_string(),
+            event_id: "$trig_f2".to_string(),
+            sender_mxid: "@alice:example.org".to_string(),
+            body: "@genie please inspect room context".to_string(),
+            formatted_body: None,
+            mentions: Some(vec!["@genie:example.org".to_string()]),
+            timestamp_ms: 2_050_000,
+            thread_root_id: Some("$trig_f".to_string()),
+            replaces_event_id: None,
+            in_reply_to_event_id: None,
+            is_falling_back: false,
+        };
+        let out2 = handle_incoming_event(&ev2, &[], &config, &*matrix, &*xmsg_client, &store)
+            .await
+            .unwrap();
+        assert_eq!(out2, BotOutcome::Forwarded);
+
+        // 1. Bound session (`ID_BOUND`) replies to its forward with `{"context":{"scope":"room"}}`
+        // and receives the `<context kind="channel">` answer on the reply path.
+        // Note: M16 sends a delta followed by a re-bootstrap to `bound`, so the context reply
+        // arrives in `bound`'s deliveries after the forward(s).
+        let deliveries = eventually(
+            "bound session to receive context answer on the reply path",
+            20,
+            || {
+                let d = bound.lines("deliveries.jsonl");
+                d.iter()
+                    .find_map(|entry| {
+                        let raw = entry["line"].as_str()?;
+                        let content = serde_json::from_str::<Value>(raw.trim())
+                            .ok()
+                            .and_then(|v| v["message"]["content"].as_str().map(String::from))
+                            .unwrap_or_else(|| raw.to_string());
+                        content.contains("<context kind=\"channel\"").then_some(content)
+                    })
+            },
+        )
+        .await;
+        assert!(
+            deliveries.contains("Real xmsg room context line"),
+            "bound session must receive room context line on reply path: {deliveries}"
+        );
+        assert!(
+            matrix.sent_notices.lock().unwrap().is_empty(),
+            "context request/answer must stay off Matrix"
+        );
+
+        // 2. Second session (`ID_OTHER`) now sends the identical `{"context":{"scope":"room"}}`
+        // reply to its forward and gets `{"context":"unknown"}` on the reply path.
+        fs::write(other.dir.path().join("go"), "").unwrap();
+
+        let other_deliveries = eventually(
+            "second session to receive {\"context\":\"unknown\"}",
+            20,
+            || {
+                let d = other.lines("deliveries.jsonl");
+                (d.len() >= 2).then_some(d)
+            },
+        )
+        .await;
+        let other_line = other_deliveries[1]["line"].as_str().unwrap_or_default();
+        let other_reply = serde_json::from_str::<Value>(other_line.trim())
+            .ok()
+            .and_then(|v| v["message"]["content"].as_str().map(String::from))
+            .unwrap_or_else(|| other_line.to_string());
+        assert!(
+            other_reply.contains("{\"context\":\"unknown\"}"),
+            "second session's identical context request must get {{\"context\":\"unknown\"}}: {other_reply}"
+        );
+        assert!(
+            !other_reply.contains("Real xmsg room context line"),
+            "second session must never receive room context: {other_reply}"
+        );
+
+        let _ = shutdown.send(());
+    }
 }

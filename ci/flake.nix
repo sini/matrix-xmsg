@@ -91,7 +91,7 @@
                     '';
                     checkPhase = ''
                       runHook preCheck
-                      cargoWithProfile test --locked --test gate_ma_integration -- --include-ignored
+                      cargoWithProfile test --locked --test gate_ma_integration --test gate_m33 -- --include-ignored
                       runHook postCheck
                     '';
                     installPhase = ''
