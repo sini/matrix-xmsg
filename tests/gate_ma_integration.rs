@@ -562,11 +562,18 @@ async fn oracle_1_a_verdict_is_not_an_answer() {
         in_reply_to_event_id: Some(root.clone()),
         ..mention("$line", Some(&root), "SOLICITED-LINE", 2_000_000)
     };
+    let untrusted_ctx = [matrix_xmsg::context::EventMessage {
+        event_id: "$untrusted_ctx".to_string(),
+        sender_mxid: "@public:example.org".to_string(),
+        timestamp_ms: 1_900_000,
+        body: "untrusted thread line".to_string(),
+        thread_root_id: Some(root.clone()),
+    }];
     let guard_client = UnixGuardClient::new(node.sock("agent.sock"), bot.config.guard_timeout_secs);
     let xmsg = create_xmsg_client(&bot.config);
     let outcome = handle_incoming_event_with_guard(
         &line,
-        &[],
+        &untrusted_ctx,
         &bot.config,
         bot.matrix.as_ref(),
         xmsg.as_ref(),

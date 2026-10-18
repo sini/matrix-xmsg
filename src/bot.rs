@@ -821,108 +821,25 @@ pub async fn handle_incoming_event_with_guard(
     // Solicited threads never opt out of screening; normal forwards follow config.screen_mentions.
     let should_screen = solicited_opt.is_some() || config.screen_mentions;
 
-    let (relay_trigger, is_rewritten, is_unscreened) = if should_screen {
-        let selected = select_context_messages(
+    let (relay_trigger, is_rewritten, is_unscreened, all_trusted_primary) =
+        match screen_forward_context(
             &trigger_msg,
             room_history,
-            &config.trusted_mxids,
-            Some(&config.owner_mxid),
-            config.history_n,
-            config.history_byte_cap,
             &mode,
-        );
-        let history: Vec<GuardLine> = selected.to_guard_history(
-            &config.bot_mxid,
-            &config.trusted_mxids,
-            Some(&config.owner_mxid),
-        );
-
-        let trigger_tier = compute_sender_tier(
-            &trigger_msg.sender_mxid,
-            &config.trusted_mxids,
-            Some(&config.owner_mxid),
-        );
-        let content = GuardContent {
-            sender: Some(trigger_msg.sender_mxid.clone()),
-            tier: Some(trigger_tier.to_string()),
-            text: trigger_msg.body.clone(),
+            &event.room_id,
+            &thread_root,
+            should_screen,
+            config,
+            matrix,
+            guard,
+            store,
+            now_secs,
+        )
+        .await?
+        {
+            Ok(res) => res,
+            Err(outcome) => return Ok(outcome),
         };
-
-        let guard_env = GuardEnvelope {
-            source: "message".to_string(),
-            history,
-            content,
-        };
-
-        match guard.check_guard(&config.guard_ref, &guard_env).await {
-            Ok(verdict) => {
-                let _ = store.clear_guard_retries(&trigger_msg.event_id);
-                if verdict.verdict == "reject" {
-                    tracing::info!(
-                        "Guard rejected line in thread {}: {}",
-                        thread_root,
-                        verdict.reason
-                    );
-                    return Ok(BotOutcome::GuardRejected);
-                }
-                if verdict.verdict == "rewrite" {
-                    let mut rew = trigger_msg.clone();
-                    rew.body = verdict.cleaned_text;
-                    (rew, true, false)
-                } else {
-                    (trigger_msg.clone(), false, false)
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Guard-in failure for line {} in thread {}: {}",
-                    trigger_msg.event_id,
-                    thread_root,
-                    e
-                );
-                match config.guard_failure_mode {
-                    GuardFailureMode::Closed => {
-                        let attempts = store.record_guard_retry(
-                            &trigger_msg.event_id,
-                            &event.room_id,
-                            &thread_root,
-                            now_secs,
-                        )?;
-                        if attempts >= config.guard_retry_budget
-                            && !store.has_guard_failure_dm_sent(&trigger_msg.event_id)?
-                        {
-                            let permalink =
-                                format!("https://matrix.to/#/{}/{}", event.room_id, thread_root);
-                            let dm_text = format!(
-                                "[matrix-xmsg] Guard-in failed for line in thread {}",
-                                permalink
-                            );
-                            let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
-                            let _ = store.set_guard_failure_dm_sent(&trigger_msg.event_id);
-                        }
-                        return Ok(BotOutcome::GuardFailed);
-                    }
-                    GuardFailureMode::Open => {
-                        if store.check_and_record_guard_outage_dm(
-                            now_secs,
-                            config.guard_outage_dm_window_secs,
-                        )? {
-                            let permalink =
-                                format!("https://matrix.to/#/{}/{}", event.room_id, thread_root);
-                            let dm_text = format!(
-                                "[matrix-xmsg] Guard-in unavailable (fail-open); forwarding unscreened line in thread {}",
-                                permalink
-                            );
-                            let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
-                        }
-                        (trigger_msg.clone(), false, true)
-                    }
-                }
-            }
-        }
-    } else {
-        (trigger_msg.clone(), false, false)
-    };
 
     let envelope = build_envelope_with_screening(
         &event.room_id,
@@ -1052,36 +969,64 @@ pub async fn handle_incoming_event_with_guard(
         };
 
         if session_changed {
-            let bootstrap_envelope = build_envelope_with_screening(
-                &event.room_id,
-                &thread_root,
-                &relay_trigger,
-                room_history,
-                &config.trusted_mxids,
-                Some(&config.owner_mxid),
-                config.history_n,
-                config.history_byte_cap,
-                is_addressed,
-                ContextMode::Rebootstrap {
-                    supersedes: delta_message_id.clone(),
-                },
-                is_rewritten,
-                is_unscreened,
-            );
-
-            let key = forward_key("rebootstrap", &claim_id);
-            let boot_resp = bounded_send("Rebootstrap to the expert", || {
-                xmsg.send_message_keyed(
-                    target_expert_ref,
-                    &mapped_sender,
-                    &bootstrap_envelope,
-                    &key,
+            let rebootstrap_mode = ContextMode::Rebootstrap {
+                supersedes: delta_message_id.clone(),
+            };
+            let boot_screened = if should_screen && all_trusted_primary {
+                screen_forward_context(
+                    &trigger_msg,
+                    room_history,
+                    &rebootstrap_mode,
+                    &event.room_id,
+                    &thread_root,
+                    should_screen,
+                    config,
+                    matrix,
+                    guard,
+                    store,
+                    now_secs,
                 )
-            })
-            .await?;
+                .await?
+                .ok()
+            } else {
+                Some((
+                    relay_trigger.clone(),
+                    is_rewritten,
+                    is_unscreened,
+                    all_trusted_primary,
+                ))
+            };
 
-            rebootstrap_message_id = Some(boot_resp.message_id);
-            session_id = boot_resp.session_id.or(session_id);
+            if let Some((boot_trigger, boot_rewritten, boot_unscreened, _)) = boot_screened {
+                let bootstrap_envelope = build_envelope_with_screening(
+                    &event.room_id,
+                    &thread_root,
+                    &boot_trigger,
+                    room_history,
+                    &config.trusted_mxids,
+                    Some(&config.owner_mxid),
+                    config.history_n,
+                    config.history_byte_cap,
+                    is_addressed,
+                    rebootstrap_mode,
+                    boot_rewritten,
+                    boot_unscreened,
+                );
+
+                let key = forward_key("rebootstrap", &claim_id);
+                let boot_resp = bounded_send("Rebootstrap to the expert", || {
+                    xmsg.send_message_keyed(
+                        target_expert_ref,
+                        &mapped_sender,
+                        &bootstrap_envelope,
+                        &key,
+                    )
+                })
+                .await?;
+
+                rebootstrap_message_id = Some(boot_resp.message_id);
+                session_id = boot_resp.session_id.or(session_id);
+            }
         }
     }
 
@@ -1597,6 +1542,128 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn screen_forward_context(
+    trigger_msg: &EventMessage,
+    room_history: &[EventMessage],
+    mode: &ContextMode,
+    room_id: &str,
+    thread_root: &str,
+    should_screen: bool,
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    guard: &dyn GuardClient,
+    store: &Store,
+    now_secs: i64,
+) -> Result<Result<(EventMessage, bool, bool, bool), BotOutcome>, AppError> {
+    if !should_screen {
+        return Ok(Ok((trigger_msg.clone(), false, false, false)));
+    }
+
+    let selected = select_context_messages(
+        trigger_msg,
+        room_history,
+        &config.trusted_mxids,
+        Some(&config.owner_mxid),
+        config.history_n,
+        config.history_byte_cap,
+        mode,
+    );
+    let history: Vec<GuardLine> = selected.to_guard_history(
+        &config.bot_mxid,
+        &config.trusted_mxids,
+        Some(&config.owner_mxid),
+    );
+
+    let all_trusted = config.is_user_trusted(&trigger_msg.sender_mxid)
+        && history.iter().all(|l| config.is_user_trusted(&l.sender));
+    if all_trusted {
+        return Ok(Ok((trigger_msg.clone(), false, false, true)));
+    }
+
+    let trigger_tier = compute_sender_tier(
+        &trigger_msg.sender_mxid,
+        &config.trusted_mxids,
+        Some(&config.owner_mxid),
+    );
+    let content = GuardContent {
+        sender: Some(trigger_msg.sender_mxid.clone()),
+        tier: Some(trigger_tier.to_string()),
+        text: trigger_msg.body.clone(),
+    };
+
+    let guard_env = GuardEnvelope {
+        source: "message".to_string(),
+        history,
+        content,
+    };
+
+    match guard.check_guard(&config.guard_ref, &guard_env).await {
+        Ok(verdict) => {
+            let _ = store.clear_guard_retries(&trigger_msg.event_id);
+            if verdict.verdict == "reject" {
+                tracing::info!(
+                    "Guard rejected line in thread {}: {}",
+                    thread_root,
+                    verdict.reason
+                );
+                return Ok(Err(BotOutcome::GuardRejected));
+            }
+            if verdict.verdict == "rewrite" {
+                let mut rew = trigger_msg.clone();
+                rew.body = verdict.cleaned_text;
+                Ok(Ok((rew, true, false, false)))
+            } else {
+                Ok(Ok((trigger_msg.clone(), false, false, false)))
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Guard-in failure for line {} in thread {}: {}",
+                trigger_msg.event_id,
+                thread_root,
+                e
+            );
+            match config.guard_failure_mode {
+                GuardFailureMode::Closed => {
+                    let attempts = store.record_guard_retry(
+                        &trigger_msg.event_id,
+                        room_id,
+                        thread_root,
+                        now_secs,
+                    )?;
+                    if attempts >= config.guard_retry_budget
+                        && !store.has_guard_failure_dm_sent(&trigger_msg.event_id)?
+                    {
+                        let permalink = format!("https://matrix.to/#/{}/{}", room_id, thread_root);
+                        let dm_text = format!(
+                            "[matrix-xmsg] Guard-in failed for line in thread {}",
+                            permalink
+                        );
+                        let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
+                        let _ = store.set_guard_failure_dm_sent(&trigger_msg.event_id);
+                    }
+                    Ok(Err(BotOutcome::GuardFailed))
+                }
+                GuardFailureMode::Open => {
+                    if store.check_and_record_guard_outage_dm(
+                        now_secs,
+                        config.guard_outage_dm_window_secs,
+                    )? {
+                        let permalink = format!("https://matrix.to/#/{}/{}", room_id, thread_root);
+                        let dm_text = format!(
+                            "[matrix-xmsg] Guard-in unavailable (fail-open); forwarding unscreened line in thread {}",
+                            permalink
+                        );
+                        let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
+                    }
+                    Ok(Ok((trigger_msg.clone(), false, true, false)))
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn screen_resync_transcript(
     delivery_message_id: &str,
     room_id: &str,
@@ -1626,6 +1693,22 @@ async fn screen_resync_transcript(
     }
     for m in sel_thread {
         tagged.push((false, m));
+    }
+
+    let all_trusted = tagged
+        .iter()
+        .filter(|(_, m)| m.sender_mxid != config.bot_mxid)
+        .all(|(_, m)| config.is_user_trusted(&m.sender_mxid));
+    if all_trusted {
+        return Ok(Ok(format_resync_transcript(
+            room_id,
+            thread_root_id,
+            background_msgs,
+            thread_history,
+            &config.trusted_mxids,
+            Some(&config.owner_mxid),
+            config.resync_byte_cap,
+        )));
     }
 
     let cap = config.history_byte_cap.max(1);
