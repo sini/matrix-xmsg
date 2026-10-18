@@ -152,6 +152,7 @@ fn test_config() -> Config {
         xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         expert_refs: None,
+        room_routes: std::collections::BTreeMap::new(),
         open_thread_nodes: vec![],
         history_n: 30,
         history_byte_cap: 12288,
@@ -1573,7 +1574,9 @@ mod real_xmsg_oracle_f {
                     std::env::var_os(REQUIRED).is_none(),
                     "XMSG_BIN is unset but {REQUIRED} is set: this run must exercise a real xmsg"
                 );
-                eprintln!("XMSG_BIN unset: skipping oracle_f (set XMSG_BIN and pass --include-ignored)");
+                eprintln!(
+                    "XMSG_BIN unset: skipping oracle_f (set XMSG_BIN and pass --include-ignored)"
+                );
                 None
             }
         }
@@ -1684,8 +1687,10 @@ mod real_xmsg_oracle_f {
 
         fn http_recipients(&self) -> String {
             let mut s = UnixStream::connect(self.sock("http.sock")).expect("http.sock");
-            s.write_all(b"GET /v1/recipients HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .unwrap();
+            s.write_all(
+                b"GET /v1/recipients HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
             let mut out = String::new();
             s.read_to_string(&mut out).unwrap();
             out
@@ -1946,15 +1951,16 @@ mod real_xmsg_oracle_f {
             20,
             || {
                 let d = bound.lines("deliveries.jsonl");
-                d.iter()
-                    .find_map(|entry| {
-                        let raw = entry["line"].as_str()?;
-                        let content = serde_json::from_str::<Value>(raw.trim())
-                            .ok()
-                            .and_then(|v| v["message"]["content"].as_str().map(String::from))
-                            .unwrap_or_else(|| raw.to_string());
-                        content.contains("<context kind=\"channel\"").then_some(content)
-                    })
+                d.iter().find_map(|entry| {
+                    let raw = entry["line"].as_str()?;
+                    let content = serde_json::from_str::<Value>(raw.trim())
+                        .ok()
+                        .and_then(|v| v["message"]["content"].as_str().map(String::from))
+                        .unwrap_or_else(|| raw.to_string());
+                    content
+                        .contains("<context kind=\"channel\"")
+                        .then_some(content)
+                })
             },
         )
         .await;

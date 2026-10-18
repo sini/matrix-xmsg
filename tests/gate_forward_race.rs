@@ -46,6 +46,7 @@ fn config() -> Config {
         xmsg_socket: PathBuf::from("/nonexistent/xmsg"),
         expert_ref: "claude".to_string(),
         expert_refs: None,
+        room_routes: std::collections::BTreeMap::new(),
         open_thread_nodes: vec![],
         history_n: 5,
         history_byte_cap: 1024,

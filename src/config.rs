@@ -1,5 +1,6 @@
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -148,6 +149,46 @@ pub struct ExpertRefs {
     pub trusted: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomRoute {
+    #[serde(default)]
+    pub expert_ref: Option<String>,
+    #[serde(default)]
+    pub expert_refs: Option<ExpertRefs>,
+    #[serde(default)]
+    pub screen_mentions: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Route<'a> {
+    expert_ref: &'a str,
+    expert_refs: Option<&'a ExpertRefs>,
+    pub screen_mentions: bool,
+}
+
+impl<'a> Route<'a> {
+    pub fn ref_for_tier(&self, tier: &str) -> &'a str {
+        if let Some(refs) = self.expert_refs {
+            match tier {
+                "trusted" => &refs.trusted,
+                _ => &refs.public,
+            }
+        } else {
+            self.expert_ref
+        }
+    }
+}
+
+pub fn route_for<'a>(config: &'a Config, room_id: &str) -> Route<'a> {
+    config.route_for(room_id)
+}
+
+fn bare_room_name(room_id_or_alias: &str) -> Option<&str> {
+    room_id_or_alias
+        .strip_prefix('!')
+        .or_else(|| room_id_or_alias.strip_prefix('#'))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub homeserver_url: String,
@@ -168,6 +209,9 @@ pub struct Config {
 
     #[serde(default)]
     pub expert_refs: Option<ExpertRefs>,
+
+    #[serde(default)]
+    pub room_routes: BTreeMap<String, RoomRoute>,
 
     #[serde(default)]
     pub open_thread_nodes: Vec<String>,
@@ -240,13 +284,8 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_toml_str_with_env(content: &str, xdg_var: Option<&str>) -> Result<Self, AppError> {
-        let mut cfg: Self = toml::from_str(content)
-            .map_err(|e| AppError::Config(format!("Failed to parse TOML config: {e}")))?;
-        if cfg.xmsg_socket.as_os_str().is_empty() {
-            cfg.xmsg_socket = socket_dir_for_env(xdg_var)?;
-        }
-        if let Some(ref refs) = cfg.expert_refs {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if let Some(ref refs) = self.expert_refs {
             if refs.public.trim().is_empty() || refs.trusted.trim().is_empty() {
                 return Err(AppError::Config(
                     "`expert_refs.public` and `expert_refs.trusted` must both be non-empty"
@@ -254,6 +293,70 @@ impl Config {
                 ));
             }
         }
+
+        for (key, route) in &self.room_routes {
+            // Refuse a key in `room_routes` that is in `rooms` (or `room_routes`) under another spelling (alias vs id)
+            if let Some(bare_key) = bare_room_name(key) {
+                if let Some(other) = self
+                    .rooms
+                    .iter()
+                    .find(|r| *r != key && bare_room_name(r) == Some(bare_key))
+                {
+                    return Err(AppError::Config(format!(
+                        "`room_routes` key `{key}` is in `rooms` under another spelling (`{other}`; alias vs room id)"
+                    )));
+                }
+                if let Some(other) = self
+                    .room_routes
+                    .keys()
+                    .find(|k| *k != key && bare_room_name(k) == Some(bare_key))
+                {
+                    return Err(AppError::Config(format!(
+                        "`room_routes` has ambiguous alias/id keys `{key}` and `{other}`"
+                    )));
+                }
+            }
+            if (key.starts_with('#') && self.rooms.iter().any(|r| r.starts_with('!')))
+                || (key.starts_with('!') && self.rooms.iter().any(|r| r.starts_with('#')))
+            {
+                return Err(AppError::Config(format!(
+                    "`room_routes` key `{key}` mixes alias (`#`) and room id (`!`) spellings with `rooms`"
+                )));
+            }
+
+            // Refuse a key in `room_routes` that is not in `rooms`
+            if !self.rooms.iter().any(|r| r == key) {
+                return Err(AppError::Config(format!(
+                    "`room_routes` key `{key}` is not in `rooms`"
+                )));
+            }
+
+            if let Some(ref r) = route.expert_ref {
+                if r.trim().is_empty() {
+                    return Err(AppError::Config(format!(
+                        "`room_routes[\"{key}\"].expert_ref` must not be empty"
+                    )));
+                }
+            }
+            if let Some(ref refs) = route.expert_refs {
+                if refs.public.trim().is_empty() || refs.trusted.trim().is_empty() {
+                    return Err(AppError::Config(format!(
+                        "`room_routes[\"{key}\"].expert_refs.public` and `.trusted` must both be non-empty"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn from_toml_str_with_env(content: &str, xdg_var: Option<&str>) -> Result<Self, AppError> {
+        let mut cfg: Self = toml::from_str(content)
+            .map_err(|e| AppError::Config(format!("Failed to parse TOML config: {e}")))?;
+        if cfg.xmsg_socket.as_os_str().is_empty() {
+            cfg.xmsg_socket = socket_dir_for_env(xdg_var)?;
+        }
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -272,14 +375,26 @@ impl Config {
         Self::from_toml_str(&content)
     }
 
-    pub fn expert_ref_for_tier(&self, tier: &str) -> &str {
-        if let Some(ref refs) = self.expert_refs {
-            match tier {
-                "trusted" => &refs.trusted,
-                _ => &refs.public,
+    pub fn route_for(&self, room_id: &str) -> Route<'_> {
+        if let Some(rr) = self.room_routes.get(room_id) {
+            let (expert_ref, expert_refs) = if let Some(ref refs) = rr.expert_refs {
+                (self.expert_ref.as_str(), Some(refs))
+            } else if let Some(ref r) = rr.expert_ref {
+                (r.as_str(), None)
+            } else {
+                (self.expert_ref.as_str(), self.expert_refs.as_ref())
+            };
+            Route {
+                expert_ref,
+                expert_refs,
+                screen_mentions: rr.screen_mentions.unwrap_or(self.screen_mentions),
             }
         } else {
-            &self.expert_ref
+            Route {
+                expert_ref: &self.expert_ref,
+                expert_refs: self.expert_refs.as_ref(),
+                screen_mentions: self.screen_mentions,
+            }
         }
     }
 

@@ -27,6 +27,7 @@ fn test_config() -> Config {
             public: "genie-expert@genie-public.bitstream".to_string(),
             trusted: "genie-expert@genie-trusted.bitstream".to_string(),
         }),
+        room_routes: std::collections::BTreeMap::new(),
         open_thread_nodes: vec!["sini.bitstream".to_string()],
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 150,

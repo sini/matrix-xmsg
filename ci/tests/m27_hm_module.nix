@@ -143,6 +143,12 @@ let
       public = "genie-expert@genie-public.bitstream";
       trusted = "genie-expert@genie-trusted.bitstream";
     };
+    roomRoutes = {
+      "!r2:custom.org" = {
+        expertRef = "genie";
+        screenMentions = false;
+      };
+    };
     openThreadNodes = [ "sini.bitstream" ];
     guardRef = "guard@node";
     guardTimeoutSecs = 99;

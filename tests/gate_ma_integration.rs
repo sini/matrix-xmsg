@@ -263,6 +263,7 @@ impl Node {
             xmsg_socket: self.run.clone(),
             expert_ref: "expert".to_string(),
             expert_refs: None,
+            room_routes: std::collections::BTreeMap::new(),
             open_thread_nodes: vec![],
             history_n: 5,
             history_byte_cap: 4096,

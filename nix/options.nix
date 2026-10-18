@@ -131,6 +131,50 @@
         '';
       };
 
+      roomRoutes = lib.mkOption {
+        type = lib.types.attrsOf (
+          lib.types.submodule {
+            options = {
+              expertRef = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Per-room override for expertRef.";
+              };
+              expertRefs = lib.mkOption {
+                type = lib.types.nullOr (
+                  lib.types.submodule {
+                    options = {
+                      public = lib.mkOption {
+                        type = lib.types.str;
+                        example = "genie-expert@genie-public.bitstream";
+                        description = "Per-room expert xmsg address for public-tier forwards.";
+                      };
+                      trusted = lib.mkOption {
+                        type = lib.types.str;
+                        example = "genie-expert@genie-trusted.bitstream";
+                        description = "Per-room expert xmsg address for trusted-tier forwards.";
+                      };
+                    };
+                  }
+                );
+                default = null;
+                description = "Per-room override for expertRefs (`public` and `trusted`).";
+              };
+              screenMentions = lib.mkOption {
+                type = lib.types.nullOr lib.types.bool;
+                default = null;
+                description = "Per-room override for screenMentions.";
+              };
+            };
+          }
+        );
+        default = { };
+        description = ''
+          Per-room routing overrides keyed by Matrix room ID.
+          Unset fields fall back to the global `expertRef`, `expertRefs`, and `screenMentions`.
+        '';
+      };
+
       openThreadNodes = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
@@ -302,6 +346,12 @@
           Aliases must be resolved to room IDs before configuring matrix-xmsg.
         '';
       }
+      {
+        assertion = lib.all (r: builtins.elem r cfg.rooms) (lib.attrNames cfg.roomRoutes);
+        message = ''
+          services.matrix-xmsg.roomRoutes keys must all be present in services.matrix-xmsg.rooms.
+        '';
+      }
     ];
 
   mkConfigAttrs =
@@ -346,6 +396,22 @@
       expert_refs = {
         inherit (cfg.expertRefs) public trusted;
       };
+    }
+    // lib.optionalAttrs (cfg.roomRoutes != { }) {
+      room_routes = lib.mapAttrs (
+        _: route:
+        lib.optionalAttrs (route.expertRef != null) {
+          expert_ref = route.expertRef;
+        }
+        // lib.optionalAttrs (route.expertRefs != null) {
+          expert_refs = {
+            inherit (route.expertRefs) public trusted;
+          };
+        }
+        // lib.optionalAttrs (route.screenMentions != null) {
+          screen_mentions = route.screenMentions;
+        }
+      ) cfg.roomRoutes;
     }
     // lib.optionalAttrs (cfg.openThreadNodes != [ ]) {
       open_thread_nodes = cfg.openThreadNodes;

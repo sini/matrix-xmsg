@@ -98,6 +98,7 @@ fn test_config() -> Config {
         xmsg_socket: PathBuf::from("/run/user/1000/xmsg"),
         expert_ref: "claude".to_string(),
         expert_refs: None,
+        room_routes: std::collections::BTreeMap::new(),
         open_thread_nodes: vec![],
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,

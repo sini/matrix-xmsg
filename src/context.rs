@@ -583,7 +583,7 @@ fn render_selected_envelope(
     let escaped_trigger_body = escape_xml_blocks(&trigger.body);
 
     let screened_opt = if unscreened { Some(false) } else { None };
-    let request_open_tag = if unscreened {
+    let request_open_tag = if unscreened && trigger_tier == "public" {
         format!("<request screened=\"false\" note=\"{UNSCREENED_WARNING_NOTE}\">")
     } else {
         "<request>".to_string()

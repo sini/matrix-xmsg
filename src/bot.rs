@@ -1,4 +1,4 @@
-use crate::config::{Admission, Config, GuardFailureMode};
+use crate::config::{route_for, Admission, Config, GuardFailureMode};
 use crate::context::{
     build_structural_envelope_with_screening, compute_sender_tier,
     format_context_line_with_screening, format_paged_context_lines, format_paged_resync_lines,
@@ -57,12 +57,12 @@ fn forward_key(purpose: &str, event_id: &str) -> String {
     format!("matrix-xmsg:{purpose}:#{:016x}", h.finish())
 }
 
-fn expert_ref_for_room_tier<'a>(config: &'a Config, _room_id: &str, tier: &str) -> &'a str {
-    config.expert_ref_for_tier(tier)
+fn expert_ref_for_room_tier<'a>(config: &'a Config, room_id: &str, tier: &str) -> &'a str {
+    route_for(config, room_id).ref_for_tier(tier)
 }
 
-fn should_screen_room(config: &Config, _room_id: &str, is_solicited: bool) -> bool {
-    is_solicited || config.screen_mentions
+fn should_screen_room(config: &Config, room_id: &str, is_solicited: bool) -> bool {
+    is_solicited || route_for(config, room_id).screen_mentions
 }
 
 fn effective_thread_tier(
@@ -870,8 +870,18 @@ pub async fn handle_incoming_event_with_guard(
                 .target_ref
                 .as_deref()
                 .is_some_and(|prev_target| prev_target != target_expert_ref);
-            if elapsed >= config.session_live_secs as i64 || target_changed {
+            if elapsed >= config.session_live_secs as i64 {
                 ContextMode::Bootstrap
+            } else if target_changed {
+                if let Some(prev_msg_id) =
+                    store.get_thread_messages(&thread_root)?.into_iter().last()
+                {
+                    ContextMode::Rebootstrap {
+                        supersedes: prev_msg_id,
+                    }
+                } else {
+                    ContextMode::Bootstrap
+                }
             } else {
                 ContextMode::Delta {
                     cursor_event_id: Some(cursor.cursor_event_id.clone()),
@@ -1753,10 +1763,6 @@ async fn screen_forward_context(
     store: &Store,
     now_secs: i64,
 ) -> Result<Result<(EventMessage, bool, bool, bool), BotOutcome>, AppError> {
-    if !should_screen {
-        return Ok(Ok((trigger_msg.clone(), false, false, false)));
-    }
-
     let selected = select_structural_context_messages(
         trigger_msg,
         room_history,
@@ -1779,6 +1785,10 @@ async fn screen_forward_context(
         && history.iter().all(|l| config.is_user_trusted(&l.sender));
     if all_trusted {
         return Ok(Ok((trigger_msg.clone(), false, false, true)));
+    }
+
+    if !should_screen {
+        return Ok(Ok((trigger_msg.clone(), false, true, false)));
     }
 
     let trigger_tier = compute_sender_tier(
@@ -2488,9 +2498,8 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                     .max(100);
                 let room_history = matrix.fetch_history(&forward.room_id, fetch_count).await?;
 
-                let trigger_ts_ms: i64 = if let Some(trig_ev) = room_history
-                    .iter()
-                    .find(|m| m.event_id == forward.event_id)
+                let trigger_ts_ms: i64 = if let Some(trig_ev) =
+                    room_history.iter().find(|m| m.event_id == forward.event_id)
                 {
                     trig_ev.timestamp_ms
                 } else if let Some(trig_ev) = matrix
