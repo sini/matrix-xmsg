@@ -169,7 +169,19 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_forwarded_messages_timeout ON forwarded_messages(addressed, reply_count, timeout_dm_sent, sent_at);
             CREATE TABLE IF NOT EXISTS thread_resyncs (
                 thread_root_id TEXT PRIMARY KEY,
-                last_resync_at INTEGER NOT NULL
+                last_resync_at INTEGER NOT NULL,
+                last_offset INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS context_rate_limits (
+                thread_root_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_rate_limits_thread ON context_rate_limits(thread_root_id, timestamp);
+            CREATE TABLE IF NOT EXISTS event_reply_targets (
+                room_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                reply_to_event_id TEXT NOT NULL,
+                PRIMARY KEY (room_id, event_id)
             );
             CREATE TABLE IF NOT EXISTS solicited_threads (
                 root_event_id TEXT PRIMARY KEY,
@@ -218,6 +230,10 @@ impl Store {
         );
         let _ = conn.execute(
             "ALTER TABLE bot_reply_events ADD COLUMN answered_mxid TEXT NOT NULL DEFAULT '';",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE thread_resyncs ADD COLUMN last_offset INTEGER NOT NULL DEFAULT 0;",
             [],
         );
 
@@ -839,15 +855,42 @@ impl Store {
         now: i64,
         window_secs: u64,
     ) -> Result<Result<(), u64>, AppError> {
+        self.check_and_record_thread_resync_page(thread_root_id, 0, now, window_secs)
+    }
+
+    /// Checks if a paged thread resync is allowed under the rate limit (at most one resync sequence per `window_secs`).
+    /// Advancing `offset > last_offset` within an active resync sequence is permitted and updates `last_offset`.
+    /// Starting a new resync (`offset == 0`) or repeating an offset (`offset <= last_offset`) within `window_secs` is throttled.
+    pub fn check_and_record_thread_resync_page(
+        &self,
+        thread_root_id: &str,
+        offset: usize,
+        now: i64,
+        window_secs: u64,
+    ) -> Result<Result<(), u64>, AppError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT last_resync_at FROM thread_resyncs WHERE thread_root_id = ?1")
+            .prepare(
+                "SELECT last_resync_at, last_offset FROM thread_resyncs WHERE thread_root_id = ?1",
+            )
             .map_err(|e| AppError::Store(e.to_string()))?;
-        let res = stmt.query_row(params![thread_root_id], |row| row.get(0));
+        let res = stmt.query_row(params![thread_root_id], |row| {
+            let last_at: i64 = row.get(0)?;
+            let last_off: i64 = row.get(1)?;
+            Ok((last_at, last_off.max(0) as usize))
+        });
         match res {
-            Ok(last_resync_at) => {
+            Ok((last_resync_at, last_offset)) => {
                 let elapsed = now.saturating_sub(last_resync_at);
                 if elapsed < window_secs as i64 {
+                    if offset > last_offset {
+                        conn.execute(
+                            "UPDATE thread_resyncs SET last_offset = ?2 WHERE thread_root_id = ?1",
+                            params![thread_root_id, offset as i64],
+                        )
+                        .map_err(|e| AppError::Store(e.to_string()))?;
+                        return Ok(Ok(()));
+                    }
                     let retry_after = (window_secs as i64 - elapsed) as u64;
                     return Ok(Err(retry_after));
                 }
@@ -857,12 +900,97 @@ impl Store {
         }
 
         conn.execute(
-            "INSERT INTO thread_resyncs (thread_root_id, last_resync_at) VALUES (?1, ?2)
-             ON CONFLICT(thread_root_id) DO UPDATE SET last_resync_at = ?2",
-            params![thread_root_id, now],
+            "INSERT INTO thread_resyncs (thread_root_id, last_resync_at, last_offset) VALUES (?1, ?2, ?3)
+             ON CONFLICT(thread_root_id) DO UPDATE SET last_resync_at = ?2, last_offset = ?3",
+            params![thread_root_id, now, offset as i64],
         )
         .map_err(|e| AppError::Store(e.to_string()))?;
         Ok(Ok(()))
+    }
+
+    /// Checks if a thread context request is allowed under the sliding window rate limit
+    /// (`max_count` per `window_secs` per `thread_root_id`).
+    /// Returns `Ok(Ok(()))` if allowed, or `Ok(Err(retry_after_secs))` if throttled.
+    pub fn check_and_record_context_rate_limit(
+        &self,
+        thread_root_id: &str,
+        max_count: usize,
+        window_secs: u64,
+        now: i64,
+    ) -> Result<Result<(), u64>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = now.saturating_sub(window_secs as i64);
+
+        let _ = conn.execute(
+            "DELETE FROM context_rate_limits WHERE thread_root_id = ?1 AND timestamp <= ?2",
+            params![thread_root_id, cutoff],
+        );
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT timestamp FROM context_rate_limits
+                 WHERE thread_root_id = ?1 AND timestamp > ?2
+                 ORDER BY timestamp ASC",
+            )
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![thread_root_id, cutoff], |row| row.get::<_, i64>(0))
+            .map_err(|e| AppError::Store(e.to_string()))?;
+
+        let mut timestamps = Vec::new();
+        for r in rows {
+            timestamps.push(r.map_err(|e| AppError::Store(e.to_string()))?);
+        }
+
+        if timestamps.len() >= max_count {
+            let oldest = timestamps.first().copied().unwrap_or(now);
+            let retry_after = ((oldest + window_secs as i64).saturating_sub(now)).max(1) as u64;
+            return Ok(Err(retry_after));
+        }
+
+        conn.execute(
+            "INSERT INTO context_rate_limits (thread_root_id, timestamp) VALUES (?1, ?2)",
+            params![thread_root_id, now],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+
+        Ok(Ok(()))
+    }
+
+    /// Records that `event_id` in `room_id` is a reply (`m.in_reply_to`) to `reply_to_event_id`.
+    pub fn record_event_reply_target(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        reply_to_event_id: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO event_reply_targets (room_id, event_id, reply_to_event_id)
+             VALUES (?1, ?2, ?3)",
+            params![room_id, event_id, reply_to_event_id],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Retrieves the replied-to event ID for `event_id` in `room_id`, if recorded.
+    pub fn get_event_reply_target(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT reply_to_event_id FROM event_reply_targets WHERE room_id = ?1 AND event_id = ?2",
+            )
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        match stmt.query_row(params![room_id, event_id], |row| row.get(0)) {
+            Ok(target) => Ok(Some(target)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
     }
 
     /// Returns the count of rows across all tables in the store.
@@ -1659,11 +1787,7 @@ mod tests {
         assert!(nested_dir.exists());
         assert!(db_path.exists());
 
-        let dir_mode = std::fs::metadata(&nested_dir)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let dir_mode = std::fs::metadata(&nested_dir).unwrap().permissions().mode() & 0o777;
         let db_mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(db_mode, 0o600);

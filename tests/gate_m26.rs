@@ -108,6 +108,12 @@ fn test_config() -> Config {
         history_n: 10,
         history_byte_cap: 12 * 1024,
         resync_byte_cap: 65536,
+        resync_page_bytes: 8192,
+        context_max_lines: 20,
+        context_max_bytes: 8192,
+        sender_window_secs: 900,
+        context_rate_limit_count: 6,
+        context_rate_limit_window_secs: 600,
         rate_limit_count: 20,
         rate_limit_window_secs: 600,
         size_cap_bytes: 2000,
@@ -662,14 +668,14 @@ async fn oracle_7_fail_open_owner_notice_rate_limited_to_one_dm_per_outage_windo
 #[tokio::test]
 async fn oracle_8_one_guard_call_per_forward_matching_context_lines_and_resync_screening() {
     let mut config = test_config();
-    config.history_n = 2; // Window caps channel and thread to last 2 lines each
+    config.history_n = 4; // Window caps thread to last 4 lines ($t_root dropped)
     let matrix = MockMatrixClient::default();
     let store = Store::new_in_memory().unwrap();
     let xmsg = MockXmsgClient::default();
     let guard = MockGuardClient::new();
 
-    // Room history before thread root $t_root: 3 channel messages (oldest $c1 should be dropped by history_n=2)
-    // Thread history on $t_root: root $t_root, bot reply $t_bot (excluded from guard), user reply $t_u1, and trigger $t_trig
+    // Room history before thread root $t_root ($c1_dropped is outside thread)
+    // Thread history on $t_root: root $t_root (dropped by history_n=4), $c2_kept, $c3_kept, bot reply $t_bot (excluded from guard), user reply $t_u1, and trigger $t_trig
     let room_history = vec![
         EventMessage {
             event_id: "$c1_dropped".to_string(),
@@ -679,25 +685,25 @@ async fn oracle_8_one_guard_call_per_forward_matching_context_lines_and_resync_s
             thread_root_id: None,
         },
         EventMessage {
+            event_id: "$t_root".to_string(),
+            sender_mxid: "@alice:example.org".to_string(),
+            timestamp_ms: 905_000,
+            body: "Thread root question".to_string(),
+            thread_root_id: None,
+        },
+        EventMessage {
             event_id: "$c2_kept".to_string(),
             sender_mxid: "@alice:example.org".to_string(),
             timestamp_ms: 910_000,
             body: "Kept channel msg 2".to_string(),
-            thread_root_id: None,
+            thread_root_id: Some("$t_root".to_string()),
         },
         EventMessage {
             event_id: "$c3_kept".to_string(),
             sender_mxid: "@public:example.org".to_string(),
             timestamp_ms: 920_000,
             body: "Kept channel msg 3".to_string(),
-            thread_root_id: None,
-        },
-        EventMessage {
-            event_id: "$t_root".to_string(),
-            sender_mxid: "@alice:example.org".to_string(),
-            timestamp_ms: 930_000,
-            body: "Thread root question".to_string(),
-            thread_root_id: None,
+            thread_root_id: Some("$t_root".to_string()),
         },
         EventMessage {
             event_id: "$t_bot".to_string(),

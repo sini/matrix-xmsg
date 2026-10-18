@@ -103,6 +103,12 @@ fn test_config(homeserver_url: &str) -> Config {
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
+        resync_page_bytes: 8192,
+        context_max_lines: 20,
+        context_max_bytes: 8192,
+        sender_window_secs: 900,
+        context_rate_limit_count: 6,
+        context_rate_limit_window_secs: 600,
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
@@ -202,6 +208,11 @@ async fn test_sdk_full_sync_and_threaded_reply_loop() {
                                     "body": "Hello @genie:example.org, can you explain the cluster architecture?",
                                     "m.mentions": {
                                         "user_ids": ["@genie:example.org"]
+                                    },
+                                    "m.relates_to": {
+                                        "m.in_reply_to": {
+                                            "event_id": "$hist_001"
+                                        }
                                     }
                                 },
                                 "event_id": trigger_event_id,

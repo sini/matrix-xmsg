@@ -81,6 +81,12 @@ fn test_config() -> Config {
         history_n: 5,
         history_byte_cap: 1024,
         resync_byte_cap: 65536,
+        resync_page_bytes: 8192,
+        context_max_lines: 20,
+        context_max_bytes: 8192,
+        sender_window_secs: 900,
+        context_rate_limit_count: 6,
+        context_rate_limit_window_secs: 600,
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
@@ -221,7 +227,7 @@ async fn test_allowlisted_mention_triggers_and_replies_in_thread() {
         timestamp_ms: 1728259260000,
         thread_root_id: None,
         replaces_event_id: None,
-        in_reply_to_event_id: None,
+        in_reply_to_event_id: Some("$ev_hist1".to_string()),
         is_falling_back: false,
     };
 

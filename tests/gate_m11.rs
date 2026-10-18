@@ -71,6 +71,12 @@ fn test_config() -> Config {
         answer_timeout_secs: 10,
         session_live_secs: 3600,
         resync_byte_cap: 65536,
+        resync_page_bytes: 8192,
+        context_max_lines: 20,
+        context_max_bytes: 8192,
+        sender_window_secs: 900,
+        context_rate_limit_count: 6,
+        context_rate_limit_window_secs: 600,
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
@@ -148,13 +154,11 @@ async fn oracle_1_first_mention_in_existing_thread_bootstraps_with_room_and_thre
     assert_eq!(payloads.len(), 1);
     let envelope = &payloads[0].2;
 
-    // Room background block must be present
+    // M33 §2: Thread bootstrap carries the thread block and omits room background
     assert!(
-        envelope.contains("<context kind=\"channel\" role=\"background\" context=\"bootstrap\""),
-        "Bootstrap in thread must carry room background block, got:\n{envelope}"
+        !envelope.contains("role=\"background\""),
+        "M33 thread bootstrap must omit room background block, got:\n{envelope}"
     );
-    assert!(envelope.contains("Room message 1 before thread"));
-    assert!(envelope.contains("Room message 2 before thread"));
 
     // Thread block must be present
     assert!(
@@ -357,16 +361,19 @@ async fn oracle_3_forward_after_session_live_secs_rebootstraps() {
     assert_eq!(payloads.len(), 2);
     let envelope2 = &payloads[1].2;
 
-    // After quiet >= session_live_secs, must re-bootstrap!
+    // After quiet >= session_live_secs, must re-bootstrap with pre-cursor thread root!
     assert!(
         envelope2.contains("context=\"bootstrap\""),
         "Forward after session_live_secs must re-bootstrap, got:\n{envelope2}"
     );
     assert!(
-        envelope2.contains("role=\"background\""),
-        "Re-bootstrap must include room background block, got:\n{envelope2}"
+        envelope2.contains("Thread root start"),
+        "Re-bootstrap must re-include pre-cursor thread root, got:\n{envelope2}"
     );
-    assert!(envelope2.contains("Room message before thread"));
+    assert!(
+        !envelope2.contains("role=\"background\""),
+        "M33 thread re-bootstrap must omit room background block, got:\n{envelope2}"
+    );
 }
 
 // ---------------------------------------------------------------------------

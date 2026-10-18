@@ -212,6 +212,42 @@
         description = "Maximum byte budget for thread resync transcripts.";
       };
 
+      resyncPageBytes = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 8192;
+        description = "Maximum byte size per page for thread resync responses.";
+      };
+
+      contextMaxLines = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 20;
+        description = "Maximum number of lines returned per room context request.";
+      };
+
+      contextMaxBytes = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 8192;
+        description = "Maximum byte size per page for context request responses.";
+      };
+
+      senderWindowSecs = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 900;
+        description = "Time window in seconds before a trigger within which a sender's own top-level lines are attached or queried.";
+      };
+
+      contextRateLimitCount = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 6;
+        description = "Maximum context requests allowed per rate limit window per thread.";
+      };
+
+      contextRateLimitWindowSecs = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 600;
+        description = "Sliding rate limit window in seconds for context requests per thread.";
+      };
+
       rateLimitCount = lib.mkOption {
         type = lib.types.ints.unsigned;
         default = 10;
@@ -289,6 +325,12 @@
       history_n = cfg.historyN;
       history_byte_cap = cfg.historyByteCap;
       resync_byte_cap = cfg.resyncByteCap;
+      resync_page_bytes = cfg.resyncPageBytes;
+      context_max_lines = cfg.contextMaxLines;
+      context_max_bytes = cfg.contextMaxBytes;
+      sender_window_secs = cfg.senderWindowSecs;
+      context_rate_limit_count = cfg.contextRateLimitCount;
+      context_rate_limit_window_secs = cfg.contextRateLimitWindowSecs;
       rate_limit_count = cfg.rateLimitCount;
       rate_limit_window_secs = cfg.rateLimitWindowSecs;
       size_cap_bytes = cfg.sizeCapBytes;

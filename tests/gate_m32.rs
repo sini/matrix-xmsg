@@ -109,6 +109,12 @@ fn test_config() -> Config {
         history_n: 10,
         history_byte_cap: 12 * 1024,
         resync_byte_cap: 65536,
+        resync_page_bytes: 8192,
+        context_max_lines: 20,
+        context_max_bytes: 8192,
+        sender_window_secs: 900,
+        context_rate_limit_count: 6,
+        context_rate_limit_window_secs: 600,
         rate_limit_count: 50,
         rate_limit_window_secs: 600,
         size_cap_bytes: 2000,
@@ -524,22 +530,24 @@ async fn oracle_b_trusted_trigger_with_one_untrusted_history_line_screens_full_e
     let xmsg = MockXmsgClient::default();
     let guard = MockGuardClient::new();
 
-    let mixed_channel_history = vec![
-        EventMessage {
-            event_id: "$bg_trusted_1".to_string(),
-            sender_mxid: "@owner:example.org".to_string(),
-            timestamp_ms: 900_000,
-            body: "Owner trusted line".to_string(),
-            thread_root_id: None,
-        },
-        EventMessage {
-            event_id: "$bg_untrusted_1".to_string(),
-            sender_mxid: "@public:example.org".to_string(),
-            timestamp_ms: 910_000,
-            body: "Untrusted community line".to_string(),
-            thread_root_id: None,
-        },
-    ];
+    let mixed_thread_history = |root_id: &str| {
+        vec![
+            EventMessage {
+                event_id: format!("$bg_trusted_{root_id}"),
+                sender_mxid: "@owner:example.org".to_string(),
+                timestamp_ms: 900_000,
+                body: "Owner trusted line".to_string(),
+                thread_root_id: Some(root_id.to_string()),
+            },
+            EventMessage {
+                event_id: format!("$bg_untrusted_{root_id}"),
+                sender_mxid: "@public:example.org".to_string(),
+                timestamp_ms: 910_000,
+                body: "Untrusted community line".to_string(),
+                thread_root_id: Some(root_id.to_string()),
+            },
+        ]
+    };
 
     // Helper closure to assert the latest single guard call carries both trusted and untrusted lines
     let assert_full_guard_call =
@@ -561,20 +569,20 @@ async fn oracle_b_trusted_trigger_with_one_untrusted_history_line_screens_full_e
             }
         };
 
-    // 1. Mention path (trusted trigger + 1 trusted history + 1 untrusted history)
+    // 1. Mention path (trusted trigger in thread + 1 trusted history + 1 untrusted history)
     let ev_mention = make_event(
         "$ev_b_mention",
         "@alice:example.org",
         "@genie trusted mention with mixed history",
         true,
-        None,
-        None,
+        Some("$root_mention_b"),
+        Some("$root_mention_b"),
         None,
         1000,
     );
     let out = handle_incoming_event_with_guard(
         &ev_mention,
-        &mixed_channel_history,
+        &mixed_thread_history("$root_mention_b"),
         &config,
         &matrix,
         &xmsg,
@@ -595,7 +603,7 @@ async fn oracle_b_trusted_trigger_with_one_untrusted_history_line_screens_full_e
     store
         .record_bot_message("$bot_msg_b", "$root_reply_b", 1000)
         .unwrap();
-    let mut reply_history = mixed_channel_history.clone();
+    let mut reply_history = mixed_thread_history("$root_reply_b");
     reply_history.push(EventMessage {
         event_id: "$root_reply_b".to_string(),
         sender_mxid: "@trusted:example.org".to_string(),
@@ -644,21 +652,21 @@ async fn oracle_b_trusted_trigger_with_one_untrusted_history_line_screens_full_e
     );
 
     // 3. Edit path (editing an unrelayed message that did not originally mention the bot)
-    let mut edit_history = mixed_channel_history.clone();
+    let mut edit_history = mixed_thread_history("$root_edit_b");
     edit_history.push(EventMessage {
         event_id: "$orig_unrelayed_b".to_string(),
         sender_mxid: "@alice:example.org".to_string(),
         timestamp_ms: 1_008_000,
         body: "trusted question before adding mention".to_string(),
-        thread_root_id: None,
+        thread_root_id: Some("$root_edit_b".to_string()),
     });
     let ev_edit = make_event(
         "$ev_b_edit",
         "@alice:example.org",
         "@genie edited trusted mention with mixed history",
         true,
-        None,
-        None,
+        Some("$root_edit_b"),
+        Some("$root_edit_b"),
         Some("$orig_unrelayed_b"),
         1010,
     );
@@ -685,7 +693,7 @@ async fn oracle_b_trusted_trigger_with_one_untrusted_history_line_screens_full_e
     store
         .record_bot_message("$bot_eng_b", "$root_eng_b", 1010)
         .unwrap();
-    let mut eng_history = mixed_channel_history.clone();
+    let mut eng_history = mixed_thread_history("$root_eng_b");
     eng_history.push(EventMessage {
         event_id: "$root_eng_b".to_string(),
         sender_mxid: "@alice:example.org".to_string(),
@@ -837,7 +845,7 @@ async fn oracle_b_trusted_trigger_with_one_untrusted_history_line_screens_full_e
     store
         .record_bot_message("$root_sol_b", "$root_sol_b", 1000)
         .unwrap();
-    let mut sol_history = mixed_channel_history.clone();
+    let mut sol_history = mixed_thread_history("$root_sol_b");
     sol_history.push(EventMessage {
         event_id: "$root_sol_b".to_string(),
         sender_mxid: "@genie:example.org".to_string(),
@@ -876,6 +884,13 @@ async fn oracle_b_trusted_trigger_with_one_untrusted_history_line_screens_full_e
 
     // 8. Resync with trusted + 1 untrusted line
     let resync_thread_msgs = vec![
+        EventMessage {
+            event_id: "$bg_trusted_1".to_string(),
+            sender_mxid: "@owner:example.org".to_string(),
+            timestamp_ms: 900_000,
+            body: "Owner trusted line".to_string(),
+            thread_root_id: Some("$root_eng_b".to_string()),
+        },
         EventMessage {
             event_id: "$root_eng_b".to_string(),
             sender_mxid: "@alice:example.org".to_string(),
@@ -1135,7 +1150,7 @@ async fn oracle_d_trust_keyed_by_raw_mxid_never_display_name() {
         "@alice:example.org",
         "@genie real alice with spoofed alice in history",
         true,
-        None,
+        Some("$bg_spoof_hist"),
         None,
         None,
         1005,

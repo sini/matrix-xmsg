@@ -114,6 +114,12 @@ fn test_config() -> Config {
         answer_timeout_secs: 10,
         session_live_secs: 3600,
         resync_byte_cap: 65536,
+        resync_page_bytes: 8192,
+        context_max_lines: 20,
+        context_max_bytes: 8192,
+        sender_window_secs: 900,
+        context_rate_limit_count: 6,
+        context_rate_limit_window_secs: 600,
         guard_ref: "genie-guard".to_string(),
         guard_timeout_secs: 30,
         guard_retry_budget: 3,
@@ -242,9 +248,10 @@ async fn oracle_1_resync_reply_produces_transcript_reply_and_nothing_in_room() {
         transcript.contains(r#"context="bootstrap""#),
         "Transcript must carry context=\"bootstrap\""
     );
+    // M33 §3.1: Resync is engaged thread only (never room-wide background)
     assert!(
-        transcript.contains(r#"role="background""#),
-        "Transcript must carry background block"
+        !transcript.contains(r#"role="background""#),
+        "M33 resync must not carry room background block"
     );
     assert!(
         transcript.contains(r#"role="thread""#),
@@ -264,8 +271,8 @@ async fn oracle_1_resync_reply_produces_transcript_reply_and_nothing_in_room() {
         "Transcript must contain reply 2"
     );
     assert!(
-        transcript.contains("earlier room message"),
-        "Transcript must contain room background"
+        !transcript.contains("earlier room message"),
+        "M33 resync transcript must exclude room background"
     );
 
     // Assert: delivery was acknowledged
@@ -357,14 +364,13 @@ async fn oracle_2_thread_longer_than_history_n_returned_in_full_paged() {
 
 // ---------------------------------------------------------------------------
 // Oracle 3:
-// over resync_byte_cap, background lines go first and envelope says truncated.
-// Mutant: drop thread lines first -> RED.
+// over resync_byte_cap, background lines are excluded and thread pages with truncated="true".
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn oracle_3_over_byte_cap_background_lines_dropped_first_and_envelope_truncated() {
     let mut config = test_config();
-    // Set a restrictive byte cap: fits the envelope + thread lines, but not room background
-    config.resync_byte_cap = 900;
+    // Set a restrictive byte cap: fits root + rep1 + rep2 (~385 bytes), but truncates before rep3
+    config.resync_byte_cap = 400;
 
     let matrix = MockMatrixClient::default();
     let store = Store::new_in_memory().unwrap();
@@ -382,6 +388,12 @@ async fn oracle_3_over_byte_cap_background_lines_dropped_first_and_envelope_trun
         Some("$root_3"),
         "important thread response beta",
         3020,
+    );
+    let rep3 = make_event_msg(
+        "$rep_3_3",
+        Some("$root_3"),
+        "trailing thread response gamma pushed to next page by byte cap",
+        3030,
     );
 
     // Multiple long background messages
@@ -418,7 +430,7 @@ async fn oracle_3_over_byte_cap_background_lines_dropped_first_and_envelope_trun
         .canned_thread_relations
         .lock()
         .unwrap()
-        .insert("$root_3".to_string(), vec![rep1, rep2]);
+        .insert("$root_3".to_string(), vec![rep1, rep2, rep3]);
 
     let ev = make_event("$root_3", None, "@genie root topic message", 3000);
     handle_incoming_event(&ev, &[], &config, &matrix, &xmsg, &store)
@@ -466,10 +478,14 @@ async fn oracle_3_over_byte_cap_background_lines_dropped_first_and_envelope_trun
         "Thread lines must be preserved before room background"
     );
 
-    // Oldest background line MUST have been dropped
+    // Background lines and overflow thread lines MUST have been dropped from page 1
     assert!(
         !transcript.contains("long background history message line 1"),
-        "Oldest background lines must be dropped first to satisfy resync_byte_cap"
+        "Background lines must be excluded from resync"
+    );
+    assert!(
+        !transcript.contains("trailing thread response gamma"),
+        "Overflow thread line must be truncated onto next page"
     );
 }
 

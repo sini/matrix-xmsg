@@ -60,6 +60,18 @@ pub trait MatrixClient: Send + Sync {
         Ok(None)
     }
 
+    /// Fetches a single event by ID in a room along with its explicit `m.in_reply_to` target event ID (if any).
+    async fn fetch_event_with_reply_target(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<(EventMessage, Option<String>)>, AppError> {
+        Ok(self
+            .fetch_event(room_id, event_id)
+            .await?
+            .map(|m| (m, None)))
+    }
+
     /// Fetches a single page of thread relations for a given thread root.
     /// Returns (events_in_page, next_batch_token).
     async fn fetch_thread_relations_page(
@@ -180,9 +192,9 @@ impl MatrixSdkClient {
     }
 }
 
-pub fn parse_timeline_event(
+pub fn parse_timeline_event_with_reply(
     event: matrix_sdk::ruma::events::AnySyncTimelineEvent,
-) -> Option<EventMessage> {
+) -> Option<(EventMessage, Option<String>)> {
     use matrix_sdk::ruma::events::room::message::Relation;
     use matrix_sdk::ruma::events::{
         AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
@@ -192,20 +204,37 @@ pub fn parse_timeline_event(
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             SyncMessageLikeEvent::Original(orig),
         )) => {
-            let thread_root_id = match &orig.content.relates_to {
-                Some(Relation::Thread(t)) => Some(t.event_id.to_string()),
-                _ => None,
+            let (thread_root_id, reply_to_id) = match &orig.content.relates_to {
+                Some(Relation::Thread(t)) => {
+                    let reply_id = if !t.is_falling_back {
+                        t.in_reply_to.as_ref().map(|r| r.event_id.to_string())
+                    } else {
+                        None
+                    };
+                    (Some(t.event_id.to_string()), reply_id)
+                }
+                Some(Relation::Reply(rep)) => (None, Some(rep.in_reply_to.event_id.to_string())),
+                _ => (None, None),
             };
-            Some(EventMessage {
-                event_id: orig.event_id.to_string(),
-                sender_mxid: orig.sender.to_string(),
-                timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
-                body: orig.content.body().to_string(),
-                thread_root_id,
-            })
+            Some((
+                EventMessage {
+                    event_id: orig.event_id.to_string(),
+                    sender_mxid: orig.sender.to_string(),
+                    timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
+                    body: orig.content.body().to_string(),
+                    thread_root_id,
+                },
+                reply_to_id,
+            ))
         }
         _ => None,
     }
+}
+
+pub fn parse_timeline_event(
+    event: matrix_sdk::ruma::events::AnySyncTimelineEvent,
+) -> Option<EventMessage> {
+    parse_timeline_event_with_reply(event).map(|(msg, _)| msg)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -814,6 +843,17 @@ impl MatrixClient for MatrixSdkClient {
         room_id: &str,
         event_id: &str,
     ) -> Result<Option<EventMessage>, AppError> {
+        Ok(self
+            .fetch_event_with_reply_target(room_id, event_id)
+            .await?
+            .map(|(m, _)| m))
+    }
+
+    async fn fetch_event_with_reply_target(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<(EventMessage, Option<String>)>, AppError> {
         use matrix_sdk::ruma::{EventId, RoomId};
 
         let r_id = <&RoomId>::try_from(room_id)
@@ -829,7 +869,7 @@ impl MatrixClient for MatrixSdkClient {
         match room.event(e_id, None).await {
             Ok(timeline_event) => {
                 if let Ok(sync_event) = timeline_event.raw().deserialize() {
-                    Ok(parse_timeline_event(sync_event))
+                    Ok(parse_timeline_event_with_reply(sync_event))
                 } else {
                     Ok(None)
                 }
@@ -944,6 +984,10 @@ pub async fn fetch_paged_thread_history(
             _ => break,
         }
     }
+
+    let mut seen = std::collections::HashSet::new();
+    thread_events.retain(|m| seen.insert(m.event_id.clone()));
+    thread_events.sort_by_key(|m| m.timestamp_ms);
 
     Ok(thread_events)
 }
@@ -1106,8 +1150,13 @@ pub struct MockMatrixClient {
     pub redacted_events: Mutex<Vec<RedactedEvent>>,
     pub edited_notices: Mutex<Vec<EditedNotice>>,
     pub canned_history: Mutex<Vec<EventMessage>>,
+    pub canned_room_history: Mutex<std::collections::HashMap<String, Vec<EventMessage>>>,
     pub canned_events: Mutex<std::collections::HashMap<String, EventMessage>>,
+    pub canned_room_events: Mutex<std::collections::HashMap<(String, String), EventMessage>>,
+    pub canned_reply_targets: Mutex<std::collections::HashMap<String, String>>,
     pub canned_thread_relations: Mutex<std::collections::HashMap<String, Vec<EventMessage>>>,
+    pub canned_room_thread_relations:
+        Mutex<std::collections::HashMap<(String, String), Vec<EventMessage>>>,
     pub canned_thread_page_size: Mutex<Option<usize>>,
     pub known_rooms: Mutex<std::collections::HashSet<String>>,
     pub configured_rooms: Mutex<std::collections::HashSet<String>>,
@@ -1245,18 +1294,51 @@ impl MatrixClient for MockMatrixClient {
 
     async fn fetch_history(
         &self,
-        _room_id: &str,
+        room_id: &str,
         _limit: usize,
     ) -> Result<Vec<EventMessage>, AppError> {
+        {
+            let room_hist = self.canned_room_history.lock().unwrap();
+            if let Some(list) = room_hist.get(room_id) {
+                return Ok(list.clone());
+            }
+        }
         let list = self.canned_history.lock().unwrap();
         Ok(list.clone())
     }
 
     async fn fetch_event(
         &self,
-        _room_id: &str,
+        room_id: &str,
         event_id: &str,
     ) -> Result<Option<EventMessage>, AppError> {
+        {
+            let room_events = self.canned_room_events.lock().unwrap();
+            if !room_events.is_empty() {
+                if let Some(msg) = room_events.get(&(room_id.to_string(), event_id.to_string())) {
+                    return Ok(Some(msg.clone()));
+                }
+                if room_events.keys().any(|(_, eid)| eid == event_id) {
+                    return Ok(None);
+                }
+            }
+        }
+        {
+            let room_hist = self.canned_room_history.lock().unwrap();
+            if !room_hist.is_empty() {
+                if let Some(list) = room_hist.get(room_id) {
+                    if let Some(msg) = list.iter().find(|m| m.event_id == event_id) {
+                        return Ok(Some(msg.clone()));
+                    }
+                }
+                if room_hist
+                    .iter()
+                    .any(|(r, list)| r != room_id && list.iter().any(|m| m.event_id == event_id))
+                {
+                    return Ok(None);
+                }
+            }
+        }
         let history = self.canned_history.lock().unwrap();
         if let Some(msg) = history.iter().find(|m| m.event_id == event_id) {
             return Ok(Some(msg.clone()));
@@ -1265,17 +1347,97 @@ impl MatrixClient for MockMatrixClient {
         Ok(events.get(event_id).cloned())
     }
 
+    async fn fetch_event_with_reply_target(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Option<(EventMessage, Option<String>)>, AppError> {
+        let msg_opt = self.fetch_event(room_id, event_id).await?;
+        let reply_target = self
+            .canned_reply_targets
+            .lock()
+            .unwrap()
+            .get(event_id)
+            .cloned();
+        Ok(msg_opt.map(|m| (m, reply_target)))
+    }
+
     async fn fetch_thread_relations_page(
         &self,
-        _room_id: &str,
+        room_id: &str,
         thread_root_id: &str,
         from_token: Option<&str>,
         default_limit: usize,
     ) -> Result<(Vec<EventMessage>, Option<String>), AppError> {
+        let room_relations = self.canned_room_thread_relations.lock().unwrap();
+        if !room_relations.is_empty() {
+            if let Some(list) =
+                room_relations.get(&(room_id.to_string(), thread_root_id.to_string()))
+            {
+                let page_size = self
+                    .canned_thread_page_size
+                    .lock()
+                    .unwrap()
+                    .unwrap_or(default_limit);
+                let start: usize = from_token.and_then(|t| t.parse().ok()).unwrap_or(0);
+                if start >= list.len() {
+                    return Ok((Vec::new(), None));
+                }
+                let end = (start + page_size).min(list.len());
+                let page = list[start..end].to_vec();
+                let next_token = if end < list.len() {
+                    Some(end.to_string())
+                } else {
+                    None
+                };
+                return Ok((page, next_token));
+            }
+            if room_relations.keys().any(|(_, tid)| tid == thread_root_id) {
+                return Ok((Vec::new(), None));
+            }
+        }
+        drop(room_relations);
+
+        {
+            let room_hist = self.canned_room_history.lock().unwrap();
+            if !room_hist.is_empty()
+                && room_hist.iter().any(|(r, list)| {
+                    r != room_id
+                        && list.iter().any(|m| {
+                            m.event_id == thread_root_id
+                                || m.thread_root_id.as_deref() == Some(thread_root_id)
+                        })
+                })
+            {
+                return Ok((Vec::new(), None));
+            }
+        }
+
         let relations = self.canned_thread_relations.lock().unwrap();
-        let list = match relations.get(thread_root_id) {
-            Some(l) => l,
-            None => return Ok((Vec::new(), None)),
+        let fallback_list: Vec<EventMessage>;
+        let list: &[EventMessage] = match relations.get(thread_root_id) {
+            Some(l) => l.as_slice(),
+            None => {
+                let room_hist = self.canned_room_history.lock().unwrap();
+                if let Some(rh) = room_hist.get(room_id) {
+                    fallback_list = rh
+                        .iter()
+                        .filter(|m| m.thread_root_id.as_deref() == Some(thread_root_id))
+                        .cloned()
+                        .collect();
+                } else {
+                    let hist = self.canned_history.lock().unwrap();
+                    fallback_list = hist
+                        .iter()
+                        .filter(|m| m.thread_root_id.as_deref() == Some(thread_root_id))
+                        .cloned()
+                        .collect();
+                }
+                if fallback_list.is_empty() {
+                    return Ok((Vec::new(), None));
+                }
+                fallback_list.as_slice()
+            }
         };
 
         let page_size = self

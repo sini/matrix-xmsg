@@ -122,9 +122,16 @@ async fn oracle_5_default_answer_timeout_600s_boundary_and_mutant() {
     mutant_config.answer_timeout_secs = 300;
     let mutant_matrix = MockMatrixClient::default();
     let mutant_store = Store::new_in_memory().unwrap();
-    handle_incoming_event(&event, &[], &mutant_config, &mutant_matrix, &xmsg, &mutant_store)
-        .await
-        .unwrap();
+    handle_incoming_event(
+        &event,
+        &[],
+        &mutant_config,
+        &mutant_matrix,
+        &xmsg,
+        &mutant_store,
+    )
+    .await
+    .unwrap();
     let mutant_swept_599 =
         sweep_answer_timeouts(&mutant_config, &mutant_matrix, &mutant_store, t0 + 599)
             .await

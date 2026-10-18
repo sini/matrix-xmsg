@@ -153,6 +153,12 @@ let
     historyN = 15;
     historyByteCap = 8192;
     resyncByteCap = 32768;
+    resyncPageBytes = 4096;
+    contextMaxLines = 10;
+    contextMaxBytes = 4096;
+    senderWindowSecs = 300;
+    contextRateLimitCount = 3;
+    contextRateLimitWindowSecs = 120;
     rateLimitCount = 20;
     rateLimitWindowSecs = 300;
     sizeCapBytes = 2048;

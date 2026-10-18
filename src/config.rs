@@ -54,6 +54,30 @@ fn default_resync_byte_cap() -> usize {
     65536
 }
 
+fn default_resync_page_bytes() -> usize {
+    8192
+}
+
+fn default_context_max_lines() -> usize {
+    20
+}
+
+fn default_context_max_bytes() -> usize {
+    8192
+}
+
+fn default_sender_window_secs() -> u64 {
+    900
+}
+
+fn default_context_rate_limit_count() -> usize {
+    6
+}
+
+fn default_context_rate_limit_window_secs() -> u64 {
+    600
+}
+
 fn default_rate_limit_count() -> usize {
     10
 }
@@ -177,6 +201,24 @@ pub struct Config {
 
     #[serde(default = "default_resync_byte_cap")]
     pub resync_byte_cap: usize,
+
+    #[serde(default = "default_resync_page_bytes")]
+    pub resync_page_bytes: usize,
+
+    #[serde(default = "default_context_max_lines")]
+    pub context_max_lines: usize,
+
+    #[serde(default = "default_context_max_bytes")]
+    pub context_max_bytes: usize,
+
+    #[serde(default = "default_sender_window_secs")]
+    pub sender_window_secs: u64,
+
+    #[serde(default = "default_context_rate_limit_count")]
+    pub context_rate_limit_count: usize,
+
+    #[serde(default = "default_context_rate_limit_window_secs")]
+    pub context_rate_limit_window_secs: u64,
 
     #[serde(default = "default_rate_limit_count")]
     pub rate_limit_count: usize,

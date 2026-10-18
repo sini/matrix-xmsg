@@ -1,9 +1,8 @@
 use crate::config::{Admission, Config, GuardFailureMode};
 use crate::context::{
-    assemble_resync_lines, build_envelope_with_screening, compute_sender_tier,
-    format_context_line_with_screening, format_resync_transcript,
-    format_resync_transcript_with_screening, select_context_messages, select_resync_messages,
-    ContextMode, EventMessage,
+    build_structural_envelope_with_screening, compute_sender_tier,
+    format_context_line_with_screening, format_paged_context_lines, format_paged_resync_lines,
+    select_structural_context_messages, slice_messages_by_byte_offset, ContextMode, EventMessage,
 };
 use crate::error::AppError;
 use crate::matrix::{is_bot_mentioned, MatrixClient};
@@ -58,6 +57,14 @@ fn forward_key(purpose: &str, event_id: &str) -> String {
     format!("matrix-xmsg:{purpose}:#{:016x}", h.finish())
 }
 
+fn expert_ref_for_room_tier<'a>(config: &'a Config, _room_id: &str, tier: &str) -> &'a str {
+    config.expert_ref_for_tier(tier)
+}
+
+fn should_screen_room(config: &Config, _room_id: &str, is_solicited: bool) -> bool {
+    is_solicited || config.screen_mentions
+}
+
 fn effective_thread_tier(
     config: &Config,
     store: &Store,
@@ -78,6 +85,7 @@ fn effective_thread_tier(
 fn control_target_ref(
     config: &Config,
     store: &Store,
+    room_id: &str,
     thread_root: &str,
     sender_mxid: &str,
 ) -> Result<String, AppError> {
@@ -88,7 +96,7 @@ fn control_target_ref(
         return Ok(target_ref);
     }
     let tier = effective_thread_tier(config, store, thread_root, sender_mxid)?;
-    Ok(config.expert_ref_for_tier(tier).to_string())
+    Ok(expert_ref_for_room_tier(config, room_id, tier).to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +122,10 @@ pub enum BotOutcome {
     Resynced,
     ResyncThrottled,
     ResyncUnknown,
+    ContextAnswered,
+    ContextThrottled,
+    ContextUnknown,
+    ContextRefused,
     OpenThreadSuccess,
     OpenThreadRefusal,
     GuardRejected,
@@ -351,6 +363,12 @@ pub async fn handle_incoming_event_with_guard(
         return Ok(BotOutcome::IgnoredRoom);
     }
 
+    if event.replaces_event_id.is_none() && !event.is_falling_back {
+        if let Some(ref reply_to) = event.in_reply_to_event_id {
+            let _ = store.record_event_reply_target(&event.room_id, &event.event_id, reply_to);
+        }
+    }
+
     // Check for !release command on solicited thread opening post
     if event.body.trim() == "!release" {
         let target_root = event
@@ -374,8 +392,47 @@ pub async fn handle_incoming_event_with_guard(
         }
     }
 
-    let (thread_root, claim_id, reaction_target_id, trigger_msg, is_addressed) =
+    let (thread_root, claim_id, reaction_target_id, trigger_msg, is_addressed, effective_reply_to) =
         if let Some(ref orig_event_id) = event.replaces_event_id {
+            // M10 Rule 3: Original event must never have been relayed
+            if store.is_event_relayed(orig_event_id)? {
+                return Ok(BotOutcome::IgnoredEdit);
+            }
+
+            // Fetch original event and its reply relation from history/store or Matrix API
+            let (orig_event, orig_reply_to) = if let Some(msg) =
+                room_history.iter().find(|m| m.event_id == *orig_event_id)
+            {
+                let rt = match store.get_event_reply_target(&event.room_id, orig_event_id)? {
+                    Some(t) => Some(t),
+                    None => matrix
+                        .fetch_event_with_reply_target(&event.room_id, orig_event_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|(_, t)| t),
+                };
+                (Some(msg.clone()), rt)
+            } else {
+                match matrix
+                    .fetch_event_with_reply_target(&event.room_id, orig_event_id)
+                    .await
+                {
+                    Ok(Some((msg, rt))) => {
+                        let rt = match rt {
+                            Some(t) => Some(t),
+                            None => store.get_event_reply_target(&event.room_id, orig_event_id)?,
+                        };
+                        (Some(msg), rt)
+                    }
+                    Ok(None) => (None, None),
+                    Err(e) => {
+                        tracing::debug!("Failed to fetch original event {}: {}", orig_event_id, e);
+                        (None, None)
+                    }
+                }
+            };
+
             // M10 Rule 1: Replacement content must mention the bot or be a reply to the bot
             let is_mentioned = is_bot_mentioned(
                 &event.body,
@@ -383,39 +440,21 @@ pub async fn handle_incoming_event_with_guard(
                 event.mentions.as_deref(),
                 &config.bot_mxid,
             );
-            let is_reply_to_bot = if let Some(ref in_reply_to) = event.in_reply_to_event_id {
+            let reply_check_id = orig_reply_to.as_deref().or_else(|| {
                 if !event.is_falling_back {
-                    store.get_bot_message_thread(in_reply_to)?.is_some()
+                    event.in_reply_to_event_id.as_deref()
                 } else {
-                    false
+                    None
                 }
+            });
+            let is_reply_to_bot = if let Some(in_reply_to) = reply_check_id {
+                store.get_bot_message_thread(in_reply_to)?.is_some()
             } else {
                 false
             };
             if !is_mentioned && !is_reply_to_bot {
                 return Ok(BotOutcome::IgnoredNoMention);
             }
-
-            // M10 Rule 3: Original event must never have been relayed
-            if store.is_event_relayed(orig_event_id)? {
-                return Ok(BotOutcome::IgnoredEdit);
-            }
-
-            // Fetch original event from history or Matrix API
-            let orig_event = if let Some(msg) =
-                room_history.iter().find(|m| m.event_id == *orig_event_id)
-            {
-                Some(msg.clone())
-            } else {
-                match matrix.fetch_event(&event.room_id, orig_event_id).await {
-                    Ok(Some(msg)) => Some(msg),
-                    Ok(None) => None,
-                    Err(e) => {
-                        tracing::debug!("Failed to fetch original event {}: {}", orig_event_id, e);
-                        None
-                    }
-                }
-            };
 
             let Some(orig) = orig_event else {
                 tracing::debug!(
@@ -460,14 +499,22 @@ pub async fn handle_incoming_event_with_guard(
                 .to_string();
             let claim_id = orig.event_id.clone();
             let reaction_target_id = orig.event_id.clone();
+            // M33 §2: Edit-into-mention resolves against the original event's timestamp and relations
             let trigger_msg = EventMessage {
                 event_id: orig.event_id.clone(),
                 sender_mxid: event.sender_mxid.clone(),
-                timestamp_ms: event.timestamp_ms,
+                timestamp_ms: orig.timestamp_ms,
                 body: event.body.clone(),
                 thread_root_id: orig.thread_root_id.clone(),
             };
-            (thread_root, claim_id, reaction_target_id, trigger_msg, true)
+            (
+                thread_root,
+                claim_id,
+                reaction_target_id,
+                trigger_msg,
+                true,
+                orig_reply_to,
+            )
         } else {
             let is_thread_escalate =
                 event.thread_root_id.is_some() && event.body.trim() == "!escalate";
@@ -565,8 +612,13 @@ pub async fn handle_incoming_event_with_guard(
                 .to_string();
 
                 let mapped_sender = map_sender_mxid(&event.sender_mxid);
-                let target_ref =
-                    control_target_ref(config, store, &thread_root, &event.sender_mxid)?;
+                let target_ref = control_target_ref(
+                    config,
+                    store,
+                    &event.room_id,
+                    &thread_root,
+                    &event.sender_mxid,
+                )?;
                 xmsg.send_message(&target_ref, &mapped_sender, &payload)
                     .await?;
 
@@ -615,7 +667,7 @@ pub async fn handle_incoming_event_with_guard(
                 })
                 .to_string();
 
-                let target_ref = config.expert_ref_for_tier("trusted");
+                let target_ref = expert_ref_for_room_tier(config, &event.room_id, "trusted");
                 xmsg.send_message(target_ref, &mapped_sender, &payload)
                     .await?;
 
@@ -674,7 +726,13 @@ pub async fn handle_incoming_event_with_guard(
                 })
                 .to_string();
 
-                let target_ref = control_target_ref(config, store, &thread_id, &event.sender_mxid)?;
+                let target_ref = control_target_ref(
+                    config,
+                    store,
+                    &event.room_id,
+                    &thread_id,
+                    &event.sender_mxid,
+                )?;
                 xmsg.send_message(&target_ref, &mapped_sender, &payload)
                     .await?;
 
@@ -722,12 +780,18 @@ pub async fn handle_incoming_event_with_guard(
                 body: event.body.clone(),
                 thread_root_id: event.thread_root_id.clone(),
             };
+            let reply_to = if !event.is_falling_back {
+                event.in_reply_to_event_id.clone()
+            } else {
+                None
+            };
             (
                 thread_root,
                 claim_id,
                 reaction_target_id,
                 trigger_msg,
                 is_addressed,
+                reply_to,
             )
         };
 
@@ -792,10 +856,10 @@ pub async fn handle_incoming_event_with_guard(
         return Ok(BotOutcome::EscalatedUserRequest);
     }
 
-    // 7. Context & Envelope Assembly + Guard Screening (M15, M26 & M28)
+    // 7. Context & Envelope Assembly + Guard Screening (M15, M26, M28, M32, M33)
     let effective_tier =
         effective_thread_tier(config, store, &thread_root, &trigger_msg.sender_mxid)?;
-    let target_expert_ref = config.expert_ref_for_tier(effective_tier);
+    let target_expert_ref = expert_ref_for_room_tier(config, &event.room_id, effective_tier);
 
     let cursor_opt = store.get_thread_cursor(&thread_root)?;
     let mode = match cursor_opt {
@@ -816,15 +880,24 @@ pub async fn handle_incoming_event_with_guard(
         }
     };
 
+    let (replied_to_msg, replied_thread_msgs) = resolve_reply_context(
+        &event.room_id,
+        effective_reply_to.as_deref(),
+        room_history,
+        matrix,
+    )
+    .await;
+
     // Check if this thread is a bound solicited thread (Unit M15)
     let solicited_opt = store.get_solicited_thread(&thread_root)?;
-    // Solicited threads never opt out of screening; normal forwards follow config.screen_mentions.
-    let should_screen = solicited_opt.is_some() || config.screen_mentions;
+    let should_screen = should_screen_room(config, &event.room_id, solicited_opt.is_some());
 
     let (relay_trigger, is_rewritten, is_unscreened, all_trusted_primary) =
         match screen_forward_context(
             &trigger_msg,
             room_history,
+            replied_to_msg.as_ref(),
+            &replied_thread_msgs,
             &mode,
             &event.room_id,
             &thread_root,
@@ -841,11 +914,14 @@ pub async fn handle_incoming_event_with_guard(
             Err(outcome) => return Ok(outcome),
         };
 
-    let envelope = build_envelope_with_screening(
+    let envelope = build_structural_envelope_with_screening(
         &event.room_id,
         &thread_root,
         &relay_trigger,
         room_history,
+        replied_to_msg.as_ref(),
+        &replied_thread_msgs,
+        config.sender_window_secs,
         &config.trusted_mxids,
         Some(&config.owner_mxid),
         config.history_n,
@@ -976,6 +1052,8 @@ pub async fn handle_incoming_event_with_guard(
                 screen_forward_context(
                     &trigger_msg,
                     room_history,
+                    replied_to_msg.as_ref(),
+                    &replied_thread_msgs,
                     &rebootstrap_mode,
                     &event.room_id,
                     &thread_root,
@@ -998,11 +1076,14 @@ pub async fn handle_incoming_event_with_guard(
             };
 
             if let Some((boot_trigger, boot_rewritten, boot_unscreened, _)) = boot_screened {
-                let bootstrap_envelope = build_envelope_with_screening(
+                let bootstrap_envelope = build_structural_envelope_with_screening(
                     &event.room_id,
                     &thread_root,
                     &boot_trigger,
                     room_history,
+                    replied_to_msg.as_ref(),
+                    &replied_thread_msgs,
+                    config.sender_window_secs,
                     &config.trusted_mxids,
                     Some(&config.owner_mxid),
                     config.history_n,
@@ -1541,10 +1622,130 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
     Ok(BotOutcome::Edited)
 }
 
+async fn resolve_reply_context(
+    room_id: &str,
+    reply_target_id: Option<&str>,
+    room_history: &[EventMessage],
+    matrix: &dyn MatrixClient,
+) -> (Option<EventMessage>, Vec<EventMessage>) {
+    let Some(target_id) = reply_target_id else {
+        return (None, Vec::new());
+    };
+
+    let replied_msg = match room_history.iter().find(|m| m.event_id == target_id) {
+        Some(m) => Some(m.clone()),
+        None => matrix.fetch_event(room_id, target_id).await.ok().flatten(),
+    };
+
+    let Some(ref r_msg) = replied_msg else {
+        return (None, Vec::new());
+    };
+
+    let candidate_root = match r_msg.thread_root_id {
+        Some(ref root) => Some(root.clone()),
+        None => Some(r_msg.event_id.clone()),
+    };
+
+    let mut thread_msgs = Vec::new();
+    if let Some(root_id) = candidate_root {
+        let fetched = matrix
+            .fetch_thread_history(room_id, &root_id)
+            .await
+            .unwrap_or_default();
+        let has_thread_replies = r_msg.thread_root_id.is_some()
+            || fetched.iter().any(|m| m.event_id != root_id)
+            || room_history
+                .iter()
+                .any(|m| m.thread_root_id.as_deref() == Some(root_id.as_str()));
+
+        if has_thread_replies {
+            for m in fetched {
+                if !thread_msgs
+                    .iter()
+                    .any(|existing: &EventMessage| existing.event_id == m.event_id)
+                {
+                    thread_msgs.push(m);
+                }
+            }
+            for m in room_history {
+                if (m.event_id == root_id || m.thread_root_id.as_deref() == Some(root_id.as_str()))
+                    && !thread_msgs
+                        .iter()
+                        .any(|existing| existing.event_id == m.event_id)
+                {
+                    thread_msgs.push(m.clone());
+                }
+            }
+            thread_msgs.sort_by_key(|m| m.timestamp_ms);
+        }
+    }
+
+    (replied_msg, thread_msgs)
+}
+
+fn caller_matches_bound(delivery: &SvcDelivery, bound: &str) -> bool {
+    let bound_addr = crate::xmsg::sender_address(bound.trim());
+    if bound_addr.is_empty() {
+        return false;
+    }
+    if let Some(caller_key) = origin_author_key(delivery) {
+        if bound_addr.contains('@') {
+            return caller_key == bound_addr;
+        }
+        if let Some(caller_id) = origin_session_id(delivery) {
+            return caller_id == bound_addr || caller_key == bound_addr;
+        }
+        return false;
+    }
+    if delivery.origin.is_none() {
+        let caller_from = crate::xmsg::sender_address(delivery.from_name.trim());
+        return !caller_from.is_empty() && caller_from == bound_addr;
+    }
+    false
+}
+
+fn is_caller_bound_to_forward(
+    delivery: &SvcDelivery,
+    forward: &ForwardedMessageRecord,
+    store: &Store,
+) -> Result<bool, AppError> {
+    let fwd_sess = store
+        .get_forward_session(&forward.message_id)?
+        .filter(|s| !s.trim().is_empty());
+    let cursor = store.get_thread_cursor(&forward.thread_root_id)?;
+    let cursor_sess = cursor
+        .as_ref()
+        .and_then(|c| c.session_id.clone())
+        .filter(|s| !s.trim().is_empty());
+
+    if cursor_sess.is_some() || fwd_sess.is_some() {
+        let matches_cursor = cursor_sess
+            .as_deref()
+            .is_some_and(|b| caller_matches_bound(delivery, b));
+        let matches_fwd = fwd_sess
+            .as_deref()
+            .is_some_and(|b| caller_matches_bound(delivery, b));
+        return Ok(matches_cursor || matches_fwd);
+    }
+
+    if let Some(ref orig) = delivery.origin {
+        let label = orig.get("label").and_then(|v| v.as_str());
+        let id = orig.get("id").and_then(|v| v.as_str());
+        let target_ref = cursor.as_ref().and_then(|c| c.target_ref.as_deref());
+        if label.is_some() && label == target_ref && id == Some("session-1") {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    Ok(!delivery.from_name.trim().is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn screen_forward_context(
     trigger_msg: &EventMessage,
     room_history: &[EventMessage],
+    replied_to_msg: Option<&EventMessage>,
+    replied_thread_msgs: &[EventMessage],
     mode: &ContextMode,
     room_id: &str,
     thread_root: &str,
@@ -1559,9 +1760,12 @@ async fn screen_forward_context(
         return Ok(Ok((trigger_msg.clone(), false, false, false)));
     }
 
-    let selected = select_context_messages(
+    let selected = select_structural_context_messages(
         trigger_msg,
         room_history,
+        replied_to_msg,
+        replied_thread_msgs,
+        config.sender_window_secs,
         &config.trusted_mxids,
         Some(&config.owner_mxid),
         config.history_n,
@@ -1663,60 +1867,76 @@ async fn screen_forward_context(
     }
 }
 
+struct ScreenedPage {
+    lines: Vec<String>,
+    unscreened: bool,
+    fail_open_warning: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn screen_resync_transcript(
+async fn screen_page_messages(
     delivery_message_id: &str,
     room_id: &str,
     thread_root_id: &str,
-    background_msgs: &[EventMessage],
-    thread_history: &[EventMessage],
+    page_msgs: &[&EventMessage],
+    should_screen: bool,
+    reject_when_all_dropped: bool,
     config: &Config,
     matrix: &dyn MatrixClient,
     guard: &dyn GuardClient,
     store: &Store,
     now_secs: i64,
-) -> Result<Result<String, BotOutcome>, AppError> {
-    let (sel_room, sel_thread, truncated) = select_resync_messages(
-        room_id,
-        thread_root_id,
-        background_msgs,
-        thread_history,
-        &config.trusted_mxids,
-        Some(&config.owner_mxid),
-        config.resync_byte_cap,
-    );
-
-    let mut tagged: Vec<(bool, &EventMessage)> =
-        Vec::with_capacity(sel_room.len() + sel_thread.len());
-    for m in sel_room {
-        tagged.push((true, m));
+) -> Result<Result<ScreenedPage, BotOutcome>, AppError> {
+    if !should_screen {
+        let lines = page_msgs
+            .iter()
+            .map(|m| {
+                format_context_line_with_screening(
+                    m,
+                    &config.trusted_mxids,
+                    Some(&config.owner_mxid),
+                    None,
+                    Some(false),
+                )
+            })
+            .collect();
+        return Ok(Ok(ScreenedPage {
+            lines,
+            unscreened: true,
+            fail_open_warning: false,
+        }));
     }
-    for m in sel_thread {
-        tagged.push((false, m));
-    }
 
-    let all_trusted = tagged
+    let all_trusted = page_msgs
         .iter()
-        .filter(|(_, m)| m.sender_mxid != config.bot_mxid)
-        .all(|(_, m)| config.is_user_trusted(&m.sender_mxid));
+        .filter(|m| m.sender_mxid != config.bot_mxid)
+        .all(|m| config.is_user_trusted(&m.sender_mxid));
     if all_trusted {
-        return Ok(Ok(format_resync_transcript(
-            room_id,
-            thread_root_id,
-            background_msgs,
-            thread_history,
-            &config.trusted_mxids,
-            Some(&config.owner_mxid),
-            config.resync_byte_cap,
-        )));
+        let lines = page_msgs
+            .iter()
+            .map(|m| {
+                format_context_line_with_screening(
+                    m,
+                    &config.trusted_mxids,
+                    Some(&config.owner_mxid),
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        return Ok(Ok(ScreenedPage {
+            lines,
+            unscreened: false,
+            fail_open_warning: false,
+        }));
     }
 
     let cap = config.history_byte_cap.max(1);
-    let mut chunks: Vec<Vec<(bool, &EventMessage)>> = Vec::new();
-    let mut current_chunk: Vec<(bool, &EventMessage)> = Vec::new();
+    let mut chunks: Vec<Vec<&EventMessage>> = Vec::new();
+    let mut current_chunk: Vec<&EventMessage> = Vec::new();
     let mut current_bytes: usize = 0;
 
-    for (is_room, msg) in tagged {
+    for &msg in page_msgs {
         let line_len = format_context_line_with_screening(
             msg,
             &config.trusted_mxids,
@@ -1730,39 +1950,33 @@ async fn screen_resync_transcript(
             chunks.push(std::mem::take(&mut current_chunk));
             current_bytes = 0;
         }
-        current_chunk.push((is_room, msg));
+        current_chunk.push(msg);
         current_bytes += line_len;
     }
     if !current_chunk.is_empty() {
         chunks.push(current_chunk);
     }
 
-    let mut room_lines: Vec<String> = Vec::new();
-    let mut thread_lines: Vec<String> = Vec::new();
+    let mut kept_lines: Vec<String> = Vec::new();
     let mut any_non_bot_chunk = false;
     let mut kept_non_bot_chunk = false;
 
     for chunk in chunks {
         let non_bot: Vec<&EventMessage> = chunk
             .iter()
-            .map(|(_, m)| *m)
+            .copied()
             .filter(|m| m.sender_mxid != config.bot_mxid)
             .collect();
 
         if non_bot.is_empty() {
-            for (is_room, m) in chunk {
-                let line = format_context_line_with_screening(
+            for m in chunk {
+                kept_lines.push(format_context_line_with_screening(
                     m,
                     &config.trusted_mxids,
                     Some(&config.owner_mxid),
                     None,
                     None,
-                );
-                if is_room {
-                    room_lines.push(line);
-                } else {
-                    thread_lines.push(line);
-                }
+                ));
             }
             continue;
         }
@@ -1803,53 +2017,76 @@ async fn screen_resync_transcript(
                 let _ = store.clear_guard_retries(delivery_message_id);
                 if verdict.verdict == "reject" {
                     tracing::info!(
-                        "Guard rejected resync chunk in thread {}: {}",
+                        "Guard rejected page chunk in thread {}: {}",
                         thread_root_id,
                         verdict.reason
                     );
+                    // If this chunk mixed trusted/bot lines with an untrusted line (when all fit in one chunk),
+                    // preserve the trusted/bot lines and drop the rejected untrusted line(s).
+                    let has_untrusted = chunk.iter().any(|m| {
+                        m.sender_mxid != config.bot_mxid && !config.is_user_trusted(&m.sender_mxid)
+                    });
+                    let has_trusted = chunk.iter().any(|m| {
+                        m.sender_mxid != config.bot_mxid && config.is_user_trusted(&m.sender_mxid)
+                    });
+                    if has_untrusted && has_trusted {
+                        kept_non_bot_chunk = true;
+                        for m in chunk {
+                            if m.sender_mxid == config.bot_mxid
+                                || config.is_user_trusted(&m.sender_mxid)
+                            {
+                                kept_lines.push(format_context_line_with_screening(
+                                    m,
+                                    &config.trusted_mxids,
+                                    Some(&config.owner_mxid),
+                                    None,
+                                    None,
+                                ));
+                            }
+                        }
+                    }
                     continue;
                 }
                 kept_non_bot_chunk = true;
                 if verdict.verdict == "rewrite" {
-                    let mut rew = last_msg.clone();
-                    rew.body = verdict.cleaned_text;
-                    let is_room = chunk
-                        .iter()
-                        .rfind(|(_, m)| m.sender_mxid != config.bot_mxid)
-                        .map(|(r, _)| *r)
-                        .unwrap_or(false);
-                    let line = format_context_line_with_screening(
-                        &rew,
-                        &config.trusted_mxids,
-                        Some(&config.owner_mxid),
-                        Some(true),
-                        None,
-                    );
-                    if is_room {
-                        room_lines.push(line);
-                    } else {
-                        thread_lines.push(line);
+                    for m in &chunk {
+                        if m.event_id == last_msg.event_id {
+                            let mut rew = (*m).clone();
+                            rew.body = verdict.cleaned_text.clone();
+                            kept_lines.push(format_context_line_with_screening(
+                                &rew,
+                                &config.trusted_mxids,
+                                Some(&config.owner_mxid),
+                                Some(true),
+                                None,
+                            ));
+                        } else if m.sender_mxid == config.bot_mxid
+                            || config.is_user_trusted(&m.sender_mxid)
+                        {
+                            kept_lines.push(format_context_line_with_screening(
+                                m,
+                                &config.trusted_mxids,
+                                Some(&config.owner_mxid),
+                                None,
+                                None,
+                            ));
+                        }
                     }
                 } else {
-                    for (is_room, m) in chunk {
-                        let line = format_context_line_with_screening(
+                    for m in chunk {
+                        kept_lines.push(format_context_line_with_screening(
                             m,
                             &config.trusted_mxids,
                             Some(&config.owner_mxid),
                             None,
                             None,
-                        );
-                        if is_room {
-                            room_lines.push(line);
-                        } else {
-                            thread_lines.push(line);
-                        }
+                        ));
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!(
-                    "Guard-in failure for resync {} in thread {}: {}",
+                    "Guard-in failure for page {} in thread {}: {}",
                     delivery_message_id,
                     thread_root_id,
                     e
@@ -1889,34 +2126,592 @@ async fn screen_resync_transcript(
                             );
                             let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
                         }
-                        return Ok(Ok(format_resync_transcript_with_screening(
-                            room_id,
-                            thread_root_id,
-                            background_msgs,
-                            thread_history,
-                            &config.trusted_mxids,
-                            Some(&config.owner_mxid),
-                            config.resync_byte_cap,
-                            true,
-                        )));
+                        let lines = page_msgs
+                            .iter()
+                            .map(|m| {
+                                format_context_line_with_screening(
+                                    m,
+                                    &config.trusted_mxids,
+                                    Some(&config.owner_mxid),
+                                    None,
+                                    Some(false),
+                                )
+                            })
+                            .collect();
+                        return Ok(Ok(ScreenedPage {
+                            lines,
+                            unscreened: true,
+                            fail_open_warning: true,
+                        }));
                     }
                 }
             }
         }
     }
 
-    if any_non_bot_chunk && !kept_non_bot_chunk {
+    if reject_when_all_dropped && any_non_bot_chunk && !kept_non_bot_chunk {
         return Ok(Err(BotOutcome::GuardRejected));
     }
 
-    Ok(Ok(assemble_resync_lines(
-        room_id,
-        thread_root_id,
-        &room_lines,
-        &thread_lines,
-        truncated,
+    Ok(Ok(ScreenedPage {
+        lines: kept_lines,
+        unscreened: false,
+        fail_open_warning: false,
+    }))
+}
+
+fn parse_resync_offset_from_obj(obj: &serde_json::Map<String, serde_json::Value>) -> Option<usize> {
+    let val = obj.get("resync")?;
+    if let Some(true) = val.as_bool() {
+        return Some(0);
+    }
+    if let Some(sub) = val.as_object() {
+        if let Some(off) = sub.get("offset").and_then(|v| v.as_u64()) {
+            return Some(off as usize);
+        }
+    }
+    None
+}
+
+fn extract_resync_offset(text: &str) -> Option<usize> {
+    let val = serde_json::from_str::<serde_json::Value>(text.trim()).ok()?;
+    let obj = val.as_object()?;
+    if let Some(off) = parse_resync_offset_from_obj(obj) {
+        return Some(off);
+    }
+    if let Some(inner_text) = obj.get("text").and_then(|v| v.as_str()) {
+        if let Ok(inner_val) = serde_json::from_str::<serde_json::Value>(inner_text.trim()) {
+            if let Some(inner_obj) = inner_val.as_object() {
+                return parse_resync_offset_from_obj(inner_obj);
+            }
+        }
+    }
+    None
+}
+
+fn extract_context_request(
+    text: &str,
+) -> Option<(
+    serde_json::Map<String, serde_json::Value>,
+    serde_json::Map<String, serde_json::Value>,
+)> {
+    let val = serde_json::from_str::<serde_json::Value>(text.trim()).ok()?;
+    let obj = val.as_object()?;
+    if let Some(ctx_val) = obj.get("context") {
+        if let Some(ctx_obj) = ctx_val.as_object() {
+            return Some((obj.clone(), ctx_obj.clone()));
+        }
+    }
+    if let Some(inner_text) = obj.get("text").and_then(|v| v.as_str()) {
+        if let Ok(inner_val) = serde_json::from_str::<serde_json::Value>(inner_text.trim()) {
+            if let Some(inner_obj) = inner_val.as_object() {
+                if let Some(ctx_val) = inner_obj.get("context") {
+                    if let Some(ctx_obj) = ctx_val.as_object() {
+                        return Some((inner_obj.clone(), ctx_obj.clone()));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_resync_request<I: SvcInbox + ?Sized>(
+    delivery: &SvcDelivery,
+    offset: usize,
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    xmsg: &dyn XmsgClient,
+    guard: &dyn GuardClient,
+    inbox: &mut I,
+    now_secs: i64,
+) -> Result<BotOutcome, AppError> {
+    let orig_id = match delivery
+        .in_reply_to
+        .as_deref()
+        .or_else(|| parse_in_reply_to_id(&delivery.envelope))
+        .or_else(|| parse_in_reply_to_id(&delivery.text))
+    {
+        Some(id) => id.to_string(),
+        None => {
+            let _ = xmsg
+                .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
+                .await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::ResyncUnknown);
+        }
+    };
+
+    let forward = match store.get_forwarded_message(&orig_id)? {
+        Some(f) => f,
+        None => {
+            let _ = xmsg
+                .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
+                .await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::ResyncUnknown);
+        }
+    };
+
+    if !is_caller_bound_to_forward(delivery, &forward, store)? {
+        let _ = xmsg
+            .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
+            .await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::ResyncUnknown);
+    }
+
+    // Rate: at most one resync sequence per thread per 60 s (advancing offset > last_offset is permitted)
+    if let Err(retry_after) =
+        store.check_and_record_thread_resync_page(&forward.thread_root_id, offset, now_secs, 60)?
+    {
+        let reply_json = serde_json::json!({
+            "resync": "throttled",
+            "retry_after": retry_after
+        })
+        .to_string();
+        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::ResyncThrottled);
+    }
+
+    // M33 §3.1: Engaged thread only (from root to latest thread reply). Never room-wide.
+    let thread_history = matrix
+        .fetch_thread_history(&forward.room_id, &forward.thread_root_id)
+        .await?;
+
+    let page_cap = config.resync_page_bytes.min(config.resync_byte_cap).max(1);
+    let slice = slice_messages_by_byte_offset(
+        &thread_history,
+        &config.trusted_mxids,
+        Some(&config.owner_mxid),
+        offset,
+        page_cap,
+    );
+
+    let is_solicited = store
+        .get_solicited_thread(&forward.thread_root_id)?
+        .is_some();
+    let should_screen = should_screen_room(config, &forward.room_id, is_solicited);
+
+    let screened = match screen_page_messages(
+        &delivery.message_id,
+        &forward.room_id,
+        &forward.thread_root_id,
+        &slice.messages,
+        should_screen,
+        true,
+        config,
+        matrix,
+        guard,
+        store,
+        now_secs,
+    )
+    .await?
+    {
+        Ok(s) => s,
+        Err(outcome) => {
+            if outcome == BotOutcome::GuardRejected {
+                inbox.ack(&delivery.message_id).await?;
+            }
+            return Ok(outcome);
+        }
+    };
+
+    let transcript = format_paged_resync_lines(
+        &forward.room_id,
+        &forward.thread_root_id,
+        &screened.lines,
+        slice.start_offset,
+        slice.end_offset,
+        slice.total_bytes,
+        screened.unscreened,
+        screened.fail_open_warning,
+    );
+
+    let send_resp = xmsg
+        .reply_message(&delivery.message_id, &transcript)
+        .await?;
+
+    // Advance cursor to the newest line returned on this page, with the asker's session id.
+    let newest_line_id = slice
+        .messages
+        .last()
+        .map(|m| m.event_id.as_str())
+        .or_else(|| thread_history.last().map(|m| m.event_id.as_str()))
+        .unwrap_or(&forward.thread_root_id);
+
+    let asker_origin_key = origin_author_key(delivery);
+    let asker_session_id = asker_origin_key
+        .as_deref()
+        .or_else(|| {
+            (!delivery.from_name.is_empty())
+                .then(|| crate::xmsg::sender_address(&delivery.from_name))
+        })
+        .or(send_resp.session_id.as_deref());
+
+    let existing_target_ref = store
+        .get_thread_cursor(&forward.thread_root_id)?
+        .and_then(|c| c.target_ref);
+    store.set_thread_cursor_with_target(
+        &forward.thread_root_id,
+        newest_line_id,
+        now_secs,
+        asker_session_id,
+        existing_target_ref.as_deref(),
+    )?;
+
+    inbox.ack(&delivery.message_id).await?;
+    Ok(BotOutcome::Resynced)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_context_request<I: SvcInbox + ?Sized>(
+    delivery: &SvcDelivery,
+    outer_obj: &serde_json::Map<String, serde_json::Value>,
+    ctx_obj: &serde_json::Map<String, serde_json::Value>,
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    xmsg: &dyn XmsgClient,
+    guard: &dyn GuardClient,
+    inbox: &mut I,
+    now_secs: i64,
+) -> Result<BotOutcome, AppError> {
+    let orig_id = match delivery
+        .in_reply_to
+        .as_deref()
+        .or_else(|| parse_in_reply_to_id(&delivery.envelope))
+        .or_else(|| parse_in_reply_to_id(&delivery.text))
+    {
+        Some(id) => id.to_string(),
+        None => {
+            let _ = xmsg
+                .reply_message(&delivery.message_id, r#"{"context": "unknown"}"#)
+                .await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::ContextUnknown);
+        }
+    };
+
+    let forward = match store.get_forwarded_message(&orig_id)? {
+        Some(f) => f,
+        None => {
+            let _ = xmsg
+                .reply_message(&delivery.message_id, r#"{"context": "unknown"}"#)
+                .await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::ContextUnknown);
+        }
+    };
+
+    // §4 rule 3: Session authorization
+    if !is_caller_bound_to_forward(delivery, &forward, store)? {
+        let _ = xmsg
+            .reply_message(&delivery.message_id, r#"{"context": "unknown"}"#)
+            .await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::ContextUnknown);
+    }
+
+    // §4 rule 1: Room-bound — no request can name another room
+    if ctx_obj.contains_key("room") || outer_obj.contains_key("room") {
+        let reply_json = serde_json::json!({
+            "context": "refused",
+            "error": "cross-room context request refused: room parameter is not permitted"
+        })
+        .to_string();
+        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::ContextRefused);
+    }
+
+    // §4 rule 4: Per-thread rate limit (default 6 per 600 s)
+    if let Err(retry_after) = store.check_and_record_context_rate_limit(
+        &forward.thread_root_id,
+        config.context_rate_limit_count,
+        config.context_rate_limit_window_secs,
+        now_secs,
+    )? {
+        let reply_json = serde_json::json!({
+            "context": "throttled",
+            "retry_after": retry_after
+        })
+        .to_string();
+        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::ContextThrottled);
+    }
+
+    let scope = match ctx_obj.get("scope").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            let reply_json = serde_json::json!({
+                "context": "refused",
+                "error": "missing 'scope' in context request"
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::ContextRefused);
+        }
+    };
+
+    let offset = ctx_obj.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+    let (candidates, kind, role, is_thread_scope): (Vec<EventMessage>, &str, &str, bool) =
+        match scope {
+            "room" => {
+                let req_limit = ctx_obj
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(config.context_max_lines);
+                let effective_limit = req_limit.min(config.context_max_lines);
+
+                let before_id = ctx_obj
+                    .get("before")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(forward.event_id.as_str());
+
+                let sender_filter = ctx_obj
+                    .get("sender")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+
+                let fetch_count = config
+                    .history_n
+                    .max(config.context_max_lines)
+                    .saturating_mul(4)
+                    .max(100);
+                let room_history = matrix.fetch_history(&forward.room_id, fetch_count).await?;
+
+                let (prior_slice, ref_ts_ms): (Vec<EventMessage>, i64) =
+                    if let Some(pos) = room_history.iter().position(|m| m.event_id == before_id) {
+                        let ts = room_history[pos].timestamp_ms;
+                        (room_history[..pos].to_vec(), ts)
+                    } else if let Some(before_ev) =
+                        matrix.fetch_event(&forward.room_id, before_id).await?
+                    {
+                        let ts = before_ev.timestamp_ms;
+                        let filtered = room_history
+                            .into_iter()
+                            .filter(|m| m.timestamp_ms < ts && m.event_id != before_id)
+                            .collect();
+                        (filtered, ts)
+                    } else if before_id == forward.event_id {
+                        let fallback_ts = room_history
+                            .last()
+                            .map(|m| m.timestamp_ms)
+                            .unwrap_or(forward.sent_at * 1000);
+                        let filtered = room_history
+                            .into_iter()
+                            .filter(|m| m.event_id != before_id)
+                            .collect();
+                        (filtered, fallback_ts)
+                    } else {
+                        let reply_json = serde_json::json!({
+                            "context": "refused",
+                            "error": format!("event '{before_id}' not found in room")
+                        })
+                        .to_string();
+                        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                        inbox.ack(&delivery.message_id).await?;
+                        return Ok(BotOutcome::ContextRefused);
+                    };
+
+                // §4 rule 2: top-level room lines only (lines inside other threads are excluded)
+                let mut filtered: Vec<EventMessage> = prior_slice
+                    .into_iter()
+                    .filter(|m| m.thread_root_id.is_none())
+                    .collect();
+
+                // §4 rule 4: sender-filtered lines only within sender_window_secs before the trigger
+                if let Some(sender_mxid) = sender_filter {
+                    let window_ms = (config.sender_window_secs as i64).saturating_mul(1000);
+                    let cutoff_ts = ref_ts_ms.saturating_sub(window_ms);
+                    filtered.retain(|m| {
+                        m.sender_mxid == sender_mxid
+                            && m.timestamp_ms >= cutoff_ts
+                            && m.timestamp_ms <= ref_ts_ms
+                    });
+                }
+
+                if filtered.len() > effective_limit {
+                    filtered = filtered.split_off(filtered.len() - effective_limit);
+                }
+
+                (filtered, "channel", "background", false)
+            }
+            "event" => {
+                let Some(event_id) = ctx_obj
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    let reply_json = serde_json::json!({
+                        "context": "refused",
+                        "error": "missing 'event' in event context request"
+                    })
+                    .to_string();
+                    let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                    inbox.ack(&delivery.message_id).await?;
+                    return Ok(BotOutcome::ContextRefused);
+                };
+
+                let Some((target_msg, fetched_reply_to)) = matrix
+                    .fetch_event_with_reply_target(&forward.room_id, event_id)
+                    .await?
+                else {
+                    let reply_json = serde_json::json!({
+                        "context": "refused",
+                        "error": format!("event '{event_id}' not found in room")
+                    })
+                    .to_string();
+                    let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                    inbox.ack(&delivery.message_id).await?;
+                    return Ok(BotOutcome::ContextRefused);
+                };
+
+                let reply_to_id = match fetched_reply_to {
+                    Some(rt) => Some(rt),
+                    None => store.get_event_reply_target(&forward.room_id, event_id)?,
+                };
+
+                // §3.2: one message, plus the message it replies to (never a whole thread)
+                let mut msgs = Vec::new();
+                if let Some(ref parent_id) = reply_to_id {
+                    if let Some(parent_msg) =
+                        matrix.fetch_event(&forward.room_id, parent_id).await?
+                    {
+                        if parent_msg.event_id != target_msg.event_id {
+                            msgs.push(parent_msg);
+                        }
+                    }
+                }
+                msgs.push(target_msg);
+
+                (msgs, "channel", "background", false)
+            }
+            "thread" => {
+                let Some(thread_id) = ctx_obj
+                    .get("thread")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    let reply_json = serde_json::json!({
+                        "context": "refused",
+                        "error": "missing 'thread' in thread context request"
+                    })
+                    .to_string();
+                    let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                    inbox.ack(&delivery.message_id).await?;
+                    return Ok(BotOutcome::ContextRefused);
+                };
+
+                let thread_msgs = matrix
+                    .fetch_thread_history(&forward.room_id, thread_id)
+                    .await?;
+                if thread_msgs.is_empty() {
+                    let reply_json = serde_json::json!({
+                        "context": "refused",
+                        "error": format!("thread '{thread_id}' not found in room")
+                    })
+                    .to_string();
+                    let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                    inbox.ack(&delivery.message_id).await?;
+                    return Ok(BotOutcome::ContextRefused);
+                }
+
+                (thread_msgs, "thread", "thread", true)
+            }
+            _ => {
+                let reply_json = serde_json::json!({
+                    "context": "refused",
+                    "error": format!("unsupported context scope '{scope}'")
+                })
+                .to_string();
+                let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                inbox.ack(&delivery.message_id).await?;
+                return Ok(BotOutcome::ContextRefused);
+            }
+        };
+
+    let page_cap = config.context_max_bytes.max(1);
+    let slice = slice_messages_by_byte_offset(
+        &candidates,
+        &config.trusted_mxids,
+        Some(&config.owner_mxid),
+        offset,
+        page_cap,
+    );
+
+    let is_solicited = store
+        .get_solicited_thread(&forward.thread_root_id)?
+        .is_some();
+    let should_screen = should_screen_room(config, &forward.room_id, is_solicited);
+
+    let screened = match screen_page_messages(
+        &delivery.message_id,
+        &forward.room_id,
+        &forward.thread_root_id,
+        &slice.messages,
+        should_screen,
         false,
-    )))
+        config,
+        matrix,
+        guard,
+        store,
+        now_secs,
+    )
+    .await?
+    {
+        Ok(s) => s,
+        Err(outcome) => {
+            if outcome == BotOutcome::GuardRejected {
+                inbox.ack(&delivery.message_id).await?;
+            }
+            return Ok(outcome);
+        }
+    };
+
+    let next_call_json = if slice.end_offset < slice.total_bytes {
+        let mut next_ctx = ctx_obj.clone();
+        next_ctx.insert(
+            "offset".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(slice.end_offset)),
+        );
+        Some(serde_json::json!({ "context": next_ctx }).to_string())
+    } else {
+        None
+    };
+
+    let response_text = format_paged_context_lines(
+        &forward.room_id,
+        &forward.thread_root_id,
+        kind,
+        role,
+        &screened.lines,
+        slice.start_offset,
+        slice.end_offset,
+        slice.total_bytes,
+        next_call_json.as_deref(),
+        is_thread_scope,
+        screened.unscreened,
+        screened.fail_open_warning,
+    );
+
+    xmsg.reply_message(&delivery.message_id, &response_text)
+        .await?;
+    inbox.ack(&delivery.message_id).await?;
+    Ok(BotOutcome::ContextAnswered)
 }
 
 pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
@@ -2025,149 +2820,18 @@ pub async fn handle_inbox_delivery_with_guard<I: SvcInbox + ?Sized>(
     // one still sending waits here for its record instead of being dropped as unknown.
     drop(store.forward_gate.write().await);
 
-    let is_resync = if let Ok(val) = serde_json::from_str::<serde_json::Value>(delivery.text.trim())
-    {
-        val.get("resync").and_then(|v| v.as_bool()).unwrap_or(false)
-    } else {
-        false
-    };
+    if let Some(offset) = extract_resync_offset(&delivery.text) {
+        return handle_resync_request(
+            delivery, offset, config, matrix, store, xmsg, guard, inbox, now_secs,
+        )
+        .await;
+    }
 
-    if is_resync {
-        let orig_id = match delivery
-            .in_reply_to
-            .as_deref()
-            .or_else(|| parse_in_reply_to_id(&delivery.envelope))
-            .or_else(|| parse_in_reply_to_id(&delivery.text))
-        {
-            Some(id) => id.to_string(),
-            None => {
-                let _ = xmsg
-                    .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
-                    .await;
-                inbox.ack(&delivery.message_id).await?;
-                return Ok(BotOutcome::ResyncUnknown);
-            }
-        };
-
-        let forward = match store.get_forwarded_message(&orig_id)? {
-            Some(f) => f,
-            None => {
-                let _ = xmsg
-                    .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
-                    .await;
-                inbox.ack(&delivery.message_id).await?;
-                return Ok(BotOutcome::ResyncUnknown);
-            }
-        };
-
-        // Rate: at most one resync per thread per 60 s
-        if let Err(retry_after) =
-            store.check_and_record_thread_resync(&forward.thread_root_id, now_secs, 60)?
-        {
-            let reply_json = serde_json::json!({
-                "resync": "throttled",
-                "retry_after": retry_after
-            })
-            .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
-            inbox.ack(&delivery.message_id).await?;
-            return Ok(BotOutcome::ResyncThrottled);
-        }
-
-        // Paged thread history fetch from root
-        let thread_history = matrix
-            .fetch_thread_history(&forward.room_id, &forward.thread_root_id)
-            .await?;
-
-        // Background room history
-        let room_history = matrix
-            .fetch_history(&forward.room_id, config.history_n)
-            .await?;
-        let root_idx_opt = room_history
-            .iter()
-            .position(|m| m.event_id == forward.thread_root_id);
-        let background_msgs: Vec<EventMessage> = match root_idx_opt {
-            Some(idx) => room_history[..idx]
-                .iter()
-                .filter(|m| m.thread_root_id.is_none())
-                .cloned()
-                .collect(),
-            None => Vec::new(),
-        };
-
-        let is_solicited = store
-            .get_solicited_thread(&forward.thread_root_id)?
-            .is_some();
-        let should_screen = is_solicited || config.screen_mentions;
-
-        let transcript = if should_screen {
-            match screen_resync_transcript(
-                &delivery.message_id,
-                &forward.room_id,
-                &forward.thread_root_id,
-                &background_msgs,
-                &thread_history,
-                config,
-                matrix,
-                guard,
-                store,
-                now_secs,
-            )
-            .await?
-            {
-                Ok(t) => t,
-                Err(outcome) => {
-                    if outcome == BotOutcome::GuardRejected {
-                        inbox.ack(&delivery.message_id).await?;
-                    }
-                    return Ok(outcome);
-                }
-            }
-        } else {
-            format_resync_transcript(
-                &forward.room_id,
-                &forward.thread_root_id,
-                &background_msgs,
-                &thread_history,
-                &config.trusted_mxids,
-                Some(&config.owner_mxid),
-                config.resync_byte_cap,
-            )
-        };
-
-        let send_resp = xmsg
-            .reply_message(&delivery.message_id, &transcript)
-            .await?;
-
-        // The thread's cursor (M16) then points at the newest line sent, with the asker's session id.
-        let newest_line_id = thread_history
-            .last()
-            .map(|m| m.event_id.as_str())
-            .unwrap_or(&forward.thread_root_id);
-
-        // The asker's address (`id@node`), from attested origin or its label (`label · id@node`, A12).
-        let asker_origin_key = origin_author_key(delivery);
-        let asker_session_id = asker_origin_key
-            .as_deref()
-            .or_else(|| {
-                (!delivery.from_name.is_empty())
-                    .then(|| crate::xmsg::sender_address(&delivery.from_name))
-            })
-            .or(send_resp.session_id.as_deref());
-
-        let existing_target_ref = store
-            .get_thread_cursor(&forward.thread_root_id)?
-            .and_then(|c| c.target_ref);
-        store.set_thread_cursor_with_target(
-            &forward.thread_root_id,
-            newest_line_id,
-            now_secs,
-            asker_session_id,
-            existing_target_ref.as_deref(),
-        )?;
-
-        inbox.ack(&delivery.message_id).await?;
-        return Ok(BotOutcome::Resynced);
+    if let Some((outer_obj, ctx_obj)) = extract_context_request(&delivery.text) {
+        return handle_context_request(
+            delivery, &outer_obj, &ctx_obj, config, matrix, store, xmsg, guard, inbox, now_secs,
+        )
+        .await;
     }
 
     let orig_id = match delivery
@@ -2550,7 +3214,13 @@ pub async fn handle_incoming_reaction(
         })
         .to_string();
 
-        let target_ref = control_target_ref(config, store, &thread_id, &reaction.sender_mxid)?;
+        let target_ref = control_target_ref(
+            config,
+            store,
+            &reaction.room_id,
+            &thread_id,
+            &reaction.sender_mxid,
+        )?;
         xmsg.send_message(&target_ref, &mapped_sender, &payload)
             .await?;
 
@@ -2593,7 +3263,13 @@ pub async fn handle_incoming_reaction(
     .to_string();
 
     let mapped_sender = map_sender_mxid(&reaction.sender_mxid);
-    let target_ref = control_target_ref(config, store, &thread_id, &reaction.sender_mxid)?;
+    let target_ref = control_target_ref(
+        config,
+        store,
+        &reaction.room_id,
+        &thread_id,
+        &reaction.sender_mxid,
+    )?;
     xmsg.send_message(&target_ref, &mapped_sender, &payload)
         .await?;
 
