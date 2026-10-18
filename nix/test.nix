@@ -73,10 +73,15 @@ pkgs.testers.nixosTest {
         # 2. Verify that matrix-xmsg fails to become active due to missing credential
         machine.wait_until_fails("systemctl is-active --quiet matrix-xmsg.service")
 
-        # 3. Assert the exact failure is step CREDENTIALS with exit status 243
-        journal = machine.succeed("journalctl -u matrix-xmsg.service")
-        assert "Failed at step CREDENTIALS" in journal, f"Expected CREDENTIALS failure, got: {journal}"
-        assert "status=243/CREDENTIALS" in journal, f"Expected status 243/CREDENTIALS, got: {journal}"
+        # 3. Assert the exact failure is step CREDENTIALS with exit status 243. The unit's recorded exit
+        #    status is the deterministic signal; the executor's "Failed at step" journal line can land after
+        #    the unit is already inactive, so it is awaited rather than read once.
+        machine.wait_until_succeeds(
+            "test \"$(systemctl show -p ExecMainStatus --value matrix-xmsg.service)\" = 243", timeout=30
+        )
+        machine.wait_until_succeeds(
+            "journalctl -u matrix-xmsg.service | grep -qF 'Failed at step CREDENTIALS'", timeout=30
+        )
       ''
     else if mode == "mutant-wrong-token" then
       ''
@@ -90,8 +95,11 @@ pkgs.testers.nixosTest {
         # 2. Wait for matrix-xmsg service to start
         machine.wait_for_unit("matrix-xmsg.service")
 
-        # 3. Allow time for sync loop attempts and 3-second backoff
-        machine.sleep(6)
+        # 3. Wait for three rejected sync attempts, however slowly the machine runs. Each attempt logs one
+        #    `Sync error:` line (`retrying in 3 seconds`); its 401 lines also come from the room join, several per attempt.
+        machine.wait_until_succeeds(
+            "test \"$(journalctl -u matrix-xmsg.service | grep -cF 'Sync error:')\" -ge 3", timeout=60
+        )
 
         # 4. Assert that no reply was ever received by the Matrix server
         res = machine.succeed("test -f /tmp/matrix_reply_received.json && echo 'present' || echo 'absent'").strip()
@@ -102,9 +110,16 @@ pkgs.testers.nixosTest {
         assert "UnknownToken" in journal or "401" in journal, f"Expected 401/UnknownToken in journal, got: {journal}"
         assert "Invalid or missing access token" in journal, f"Expected token error in journal, got: {journal}"
 
-        # 6. Verify backoff bounded: count should be 2..4 in 6s window (proves 3s backoff and no hot spinning)
-        status_401_count = journal.count("status_code: 401")
-        assert 2 <= status_401_count <= 5, f"Expected 2..5 401 attempts with 3s backoff in 6s window, got {status_401_count}"
+        # 6. Verify the 3-second backoff from the attempts' own timestamps (no hot spinning), not from a count
+        #    in a fixed wall-clock window, which depends on how fast the machine runs
+        stamps = [
+            float(l.split()[0])
+            for l in machine.succeed("journalctl -u matrix-xmsg.service -o short-unix").splitlines()
+            if "Sync error:" in l
+        ]
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        assert len(gaps) >= 2 and min(gaps) >= 2.5, f"Expected >=3s backoff between 401 attempts, got gaps {gaps}"
+        assert "status_code: 401" in journal, f"Expected the 401 response in journal, got: {journal}"
 
         # 7. Clean shutdown within TimeoutStopSec
         machine.succeed("systemctl stop matrix-xmsg.service")
