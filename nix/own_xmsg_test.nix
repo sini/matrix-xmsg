@@ -76,6 +76,11 @@ pkgs.testers.nixosTest {
         mode = "0400";
       };
 
+      environment.etc."matrix-store-passphrase" = {
+        text = "test_store_passphrase_secret\n";
+        mode = "0400";
+      };
+
       systemd.services.mock-matrix = {
         description = "Mock Matrix homeserver (Matrix only)";
         wantedBy = [ "multi-user.target" ];
@@ -117,6 +122,7 @@ pkgs.testers.nixosTest {
         homeserverUrl = "http://127.0.0.1:8008";
         botMxid = "@bot:test.local";
         accessTokenFile = "/etc/matrix-token";
+        storePassphraseFile = "/etc/matrix-store-passphrase";
         rooms = [ "!test:test.local" ];
         trustedMxids = [ "@trusted:test.local" ];
         ownerMxid = "@owner:test.local";

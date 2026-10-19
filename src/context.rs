@@ -33,6 +33,18 @@ pub enum ContextMode {
     },
 }
 
+pub const UNDECRYPTABLE_BODY_SENTINEL: &str = "\0__matrix_xmsg_undecryptable__";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndecryptablePlaceholderLine {
+    pub event_id: String,
+    pub sender: String,
+    pub ts: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root: Option<String>,
+    pub undecryptable: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventMessage {
     pub event_id: String,
@@ -40,6 +52,27 @@ pub struct EventMessage {
     pub timestamp_ms: i64,
     pub body: String,
     pub thread_root_id: Option<String>,
+}
+
+impl EventMessage {
+    pub fn new_undecryptable(
+        event_id: String,
+        sender_mxid: String,
+        timestamp_ms: i64,
+        thread_root_id: Option<String>,
+    ) -> Self {
+        Self {
+            event_id,
+            sender_mxid,
+            timestamp_ms,
+            body: UNDECRYPTABLE_BODY_SENTINEL.to_string(),
+            thread_root_id,
+        }
+    }
+
+    pub fn is_undecryptable(&self) -> bool {
+        self.body == UNDECRYPTABLE_BODY_SENTINEL
+    }
 }
 
 /// Computes the authenticated tier ("trusted" or "public") for a Matrix sender ID.
@@ -73,7 +106,14 @@ pub fn format_timestamp(timestamp_ms: i64) -> String {
         .unwrap_or_else(|| "00:00".to_string())
 }
 
-/// Formats a single EventMessage into a RelayedLine JSON string.
+/// Formats millisecond timestamp as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn format_iso_timestamp(timestamp_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Formats a single EventMessage into a RelayedLine JSON string (or UndecryptablePlaceholderLine for undecryptable events).
 pub fn format_context_line(
     msg: &EventMessage,
     trusted_mxids: &[String],
@@ -89,6 +129,16 @@ pub fn format_context_line_with_screening(
     rewritten: Option<bool>,
     screened: Option<bool>,
 ) -> String {
+    if msg.is_undecryptable() {
+        return serde_json::to_string(&UndecryptablePlaceholderLine {
+            event_id: msg.event_id.clone(),
+            sender: msg.sender_mxid.clone(),
+            ts: format_iso_timestamp(msg.timestamp_ms),
+            thread_root: msg.thread_root_id.clone(),
+            undecryptable: true,
+        })
+        .unwrap_or_default();
+    }
     let sender_name = map_sender_mxid(&msg.sender_mxid);
     let trust_tag = compute_sender_tier(&msg.sender_mxid, trusted_mxids, owner_mxid);
     // F5 & N5: Collapse newlines, Unicode separators (U+2028, U+2029, U+0085), and control chars
@@ -125,7 +175,8 @@ pub struct SelectedContext<'a> {
 
 impl<'a> SelectedContext<'a> {
     /// Converts the selected context messages into `GuardLine`s for `GuardEnvelope.history`,
-    /// in envelope order (channel background first, then thread), excluding the bot's own posts.
+    /// in envelope order (channel background first, then thread), excluding the bot's own posts
+    /// and undecryptable placeholders (§5.3: placeholders are never sent to the guard).
     pub fn to_guard_history(
         &self,
         bot_mxid: &str,
@@ -135,7 +186,7 @@ impl<'a> SelectedContext<'a> {
         self.channel_msgs
             .iter()
             .chain(self.thread_msgs.iter())
-            .filter(|m| m.sender_mxid != bot_mxid)
+            .filter(|m| m.sender_mxid != bot_mxid && !m.is_undecryptable())
             .map(|m| crate::xmsg::GuardLine {
                 sender: m.sender_mxid.clone(),
                 tier: compute_sender_tier(&m.sender_mxid, trusted_mxids, owner_mxid).to_string(),

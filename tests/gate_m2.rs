@@ -118,6 +118,8 @@ fn test_config(homeserver_url: &str) -> Config {
         guard_failure_mode: matrix_xmsg::config::GuardFailureMode::Closed,
         guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
+        store_passphrase_file: None,
+        undecryptable_wait_secs: 10,
         rate_limit_count: 5,
         rate_limit_window_secs: 60,
         size_cap_bytes: 2048,
@@ -1769,10 +1771,17 @@ async fn test_n9_run_daemon_loop_resumes_from_persisted_sync_token() {
         .await;
 
     let store = Arc::new(Store::new_in_memory().unwrap());
-    store.set_sync_token(saved_token).unwrap();
 
     let config = test_config(&mock_server.uri());
     let sdk = MatrixSdkClient::new(&config.homeserver_url, &config.bot_mxid, "syt_token")
+        .await
+        .unwrap();
+    sdk.inner()
+        .state_store()
+        .set_kv_data(
+            matrix_sdk::store::StateStoreDataKey::SyncToken,
+            matrix_sdk::store::StateStoreDataValue::SyncToken(saved_token.to_string()),
+        )
         .await
         .unwrap();
 
@@ -1793,10 +1802,14 @@ async fn test_n9_run_daemon_loop_resumes_from_persisted_sync_token() {
         "run_daemon_loop must exit cleanly on shutdown: {loop_res:?}"
     );
 
-    assert_eq!(
-        store.get_sync_token().unwrap(),
-        Some("next_token_43".to_string())
-    );
+    let persisted = sdk
+        .inner()
+        .state_store()
+        .get_kv_data(matrix_sdk::store::StateStoreDataKey::SyncToken)
+        .await
+        .unwrap()
+        .and_then(|v| v.into_sync_token());
+    assert_eq!(persisted, Some("next_token_43".to_string()));
 }
 
 #[test]
@@ -2073,7 +2086,6 @@ async fn test_n1_double_post() {
         .await;
 
     let store = Arc::new(Store::new_in_memory().unwrap());
-    store.set_sync_token("saved_tok").unwrap();
 
     let config = Arc::new(test_config(&mock_server.uri()));
     let sdk = Arc::new(
@@ -2081,6 +2093,14 @@ async fn test_n1_double_post() {
             .await
             .unwrap(),
     );
+    sdk.inner()
+        .state_store()
+        .set_kv_data(
+            matrix_sdk::store::StateStoreDataKey::SyncToken,
+            matrix_sdk::store::StateStoreDataValue::SyncToken("saved_tok".to_string()),
+        )
+        .await
+        .unwrap();
     let xmsg = Arc::new(TestXmsgMock::with_delay(Duration::from_millis(400)));
 
     let tracker = register_event_handlers(
@@ -2235,8 +2255,6 @@ async fn test_r5_backlog_suppression_primary_token_guard() {
         .await;
 
     let store = Arc::new(Store::new_in_memory().unwrap());
-    // Store has NO sync token -> initial token-less sync!
-    assert!(store.get_sync_token().unwrap().is_none());
 
     let config = Arc::new(test_config(&mock_server.uri()));
     let sdk = Arc::new(
@@ -2244,6 +2262,14 @@ async fn test_r5_backlog_suppression_primary_token_guard() {
             .await
             .unwrap(),
     );
+    // SDK state store has NO sync token -> initial token-less sync!
+    assert!(sdk
+        .inner()
+        .state_store()
+        .get_kv_data(matrix_sdk::store::StateStoreDataKey::SyncToken)
+        .await
+        .unwrap()
+        .is_none());
     let xmsg = Arc::new(TestXmsgMock::with_reply("answer"));
 
     let _tracker = matrix_xmsg::bot::register_event_handlers_with_startup_ts(
@@ -2392,7 +2418,6 @@ async fn test_p_a_n4_tolerance_resumed_sync() {
         .await;
 
     let store = Arc::new(Store::new_in_memory().unwrap());
-    store.set_sync_token("resumed_tok").unwrap();
 
     let config = Arc::new(test_config(&mock_server.uri()));
     let sdk = Arc::new(
@@ -2400,6 +2425,14 @@ async fn test_p_a_n4_tolerance_resumed_sync() {
             .await
             .unwrap(),
     );
+    sdk.inner()
+        .state_store()
+        .set_kv_data(
+            matrix_sdk::store::StateStoreDataKey::SyncToken,
+            matrix_sdk::store::StateStoreDataValue::SyncToken("resumed_tok".to_string()),
+        )
+        .await
+        .unwrap();
     let xmsg = Arc::new(TestXmsgMock::with_reply("answer"));
 
     let _tracker = matrix_xmsg::bot::register_event_handlers_with_startup_ts(

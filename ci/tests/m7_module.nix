@@ -455,6 +455,59 @@ in
           });
       expected = true;
     };
+
+    test-m36-e2ee-setup-oneshot-and-no-recovery-key-on-bot-unit =
+      let
+        res = evalModule {
+          storePassphraseFile = "/run/agenix/matrix-xmsg-store-key";
+          recoveryKeyFile = "/run/agenix/matrix-xmsg-recovery-key";
+          resetCryptoStore = true;
+        };
+        botSvc = res.config.systemd.services.matrix-xmsg;
+        setupSvc = res.config.systemd.services.matrix-xmsg-e2ee-setup;
+      in
+      {
+        expr = {
+          assertions = map (a: a.message) (builtins.filter (a: !a.assertion) res.config.assertions);
+          botLoadCredential = botSvc.serviceConfig.LoadCredential;
+          botHasRecoveryKey = lib.any (lib.hasInfix "recovery-key") botSvc.serviceConfig.LoadCredential;
+          botExecHasRecoveryKey = lib.hasInfix "recovery-key" botSvc.serviceConfig.ExecStart;
+          setupType = setupSvc.serviceConfig.Type;
+          setupLoadCredential = setupSvc.serviceConfig.LoadCredential;
+          setupHasE2eeSetupFlag = lib.hasInfix "--e2ee-setup" setupSvc.serviceConfig.ExecStart;
+          setupHasResetFlag = lib.hasInfix "--reset-crypto-store" setupSvc.serviceConfig.ExecStart;
+          setupHasRecoveryKeyArg = lib.hasInfix "--recovery-key-file /run/credentials/matrix-xmsg-e2ee-setup.service/recovery-key" setupSvc.serviceConfig.ExecStart;
+        };
+        expected = {
+          assertions = [ ];
+          botLoadCredential = [
+            "access-token:/run/token"
+            "store-passphrase:/run/agenix/matrix-xmsg-store-key"
+          ];
+          botHasRecoveryKey = false;
+          botExecHasRecoveryKey = false;
+          setupType = "oneshot";
+          setupLoadCredential = [
+            "access-token:/run/token"
+            "store-passphrase:/run/agenix/matrix-xmsg-store-key"
+            "recovery-key:/run/agenix/matrix-xmsg-recovery-key"
+          ];
+          setupHasE2eeSetupFlag = true;
+          setupHasResetFlag = true;
+          setupHasRecoveryKeyArg = true;
+        };
+      };
+
+    test-m36-reset-crypto-store-requires-recovery-key = {
+      expr =
+        builtins.elem
+          "services.matrix-xmsg.resetCryptoStore requires services.matrix-xmsg.recoveryKeyFile to be set.\n"
+          (evalConfig {
+            storePassphraseFile = "/run/agenix/matrix-xmsg-store-key";
+            resetCryptoStore = true;
+          });
+      expected = true;
+    };
   };
 
   perSystem =

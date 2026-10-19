@@ -42,6 +42,51 @@
         description = accessTokenDescription;
       };
 
+      storePassphraseFile = lib.mkOption {
+        type = lib.types.nullOr (
+          lib.types.addCheck lib.types.str (
+            s: !builtins.hasContext s && !lib.hasPrefix builtins.storeDir s && lib.hasPrefix "/" s
+          )
+        );
+        default = null;
+        example = "/run/secrets/matrix-xmsg-store-key";
+        description = ''
+          Runtime path to file containing the passphrase that encrypts the matrix-sdk SQLite crypto store at rest.
+          Loaded securely via systemd LoadCredential on NixOS; never copied into `/nix/store`.
+        '';
+      };
+
+      recoveryKeyFile = lib.mkOption {
+        type = lib.types.nullOr (
+          lib.types.addCheck lib.types.str (
+            s: !builtins.hasContext s && !lib.hasPrefix builtins.storeDir s && lib.hasPrefix "/" s
+          )
+        );
+        default = null;
+        example = "/run/secrets/matrix-xmsg-recovery-key";
+        description = ''
+          Runtime path to file containing the Matrix secret-storage recovery key or passphrase.
+          Read ONLY by `matrix-xmsg-e2ee-setup.service` via its own `LoadCredential`;
+          never rendered into `config.toml` and never mounted on `matrix-xmsg.service`.
+        '';
+      };
+
+      resetCryptoStore = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          When true, passes `--reset-crypto-store` to `matrix-xmsg-e2ee-setup.service` so an empty local crypto store
+          can recover the bot's cross-signing identity and room-key backup from server-side secret storage.
+          Has no effect when the local crypto store is non-empty.
+        '';
+      };
+
+      undecryptableWaitSecs = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 10;
+        description = "Time in seconds to wait off the sync loop for late room keys before treating an encrypted event as undecryptable.";
+      };
+
       rooms = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
@@ -380,11 +425,24 @@
           services.matrix-xmsg.guardRef must be set when services.matrix-xmsg.screenMentions or services.matrix-xmsg.screenSolicited is enabled (globally or in roomRoutes).
         '';
       }
+      {
+        assertion = cfg.resetCryptoStore -> cfg.recoveryKeyFile != null;
+        message = ''
+          services.matrix-xmsg.resetCryptoStore requires services.matrix-xmsg.recoveryKeyFile to be set.
+        '';
+      }
     ];
 
   mkConfigAttrs =
-    { lib }:
+    {
+      lib,
+      storePassphraseFile ? null,
+    }:
     cfg: accessTokenFile:
+    let
+      effectiveStorePassphraseFile =
+        if storePassphraseFile != null then storePassphraseFile else cfg.storePassphraseFile;
+    in
     {
       homeserver_url = cfg.homeserverUrl;
       bot_mxid = cfg.botMxid;
@@ -415,7 +473,11 @@
       answer_timeout_secs = cfg.answerTimeoutSecs;
       session_live_secs = cfg.sessionLiveSecs;
       inbox_retry_budget = cfg.inboxRetryBudget;
+      undecryptable_wait_secs = cfg.undecryptableWaitSecs;
       db_path = toString cfg.dbPath;
+    }
+    // lib.optionalAttrs (effectiveStorePassphraseFile != null) {
+      store_passphrase_file = toString effectiveStorePassphraseFile;
     }
     // lib.optionalAttrs (cfg.guardRef != null) {
       guard_ref = cfg.guardRef;
@@ -452,10 +514,16 @@
     };
 
   mkConfigToml =
-    { lib, pkgs }:
+    {
+      lib,
+      pkgs,
+      storePassphraseFile ? null,
+    }:
     cfg: accessTokenFile:
     let
-      attrs = (import ./options.nix).mkConfigAttrs { inherit lib; } cfg accessTokenFile;
+      attrs = (import ./options.nix).mkConfigAttrs {
+        inherit lib storePassphraseFile;
+      } cfg accessTokenFile;
     in
     ((pkgs.formats.toml { }).generate "matrix-xmsg-config.toml" attrs).overrideAttrs (old: {
       passthru = (old.passthru or { }) // {

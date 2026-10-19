@@ -106,6 +106,8 @@ fn test_config() -> Config {
         guard_failure_mode: GuardFailureMode::Closed,
         guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
+        store_passphrase_file: None,
+        undecryptable_wait_secs: 10,
         history_n: 10,
         history_byte_cap: 12 * 1024,
         resync_byte_cap: 65536,

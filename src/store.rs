@@ -116,6 +116,7 @@ impl Store {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            DELETE FROM bot_meta WHERE key = 'sync_token';
             CREATE TABLE IF NOT EXISTS dm_rooms (
                 user_mxid TEXT PRIMARY KEY,
                 room_id TEXT NOT NULL,
@@ -338,33 +339,6 @@ impl Store {
         )
         .map_err(|e| AppError::Store(e.to_string()))?;
 
-        Ok(())
-    }
-
-    /// Retrieves the persisted sync token (next_batch) if available.
-    pub fn get_sync_token(&self) -> Result<Option<String>, AppError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT value FROM bot_meta WHERE key = 'sync_token'")
-            .map_err(|e| AppError::Store(e.to_string()))?;
-
-        let res = stmt.query_row([], |row| row.get(0));
-        match res {
-            Ok(token) => Ok(Some(token)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(AppError::Store(e.to_string())),
-        }
-    }
-
-    /// Persists the Matrix sync token (next_batch) into the bot_meta table.
-    pub fn set_sync_token(&self, token: &str) -> Result<(), AppError> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO bot_meta (key, value) VALUES ('sync_token', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = ?1",
-            params![token],
-        )
-        .map_err(|e| AppError::Store(e.to_string()))?;
         Ok(())
     }
 
@@ -1441,24 +1415,6 @@ mod tests {
 
         // Attempt after window (t = 61) succeeds (since cutoff = 1, t = 0 expired)
         assert!(store.check_and_record_rate_limit(user, 5, 60, 61).is_ok());
-    }
-
-    #[test]
-    fn test_sync_token_persistence() {
-        let store = Store::new_in_memory().unwrap();
-        assert_eq!(store.get_sync_token().unwrap(), None);
-
-        store.set_sync_token("syt_batch_001").unwrap();
-        assert_eq!(
-            store.get_sync_token().unwrap(),
-            Some("syt_batch_001".to_string())
-        );
-
-        store.set_sync_token("syt_batch_002").unwrap();
-        assert_eq!(
-            store.get_sync_token().unwrap(),
-            Some("syt_batch_002".to_string())
-        );
     }
 
     #[test]

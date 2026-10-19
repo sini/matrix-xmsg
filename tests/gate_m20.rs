@@ -123,6 +123,8 @@ fn test_config() -> Config {
         guard_failure_mode: matrix_xmsg::config::GuardFailureMode::Closed,
         guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
+        store_passphrase_file: None,
+        undecryptable_wait_secs: 10,
         rate_limit_count: 10,
         rate_limit_window_secs: 60,
         size_cap_bytes: 4096,
@@ -148,12 +150,6 @@ async fn oracle_1_restart_with_saved_sync_token_posts_in_quiet_room() {
         .contains("!quiet:example.org"));
 
     let store = Arc::new(Store::new_in_memory().unwrap());
-    // Persist saved sync token (simulated restart with sync token)
-    store.set_sync_token("s_saved_batch_token_999").unwrap();
-    assert_eq!(
-        store.get_sync_token().unwrap().as_deref(),
-        Some("s_saved_batch_token_999")
-    );
 
     let xmsg = Arc::new(MockXmsgClient::default());
 

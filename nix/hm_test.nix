@@ -27,6 +27,7 @@ pkgs.testers.nixosTest {
 
       systemd.tmpfiles.rules = [
         "f /home/alice/matrix-token 0600 alice users - syt_valid_test_token_12345"
+        "f /home/alice/matrix-store-passphrase 0600 alice users - test_store_passphrase_secret"
       ];
 
       systemd.services.mock-matrix = {
@@ -69,6 +70,7 @@ pkgs.testers.nixosTest {
           homeserverUrl = "http://127.0.0.1:8008";
           botMxid = "@bot:test.local";
           accessTokenFile = "/home/alice/matrix-token";
+          storePassphraseFile = "/home/alice/matrix-store-passphrase";
           rooms = [ "!test:test.local" ];
           trustedMxids = [ "@trusted:test.local" ];
           ownerMxid = "@owner:test.local";

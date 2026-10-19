@@ -129,6 +129,8 @@ fn test_config() -> Config {
         guard_failure_mode: matrix_xmsg::config::GuardFailureMode::Closed,
         guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
+        store_passphrase_file: None,
+        undecryptable_wait_secs: 10,
         db_path: PathBuf::from(":memory:"),
     }
 }

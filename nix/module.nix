@@ -17,7 +17,21 @@ let
   # Systemd LoadCredential mounts the secret at /run/credentials/matrix-xmsg.service/access-token
   configToml = shared.mkConfigToml {
     inherit lib pkgs;
+    storePassphraseFile =
+      if cfg.storePassphraseFile != null then
+        "/run/credentials/matrix-xmsg.service/store-passphrase"
+      else
+        null;
   } cfg "/run/credentials/matrix-xmsg.service/access-token";
+
+  setupConfigToml = shared.mkConfigToml {
+    inherit lib pkgs;
+    storePassphraseFile =
+      if cfg.storePassphraseFile != null then
+        "/run/credentials/matrix-xmsg-e2ee-setup.service/store-passphrase"
+      else
+        null;
+  } cfg "/run/credentials/matrix-xmsg-e2ee-setup.service/access-token";
 
   peersFile =
     pkgs.runCommand "matrix-xmsg-xmsg-peers.json"
@@ -220,7 +234,11 @@ in
     systemd.services = {
       matrix-xmsg = {
         description = "matrix-xmsg Matrix bot backed by xmsg agent";
-        after = [ "network.target" ] ++ lib.optional xmsgCfg.enable "matrix-xmsg-xmsg.service";
+        after = [
+          "network.target"
+        ]
+        ++ lib.optional xmsgCfg.enable "matrix-xmsg-xmsg.service"
+        ++ lib.optional (cfg.recoveryKeyFile != null) "matrix-xmsg-e2ee-setup.service";
         wantedBy = [ "multi-user.target" ];
 
         serviceConfig = {
@@ -238,8 +256,13 @@ in
           RuntimeDirectory = "matrix-xmsg";
           WorkingDirectory = cfg.stateDir;
 
-          # Secure Token Loading via Systemd Credentials
-          LoadCredential = [ "access-token:${toString cfg.accessTokenFile}" ];
+          # Secure Token and Store Passphrase Loading via Systemd Credentials (never recovery-key; §4.3)
+          LoadCredential = [
+            "access-token:${toString cfg.accessTokenFile}"
+          ]
+          ++ lib.optional (
+            cfg.storePassphraseFile != null
+          ) "store-passphrase:${toString cfg.storePassphraseFile}";
 
           # Graceful shutdown margin (drain 5s + notice 5s + margin)
           TimeoutStopSec = 60;
@@ -284,6 +307,74 @@ in
         }
         // lib.optionalAttrs (cfg.xmsgSocket != null) {
           BindPaths = [ (toString cfg.xmsgSocket) ];
+        };
+      };
+    }
+    // lib.optionalAttrs (cfg.recoveryKeyFile != null) {
+      matrix-xmsg-e2ee-setup = {
+        description = "matrix-xmsg E2EE bootstrap and recovery setup oneshot";
+        after = [ "network.target" ];
+        before = [ "matrix-xmsg.service" ];
+        requiredBy = [ "matrix-xmsg.service" ];
+        wantedBy = [ "multi-user.target" ];
+
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart =
+            "${lib.getExe cfg.package} --config ${setupConfigToml} --e2ee-setup --recovery-key-file /run/credentials/matrix-xmsg-e2ee-setup.service/recovery-key"
+            + lib.optionalString cfg.resetCryptoStore " --reset-crypto-store";
+
+          DynamicUser = cfg.dynamicUser;
+          User = lib.mkIf (!cfg.dynamicUser) cfg.user;
+          Group = lib.mkIf (!cfg.dynamicUser && (cfg.user == "matrix-xmsg" || cfg.group != null)) (
+            if cfg.group != null then cfg.group else "matrix-xmsg"
+          );
+          StateDirectory = "matrix-xmsg";
+          RuntimeDirectory = "matrix-xmsg-e2ee-setup";
+          WorkingDirectory = cfg.stateDir;
+
+          # Only the oneshot setup unit mounts the recovery key (§4.3, gate P3).
+          LoadCredential = [
+            "access-token:${toString cfg.accessTokenFile}"
+          ]
+          ++ lib.optional (
+            cfg.storePassphraseFile != null
+          ) "store-passphrase:${toString cfg.storePassphraseFile}"
+          ++ [ "recovery-key:${toString cfg.recoveryKeyFile}" ];
+
+          CapabilityBoundingSet = "";
+          DevicePolicy = "closed";
+          LockPersonality = true;
+          MemoryDenyWriteExecute = true;
+          NoNewPrivileges = true;
+          PrivateDevices = true;
+          PrivateTmp = true;
+          PrivateUsers = true;
+          ProtectClock = true;
+          ProtectControlGroups = true;
+          ProtectHome = true;
+          ProtectHostname = true;
+          ProtectKernelLogs = true;
+          ProtectKernelModules = true;
+          ProtectKernelTunables = true;
+          ProtectProc = "invisible";
+          ProtectSystem = "strict";
+          RemoveIPC = true;
+          RestrictAddressFamilies = [
+            "AF_INET"
+            "AF_INET6"
+            "AF_UNIX"
+          ];
+          RestrictNamespaces = true;
+          RestrictRealtime = true;
+          RestrictSUIDSGID = true;
+          SystemCallArchitectures = "native";
+          SystemCallFilter = [
+            "@system-service"
+            "~@privileged"
+          ];
+          UMask = "0077";
         };
       };
     }

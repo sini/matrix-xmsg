@@ -100,6 +100,11 @@ pub trait MatrixClient: Send + Sync {
     async fn resolve_rooms(&self, _rooms: &[String]) -> Result<(), AppError> {
         Ok(())
     }
+
+    /// Returns Some(true/false) when backed by a persistent SDK state store, or None for in-memory test clients.
+    fn had_initial_sync_token(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// Real Matrix client backed by `matrix-sdk`.
@@ -108,6 +113,196 @@ pub struct MatrixSdkClient {
     dm_rooms: Mutex<std::collections::HashMap<String, String>>,
     store: Mutex<Option<std::sync::Arc<crate::store::Store>>>,
     configured_rooms: Mutex<std::collections::HashSet<String>>,
+    encryption_enabled: bool,
+    had_initial_sync_token: std::sync::atomic::AtomicBool,
+}
+
+pub fn is_crypto_store_empty(state_dir: &std::path::Path) -> Result<bool, AppError> {
+    let crypto_db = state_dir.join("matrix-sdk-crypto.sqlite3");
+    let Ok(meta) = std::fs::metadata(&crypto_db) else {
+        return Ok(true);
+    };
+    if meta.len() == 0 {
+        return Ok(true);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &crypto_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| {
+        AppError::Matrix(format!(
+            "Failed to inspect crypto store at {}: {e}",
+            crypto_db.display()
+        ))
+    })?;
+
+    let table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'kv'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if table_exists == 0 {
+        return Ok(true);
+    }
+    let account_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM kv WHERE key = 'account'", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+    Ok(account_count == 0)
+}
+
+async fn query_whoami_and_server_keys(
+    homeserver_url: &str,
+    access_token: &str,
+    expected_bot_mxid: &str,
+) -> Result<
+    (
+        matrix_sdk::ruma::OwnedUserId,
+        matrix_sdk::ruma::OwnedDeviceId,
+        bool,
+        bool,
+    ),
+    AppError,
+> {
+    let base = homeserver_url.trim_end_matches('/');
+    let http = matrix_sdk::reqwest::Client::new();
+
+    let whoami_url = format!("{base}/_matrix/client/v3/account/whoami");
+    let whoami_resp = http
+        .get(&whoami_url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| AppError::Matrix(format!("Failed to call /account/whoami: {e:?}")))?;
+    if !whoami_resp.status().is_success() {
+        let status = whoami_resp.status();
+        let body = whoami_resp.text().await.unwrap_or_default();
+        return Err(AppError::Matrix(format!(
+            "/account/whoami returned HTTP {} (status_code: {}): {}",
+            status,
+            status.as_u16(),
+            body
+        )));
+    }
+    let whoami_bytes = whoami_resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::Matrix(format!("Failed to read /account/whoami body: {e}")))?;
+    let whoami_json: serde_json::Value = serde_json::from_slice(&whoami_bytes)
+        .map_err(|e| AppError::Matrix(format!("Invalid JSON from /account/whoami: {e}")))?;
+
+    let user_id_str = whoami_json
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::Config("Homeserver /account/whoami returned no user_id".to_string())
+        })?;
+    if user_id_str != expected_bot_mxid {
+        return Err(AppError::Config(format!(
+            "Access token belongs to user '{user_id_str}', expected configured bot_mxid '{expected_bot_mxid}'"
+        )));
+    }
+    let user_id = <&matrix_sdk::ruma::UserId>::try_from(user_id_str)
+        .map_err(|e| AppError::Config(format!("Invalid user_id '{user_id_str}': {e}")))?
+        .to_owned();
+
+    let device_id_str = whoami_json
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::Config(
+                "Access token has no associated device_id in /account/whoami; refusing to start"
+                    .to_string(),
+            )
+        })?;
+    let device_id = matrix_sdk::ruma::OwnedDeviceId::from(device_id_str);
+
+    let keys_query_url = format!("{base}/_matrix/client/v3/keys/query");
+    let keys_req_body = serde_json::to_vec(&serde_json::json!({
+        "device_keys": {
+            expected_bot_mxid: []
+        }
+    }))
+    .unwrap_or_default();
+    let keys_resp = http
+        .post(&keys_query_url)
+        .bearer_auth(access_token)
+        .header("content-type", "application/json")
+        .body(keys_req_body)
+        .send()
+        .await
+        .map_err(|e| AppError::Matrix(format!("Failed to call /keys/query: {e}")))?;
+    if !keys_resp.status().is_success() {
+        return Err(AppError::Matrix(format!(
+            "/keys/query returned HTTP {}",
+            keys_resp.status()
+        )));
+    }
+    let keys_bytes = keys_resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::Matrix(format!("Failed to read /keys/query body: {e}")))?;
+    let keys_json: serde_json::Value = serde_json::from_slice(&keys_bytes)
+        .map_err(|e| AppError::Matrix(format!("Invalid JSON from /keys/query: {e}")))?;
+
+    let server_has_device_keys = keys_json
+        .get("device_keys")
+        .and_then(|u| u.get(expected_bot_mxid))
+        .and_then(|d| d.get(device_id_str))
+        .and_then(|k| k.as_object())
+        .is_some_and(|obj| !obj.is_empty());
+
+    let server_has_cross_signing = keys_json
+        .get("master_keys")
+        .and_then(|m| m.get(expected_bot_mxid))
+        .and_then(|k| k.get("keys"))
+        .and_then(|k| k.as_object())
+        .is_some_and(|obj| !obj.is_empty());
+
+    Ok((
+        user_id,
+        device_id,
+        server_has_device_keys,
+        server_has_cross_signing,
+    ))
+}
+
+async fn flush_initial_e2ee_requests(client: &Client, had_token: bool) -> Result<(), AppError> {
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
+    let settings = matrix_sdk::config::SyncSettings::default().timeout(std::time::Duration::ZERO);
+    let _ = client.sync_once(settings).await;
+    if !had_token {
+        let _ = client
+            .state_store()
+            .remove_kv_data(matrix_sdk::store::StateStoreDataKey::SyncToken)
+            .await;
+    }
+    Ok(())
+}
+
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
 }
 
 impl MatrixSdkClient {
@@ -146,7 +341,231 @@ impl MatrixSdkClient {
             dm_rooms: Mutex::new(std::collections::HashMap::new()),
             store: Mutex::new(None),
             configured_rooms: Mutex::new(std::collections::HashSet::new()),
+            encryption_enabled: false,
+            had_initial_sync_token: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Builds a persistent E2EE-enabled Matrix client following M36 §§3–5.
+    /// Runs the §3.1 startup table BEFORE `restore_session` so key uploads cannot fire
+    /// on a mismatched or lost crypto store.
+    pub async fn new_with_e2ee(
+        homeserver_url: &str,
+        bot_mxid: &str,
+        access_token: &str,
+        state_dir: &std::path::Path,
+        store_passphrase: &str,
+        reset_crypto_store: bool,
+        recovery_key: Option<&str>,
+    ) -> Result<Self, AppError> {
+        use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
+
+        if store_passphrase.trim().is_empty() {
+            return Err(AppError::Config(
+                "Refusing to start: E2EE store passphrase is empty".to_string(),
+            ));
+        }
+
+        std::fs::create_dir_all(state_dir).map_err(|e| {
+            AppError::Config(format!(
+                "Failed to create crypto store directory {}: {e}",
+                state_dir.display()
+            ))
+        })?;
+
+        // §3.1: Startup check MUST run BEFORE `restore_session`.
+        let local_empty = is_crypto_store_empty(state_dir)?;
+        let (user_id, device_id, server_has_device_keys, server_has_cross_signing) =
+            query_whoami_and_server_keys(homeserver_url, access_token, bot_mxid).await?;
+
+        let recovery_key_trimmed = recovery_key.map(str::trim).filter(|s| !s.is_empty());
+
+        if local_empty {
+            if server_has_device_keys {
+                // Row 1: empty | yes | any -> refuse always
+                return Err(AppError::Matrix(format!(
+                    "Refusing to start: local crypto store is empty but server already has device keys for device '{device_id}'; mint a new device token"
+                )));
+            }
+            if server_has_cross_signing && !reset_crypto_store {
+                // Row 2 without --reset-crypto-store -> refuse
+                return Err(AppError::Matrix(format!(
+                    "Refusing to start: local crypto store is empty for device '{device_id}' while cross-signing identity exists on server; pass --reset-crypto-store to recover"
+                )));
+            }
+            if server_has_cross_signing && reset_crypto_store && recovery_key_trimmed.is_none() {
+                return Err(AppError::Config(
+                    "Refusing to start: --reset-crypto-store requires --recovery-key-file"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let encryption_settings = EncryptionSettings {
+            auto_enable_cross_signing: false,
+            backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
+            auto_enable_backups: false,
+        };
+
+        let client = Client::builder()
+            .homeserver_url(homeserver_url)
+            .sqlite_store(state_dir, Some(store_passphrase))
+            .with_encryption_settings(encryption_settings)
+            .with_enable_share_history_on_invite(false)
+            .build()
+            .await
+            .map_err(|e| AppError::Matrix(format!("Failed to build E2EE Matrix client: {e}")))?;
+
+        let meta = matrix_sdk::SessionMeta {
+            user_id,
+            device_id: device_id.clone(),
+        };
+        let tokens = matrix_sdk::SessionTokens {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+        };
+        let session = matrix_sdk::authentication::matrix::MatrixSession { meta, tokens };
+
+        client
+            .matrix_auth()
+            .restore_session(session, Default::default())
+            .await
+            .map_err(|e| AppError::Matrix(format!("Failed to restore E2EE session: {e}")))?;
+
+        let had_token = client
+            .state_store()
+            .get_kv_data(matrix_sdk::store::StateStoreDataKey::SyncToken)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+
+        if local_empty && !server_has_device_keys && !server_has_cross_signing {
+            // Row 3: first boot -> bootstrap cross-signing and (if recovery key provided) enable recovery + backup
+            tracing::info!(
+                device_id = %device_id,
+                "First boot on empty E2EE crypto store: bootstrapping cross-signing"
+            );
+            client
+                .encryption()
+                .bootstrap_cross_signing(None)
+                .await
+                .map_err(|e| AppError::Matrix(format!("Failed to bootstrap cross-signing: {e}")))?;
+            flush_initial_e2ee_requests(&client, had_token).await?;
+
+            if let Some(rk) = recovery_key_trimmed {
+                tracing::info!(
+                    device_id = %device_id,
+                    "Enabling server-side secret storage and room-key backup"
+                );
+                client
+                    .encryption()
+                    .recovery()
+                    .enable()
+                    .wait_for_backups_to_upload()
+                    .with_passphrase(rk)
+                    .await
+                    .map_err(|e| {
+                        AppError::Matrix(format!(
+                            "Failed to enable E2EE recovery and key backup: {e}"
+                        ))
+                    })?;
+            }
+            if let Err(e) = client.rename_device(&device_id, "matrix-xmsg").await {
+                tracing::debug!(
+                    device_id = %device_id,
+                    "Could not set device display name to matrix-xmsg: {e}"
+                );
+            }
+        } else if local_empty
+            && !server_has_device_keys
+            && server_has_cross_signing
+            && reset_crypto_store
+        {
+            // Row 2 with --reset-crypto-store -> recover from secret storage and sign new device
+            let rk = recovery_key_trimmed.expect("checked above");
+            tracing::info!(
+                device_id = %device_id,
+                "Recovering E2EE cross-signing identity and room-key backup into new device store"
+            );
+            flush_initial_e2ee_requests(&client, had_token).await?;
+            client
+                .encryption()
+                .recovery()
+                .recover(rk)
+                .await
+                .map_err(|e| {
+                    AppError::Matrix(format!(
+                        "Failed to recover E2EE identity and backup with recovery key: {e}"
+                    ))
+                })?;
+            flush_initial_e2ee_requests(&client, had_token).await?;
+            if let Err(e) = client.rename_device(&device_id, "matrix-xmsg").await {
+                tracing::debug!(
+                    device_id = %device_id,
+                    "Could not set device display name to matrix-xmsg: {e}"
+                );
+            }
+        } else if !local_empty {
+            // Row 4: non-empty store; if recovery_key is provided (e.g. --e2ee-setup) and backup isn't enabled on server yet, enable it
+            if let Some(rk) = recovery_key_trimmed {
+                if !reset_crypto_store
+                    && !client
+                        .encryption()
+                        .backups()
+                        .fetch_exists_on_server()
+                        .await
+                        .unwrap_or(true)
+                {
+                    tracing::info!(
+                        device_id = %device_id,
+                        "Enabling server-side secret storage and room-key backup on existing store"
+                    );
+                    client
+                        .encryption()
+                        .recovery()
+                        .enable()
+                        .wait_for_backups_to_upload()
+                        .with_passphrase(rk)
+                        .await
+                        .map_err(|e| {
+                            AppError::Matrix(format!(
+                                "Failed to enable E2EE recovery and key backup: {e}"
+                            ))
+                        })?;
+                }
+            }
+        }
+
+        Ok(Self {
+            client,
+            dm_rooms: Mutex::new(std::collections::HashMap::new()),
+            store: Mutex::new(None),
+            configured_rooms: Mutex::new(std::collections::HashSet::new()),
+            encryption_enabled: true,
+            had_initial_sync_token: std::sync::atomic::AtomicBool::new(had_token),
+        })
+    }
+
+    pub fn is_encryption_enabled(&self) -> bool {
+        self.encryption_enabled
+    }
+
+    pub fn had_initial_sync_token(&self) -> bool {
+        self.had_initial_sync_token
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub async fn get_persisted_sync_token(&self) -> Option<String> {
+        match self
+            .client
+            .state_store()
+            .get_kv_data(matrix_sdk::store::StateStoreDataKey::SyncToken)
+            .await
+        {
+            Ok(Some(matrix_sdk::store::StateStoreDataValue::SyncToken(token))) => Some(token),
+            _ => None,
+        }
     }
 
     pub fn set_store(&self, store: std::sync::Arc<crate::store::Store>) {
@@ -170,6 +589,134 @@ impl MatrixSdkClient {
         &self.client
     }
 
+    async fn query_room_encryption_status_code(
+        &self,
+        r_id: &matrix_sdk::ruma::RoomId,
+    ) -> Result<u16, AppError> {
+        let base = self
+            .client
+            .homeserver()
+            .as_str()
+            .trim_end_matches('/')
+            .to_string();
+        let Some(token) = self.client.access_token() else {
+            return Err(AppError::Matrix(
+                "Missing access token on Matrix client".to_string(),
+            ));
+        };
+        let encoded_room = encode_path_segment(r_id.as_str());
+        let url = format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.encryption/");
+        let resp = matrix_sdk::reqwest::Client::new()
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::Matrix(format!(
+                    "Failed to query m.room.encryption for {r_id}: {e:?}"
+                ))
+            })?;
+        Ok(resp.status().as_u16())
+    }
+
+    /// Verifies whether `r_id` has `m.room.encryption` and enforces the rule:
+    /// The bot NEVER sends plaintext into a room that has `m.room.encryption`.
+    /// If the room is encrypted and the client cannot encrypt (crypto store unavailable,
+    /// encryption disabled, or room not in SDK state), fails closed and logs `WARN`.
+    async fn check_room_encryption_before_send(
+        &self,
+        r_id: &matrix_sdk::ruma::RoomId,
+        room: Option<&matrix_sdk::Room>,
+    ) -> Result<bool, AppError> {
+        let is_encrypted = if let Some(room) = room {
+            if room.encryption_state().is_unknown() {
+                if let Err(e) = room.request_encryption_state().await {
+                    // wiremock returns an empty body on unmocked 404s, which Ruma reports as a deserialization error.
+                    match self.query_room_encryption_status_code(r_id).await {
+                        Ok(404) => {
+                            let _ = room
+                                .update_room_info(|mut info| {
+                                    info.mark_encryption_state_synced();
+                                    info.set_encryption_event(None);
+                                    (info, Default::default())
+                                })
+                                .await;
+                        }
+                        Ok(200) => {
+                            tracing::warn!(
+                                room_id = %r_id,
+                                "Refusing to send in encrypted room: failed to load encryption state into SDK ({e})"
+                            );
+                            return Err(AppError::Matrix(format!(
+                                "Refusing to send in encrypted room {r_id}: encryption state unavailable ({e})"
+                            )));
+                        }
+                        Ok(status) => {
+                            tracing::warn!(
+                                room_id = %r_id,
+                                status = status,
+                                "Refusing to send in room with unknown encryption state (HTTP {status}): {e}"
+                            );
+                            return Err(AppError::Matrix(format!(
+                                "Refusing to send in room {r_id}: could not verify encryption state (HTTP {status})"
+                            )));
+                        }
+                        Err(qe) => {
+                            tracing::warn!(
+                                room_id = %r_id,
+                                "Refusing to send in room with unknown encryption state: {e} / {qe}"
+                            );
+                            return Err(AppError::Matrix(format!(
+                                "Refusing to send in room {r_id}: could not verify encryption state ({e})"
+                            )));
+                        }
+                    }
+                }
+            }
+            room.encryption_state().is_encrypted()
+        } else {
+            match self.query_room_encryption_status_code(r_id).await {
+                Ok(404) => false,
+                Ok(200) => true,
+                Ok(status) => {
+                    tracing::warn!(
+                        room_id = %r_id,
+                        status = status,
+                        "Refusing to send in cold room: could not verify encryption state (HTTP {status})"
+                    );
+                    return Err(AppError::Matrix(format!(
+                        "Refusing to send in room {r_id}: could not verify encryption state (HTTP {status})"
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        room_id = %r_id,
+                        "Refusing to send in cold room: could not verify encryption state: {e}"
+                    );
+                    return Err(e);
+                }
+            }
+        };
+
+        if is_encrypted {
+            let has_olm =
+                self.encryption_enabled && self.client.encryption().ed25519_key().await.is_some();
+            if room.is_none() || !has_olm {
+                tracing::warn!(
+                    room_id = %r_id,
+                    encryption_enabled = self.encryption_enabled,
+                    room_in_state = room.is_some(),
+                    "Refusing to send plaintext in encrypted room: E2EE crypto store is unavailable or room not synced"
+                );
+                return Err(AppError::Matrix(format!(
+                    "Refusing to send in encrypted room {r_id}: encryption unavailable"
+                )));
+            }
+        }
+
+        Ok(is_encrypted)
+    }
+
     pub async fn resolve_rooms(&self, rooms: &[String]) -> Result<(), AppError> {
         use matrix_sdk::ruma::RoomId;
         {
@@ -180,12 +727,48 @@ impl MatrixSdkClient {
         }
         for room_str in rooms {
             if let Ok(r_id) = <&RoomId>::try_from(room_str.as_str()) {
-                if self.client.get_room(r_id).is_none() {
+                let needs_join = self
+                    .client
+                    .get_room(r_id)
+                    .is_none_or(|r| r.state() != matrix_sdk::RoomState::Joined);
+                if needs_join {
                     tracing::info!("Resolving room {room_str} into client state");
                     if let Err(e) = self.client.join_room_by_id(r_id).await {
                         tracing::warn!("Failed to resolve/join configured room {room_str}: {e}");
                     }
                 }
+                // §5.5: Log every configured room's encryption state as a single INFO line per room at startup.
+                let enc_state = if let Some(room) = self.client.get_room(r_id) {
+                    if room.encryption_state().is_unknown() {
+                        if room.request_encryption_state().await.is_err() {
+                            if let Ok(404) = self.query_room_encryption_status_code(r_id).await {
+                                let _ = room
+                                    .update_room_info(|mut info| {
+                                        info.mark_encryption_state_synced();
+                                        info.set_encryption_event(None);
+                                        (info, Default::default())
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    if room.encryption_state().is_encrypted() {
+                        "encrypted"
+                    } else {
+                        "unencrypted"
+                    }
+                } else {
+                    match self.query_room_encryption_status_code(r_id).await {
+                        Ok(200) => "encrypted",
+                        Ok(404) => "unencrypted",
+                        _ => "unknown",
+                    }
+                };
+                tracing::info!(
+                    room_id = %room_str,
+                    encryption = enc_state,
+                    "Configured room {room_str} encryption state: {enc_state}"
+                );
             }
         }
         Ok(())
@@ -195,6 +778,7 @@ impl MatrixSdkClient {
 pub fn parse_timeline_event_with_reply(
     event: matrix_sdk::ruma::events::AnySyncTimelineEvent,
 ) -> Option<(EventMessage, Option<String>)> {
+    use matrix_sdk::ruma::events::room::encrypted::Relation as EncryptedRelation;
     use matrix_sdk::ruma::events::room::message::Relation;
     use matrix_sdk::ruma::events::{
         AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
@@ -216,14 +800,47 @@ pub fn parse_timeline_event_with_reply(
                 Some(Relation::Reply(rep)) => (None, Some(rep.in_reply_to.event_id.to_string())),
                 _ => (None, None),
             };
+            let raw_body = orig.content.body();
+            let safe_body = if raw_body == crate::context::UNDECRYPTABLE_BODY_SENTINEL {
+                String::new()
+            } else {
+                raw_body.to_string()
+            };
             Some((
                 EventMessage {
                     event_id: orig.event_id.to_string(),
                     sender_mxid: orig.sender.to_string(),
                     timestamp_ms: u64::from(orig.origin_server_ts.0) as i64,
-                    body: orig.content.body().to_string(),
+                    body: safe_body,
                     thread_root_id,
                 },
+                reply_to_id,
+            ))
+        }
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+            SyncMessageLikeEvent::Original(orig),
+        )) => {
+            let (thread_root_id, reply_to_id) = match &orig.content.relates_to {
+                Some(EncryptedRelation::Thread(t)) => {
+                    let reply_id = if !t.is_falling_back {
+                        t.in_reply_to.as_ref().map(|r| r.event_id.to_string())
+                    } else {
+                        None
+                    };
+                    (Some(t.event_id.to_string()), reply_id)
+                }
+                Some(EncryptedRelation::Reply(rep)) => {
+                    (None, Some(rep.in_reply_to.event_id.to_string()))
+                }
+                _ => (None, None),
+            };
+            Some((
+                EventMessage::new_undecryptable(
+                    orig.event_id.to_string(),
+                    orig.sender.to_string(),
+                    u64::from(orig.origin_server_ts.0) as i64,
+                    thread_root_id,
+                ),
                 reply_to_id,
             ))
         }
@@ -496,6 +1113,54 @@ pub fn build_notice_content(
     content
 }
 
+async fn parse_fetched_timeline_event(
+    room: &matrix_sdk::Room,
+    timeline_event: matrix_sdk::deserialized_responses::TimelineEvent,
+) -> Option<(EventMessage, Option<String>)> {
+    use futures_util::StreamExt;
+    use matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent;
+
+    let sync_event = timeline_event.raw().deserialize().ok()?;
+    let (msg, reply_to) = parse_timeline_event_with_reply(sync_event)?;
+    if !msg.is_undecryptable() {
+        return Some((msg, reply_to));
+    }
+
+    let raw_encrypted: matrix_sdk::ruma::serde::Raw<OriginalSyncRoomEncryptedEvent> =
+        timeline_event.raw().clone().cast_unchecked();
+
+    let mut keys_stream = room.client().encryption().room_keys_received_stream().await;
+
+    if let Ok(decrypted) = room.decrypt_event(&raw_encrypted, None).await {
+        if let Ok(dec_sync) = decrypted.raw().deserialize() {
+            if let Some(parsed) = parse_timeline_event_with_reply(dec_sync) {
+                if !parsed.0.is_undecryptable() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+
+    if let Some(ref mut stream) = keys_stream {
+        if room.client().encryption().backups().are_enabled().await {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while let Ok(Some(_)) = tokio::time::timeout_at(deadline, stream.next()).await {
+                if let Ok(decrypted) = room.decrypt_event(&raw_encrypted, None).await {
+                    if let Ok(dec_sync) = decrypted.raw().deserialize() {
+                        if let Some(parsed) = parse_timeline_event_with_reply(dec_sync) {
+                            if !parsed.0.is_undecryptable() {
+                                return Some(parsed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some((msg, reply_to))
+}
+
 #[async_trait]
 impl MatrixClient for MatrixSdkClient {
     async fn send_notice(
@@ -524,27 +1189,39 @@ impl MatrixClient for MatrixSdkClient {
             )));
         }
 
-        if let Some(room) = self.client.get_room(r_id) {
-            let resp = room
-                .send(content)
-                .await
-                .map_err(|e| AppError::Matrix(format!("Failed to send notice: {e}")))?;
-            return Ok(resp.response.event_id.to_string());
-        }
-
-        // Cold room fallback: attempt to join/resolve into client state (restricted to configured rooms)
-        let is_configured = self.configured_rooms.lock().unwrap().contains(room_id);
-        if is_configured {
-            if let Ok(room) = self.client.join_room_by_id(r_id).await {
-                let resp = room
-                    .send(content)
-                    .await
-                    .map_err(|e| AppError::Matrix(format!("Failed to send notice: {e}")))?;
-                return Ok(resp.response.event_id.to_string());
+        let mut room = self.client.get_room(r_id);
+        if room.is_none() {
+            let is_configured = self.configured_rooms.lock().unwrap().contains(room_id);
+            if is_configured {
+                if let Ok(joined) = self.client.join_room_by_id(r_id).await {
+                    room = Some(joined);
+                }
             }
         }
 
-        // Direct HTTP send fallback (matching send_dm Arm B)
+        let is_encrypted = self
+            .check_room_encryption_before_send(r_id, room.as_ref())
+            .await?;
+
+        if let Some(room) = room {
+            let resp = room.send(content).await.map_err(|e| {
+                tracing::warn!(room_id = %room_id, "Failed to send notice in room: {e}");
+                AppError::Matrix(format!("Failed to send notice: {e}"))
+            })?;
+            return Ok(resp.response.event_id.to_string());
+        }
+
+        if is_encrypted {
+            tracing::warn!(
+                room_id = %room_id,
+                "Refusing raw HTTP fallback in encrypted room"
+            );
+            return Err(AppError::Matrix(format!(
+                "Refusing to send plaintext in encrypted room {room_id}"
+            )));
+        }
+
+        // Direct HTTP send fallback (only for unencrypted cold rooms)
         use matrix_sdk::ruma::api::client::message::send_message_event::v3::Request as SendMessageEventRequest;
         use matrix_sdk::ruma::events::MessageLikeEventType;
         use matrix_sdk::ruma::TransactionId;
@@ -597,17 +1274,33 @@ impl MatrixClient for MatrixSdkClient {
                 // R1: Query the server for the owner's membership of the cached DM room.
                 // Reuse only if the owner has joined or been invited; otherwise create a new room.
                 if is_owner_member_of_room(&self.client, r_id, u_id).await {
-                    if let Some(room) = self.client.get_room(r_id) {
+                    let room = self.client.get_room(r_id);
+                    let is_encrypted = self
+                        .check_room_encryption_before_send(r_id, room.as_ref())
+                        .await?;
+                    if let Some(room) = room {
                         // Arm A: room in SDK state
-                        if let Ok(send_resp) = room.send(content.clone()).await {
-                            self.dm_rooms
-                                .lock()
-                                .unwrap()
-                                .insert(user_id.to_string(), r_id_str.clone());
-                            return Ok(send_resp.response.event_id.to_string());
+                        match room.send(content.clone()).await {
+                            Ok(send_resp) => {
+                                self.dm_rooms
+                                    .lock()
+                                    .unwrap()
+                                    .insert(user_id.to_string(), r_id_str.clone());
+                                return Ok(send_resp.response.event_id.to_string());
+                            }
+                            Err(e) if is_encrypted => {
+                                tracing::warn!(
+                                    room_id = %r_id_str,
+                                    "Failed to send encrypted DM in room: {e}"
+                                );
+                                return Err(AppError::Matrix(format!(
+                                    "Failed to send encrypted DM in {r_id_str}: {e}"
+                                )));
+                            }
+                            Err(_) => {}
                         }
-                    } else {
-                        // Arm B: room not in SDK state (e.g. after restart)
+                    } else if !is_encrypted {
+                        // Arm B: unencrypted room not in SDK state (e.g. after restart)
                         use matrix_sdk::ruma::api::client::message::send_message_event::v3::Request as SendMessageEventRequest;
                         use matrix_sdk::ruma::events::MessageLikeEventType;
                         use matrix_sdk::ruma::TransactionId;
@@ -660,6 +1353,10 @@ impl MatrixClient for MatrixSdkClient {
             }
         }
 
+        let _ = self
+            .check_room_encryption_before_send(created.room_id(), Some(&created))
+            .await?;
+
         let send_resp = created
             .send(content)
             .await
@@ -694,10 +1391,8 @@ impl MatrixClient for MatrixSdkClient {
 
         let mut messages = Vec::new();
         for ev in res.chunk {
-            if let Ok(timeline_event) = ev.raw().deserialize() {
-                if let Some(msg) = parse_timeline_event(timeline_event) {
-                    messages.push(msg);
-                }
+            if let Some((msg, _)) = parse_fetched_timeline_event(&room, ev).await {
+                messages.push(msg);
             }
         }
         messages.reverse();
@@ -722,6 +1417,10 @@ impl MatrixClient for MatrixSdkClient {
         let room = self.client.get_room(r_id).ok_or_else(|| {
             AppError::Matrix(format!("Room not found in client state: {room_id}"))
         })?;
+
+        let _ = self
+            .check_room_encryption_before_send(r_id, Some(&room))
+            .await?;
 
         let content = ReactionEventContent::new(Annotation::new(e_id.to_owned(), key.to_string()));
         let resp = room
@@ -796,23 +1495,36 @@ impl MatrixClient for MatrixSdkClient {
         let content = build_notice_content(new_body, None)
             .make_replacement(ReplacementMetadata::new(target_id.to_owned(), None));
 
-        if let Some(room) = self.client.get_room(r_id) {
-            let resp = room
-                .send(content)
-                .await
-                .map_err(|e| AppError::Matrix(format!("Failed to send edit notice: {e}")))?;
+        let mut room = self.client.get_room(r_id);
+        if room.is_none() {
+            let is_configured = self.configured_rooms.lock().unwrap().contains(room_id);
+            if is_configured {
+                if let Ok(joined) = self.client.join_room_by_id(r_id).await {
+                    room = Some(joined);
+                }
+            }
+        }
+
+        let is_encrypted = self
+            .check_room_encryption_before_send(r_id, room.as_ref())
+            .await?;
+
+        if let Some(room) = room {
+            let resp = room.send(content).await.map_err(|e| {
+                tracing::warn!(room_id = %room_id, "Failed to send edit notice in room: {e}");
+                AppError::Matrix(format!("Failed to send edit notice: {e}"))
+            })?;
             return Ok(resp.response.event_id.to_string());
         }
 
-        let is_configured = self.configured_rooms.lock().unwrap().contains(room_id);
-        if is_configured {
-            if let Ok(room) = self.client.join_room_by_id(r_id).await {
-                let resp = room
-                    .send(content)
-                    .await
-                    .map_err(|e| AppError::Matrix(format!("Failed to send edit notice: {e}")))?;
-                return Ok(resp.response.event_id.to_string());
-            }
+        if is_encrypted {
+            tracing::warn!(
+                room_id = %room_id,
+                "Refusing raw HTTP edit fallback in encrypted room"
+            );
+            return Err(AppError::Matrix(format!(
+                "Refusing to send plaintext edit in encrypted room {room_id}"
+            )));
         }
 
         use matrix_sdk::ruma::api::client::message::send_message_event::v3::Request as SendMessageEventRequest;
@@ -867,13 +1579,7 @@ impl MatrixClient for MatrixSdkClient {
         };
 
         match room.event(e_id, None).await {
-            Ok(timeline_event) => {
-                if let Ok(sync_event) = timeline_event.raw().deserialize() {
-                    Ok(parse_timeline_event_with_reply(sync_event))
-                } else {
-                    Ok(None)
-                }
-            }
+            Ok(timeline_event) => Ok(parse_fetched_timeline_event(&room, timeline_event).await),
             Err(e) => {
                 tracing::debug!(
                     "Failed to fetch event {} in room {}: {}",
@@ -924,10 +1630,8 @@ impl MatrixClient for MatrixSdkClient {
 
         let mut events = Vec::new();
         for timeline_event in relations.chunk {
-            if let Ok(sync_event) = timeline_event.raw().deserialize() {
-                if let Some(msg) = parse_timeline_event(sync_event) {
-                    events.push(msg);
-                }
+            if let Some((msg, _)) = parse_fetched_timeline_event(&room, timeline_event).await {
+                events.push(msg);
             }
         }
 
@@ -949,6 +1653,14 @@ impl MatrixClient for MatrixSdkClient {
 
     async fn resolve_rooms(&self, rooms: &[String]) -> Result<(), AppError> {
         self.resolve_rooms(rooms).await
+    }
+
+    fn had_initial_sync_token(&self) -> Option<bool> {
+        if self.encryption_enabled {
+            Some(MatrixSdkClient::had_initial_sync_token(self))
+        } else {
+            None
+        }
     }
 }
 

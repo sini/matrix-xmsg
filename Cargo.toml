@@ -9,6 +9,10 @@ license = "MIT"
 name = "matrix-xmsg"
 path = "src/main.rs"
 
+[[bin]]
+name = "mas-e2ee-probe"
+path = "src/bin/mas_e2ee_probe.rs"
+
 [lib]
 name = "matrix_xmsg"
 path = "src/lib.rs"
@@ -23,12 +27,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2.0"
 regex = "1.11"
-rusqlite = { version = "0.33", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
-matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-aws-lc-rs", "markdown"] }
+matrix-sdk = { version = "0.19", default-features = false, features = ["rustls-aws-lc-rs", "markdown", "e2e-encryption", "bundled-sqlite"] }
 
 [dev-dependencies]
 tokio = { version = "1.43", features = ["test-util"] }

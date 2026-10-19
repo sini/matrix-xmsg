@@ -24,6 +24,7 @@ env:
   VM_CHECKS: >-
     hm-user-service
     hm-user-service-mutant-no-svcexe
+    mas-e2ee
     nixos-module
     nixos-module-mutant-missing
     nixos-module-mutant-wrong-token

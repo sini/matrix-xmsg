@@ -38,6 +38,11 @@ pkgs.testers.nixosTest {
         mode = "0400";
       };
 
+      environment.etc."matrix-store-passphrase" = {
+        text = "test_store_passphrase_secret\n";
+        mode = "0400";
+      };
+
       systemd.services.matrix-xmsg.environment.RUST_LOG = "info";
 
       # Enable and configure matrix-xmsg
@@ -50,6 +55,7 @@ pkgs.testers.nixosTest {
         botMxid = "@bot:test.local";
         accessTokenFile =
           if mode == "mutant-missing" then "/etc/nonexistent-token" else "/etc/matrix-token";
+        storePassphraseFile = "/etc/matrix-store-passphrase";
         rooms = [ "!test:test.local" ];
         trustedMxids = [ "@trusted:test.local" ];
         ownerMxid = "@owner:test.local";

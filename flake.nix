@@ -143,6 +143,10 @@
                 python3 ${./nix/check_image.py} ${packages.${pkgs.stdenv.hostPlatform.system}.image}
                 touch $out
               '';
+          mas-e2ee = import ./nix/mas_e2ee_test.nix {
+            inherit pkgs;
+            matrix-xmsg = surface;
+          };
         }
       );
 

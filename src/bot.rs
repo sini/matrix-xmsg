@@ -1527,6 +1527,22 @@ async fn handle_redact_request<I: SvcInbox + ?Sized>(
         return Ok(BotOutcome::RedactRefused);
     }
 
+    // §5.4: Verify unencrypted sender == bot_mxid even when the bot's own event is undecryptable.
+    if let Some(ev) = matrix.fetch_event(&rec.room_id, &rec.event_id).await? {
+        if ev.sender_mxid != config.bot_mxid {
+            let reply_json = serde_json::json!({
+                "error": format!(
+                    "unauthorized: target event '{}' was sent by '{}', not '{}'",
+                    rec.event_id, ev.sender_mxid, config.bot_mxid
+                )
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::RedactRefused);
+        }
+    }
+
     let reason = obj
         .get("reason")
         .and_then(|v| v.as_str())
@@ -1544,6 +1560,7 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
     delivery: &SvcDelivery,
     raw_json_text: &str,
     obj: &serde_json::Map<String, serde_json::Value>,
+    config: &Config,
     matrix: &dyn MatrixClient,
     store: &Store,
     xmsg: &dyn XmsgClient,
@@ -1604,6 +1621,22 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
         let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::EditRefused);
+    }
+
+    // §5.4: Verify unencrypted sender == bot_mxid even when the bot's own event is undecryptable.
+    if let Some(ev) = matrix.fetch_event(&rec.room_id, &rec.event_id).await? {
+        if ev.sender_mxid != config.bot_mxid {
+            let reply_json = serde_json::json!({
+                "error": format!(
+                    "unauthorized: target event '{}' was sent by '{}', not '{}'",
+                    rec.event_id, ev.sender_mxid, config.bot_mxid
+                )
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::EditRefused);
+        }
     }
 
     let has_answer = obj
@@ -1906,7 +1939,7 @@ async fn screen_page_messages(
 ) -> Result<Result<ScreenedPage, BotOutcome>, AppError> {
     let all_trusted = page_msgs
         .iter()
-        .filter(|m| m.sender_mxid != config.bot_mxid)
+        .filter(|m| m.sender_mxid != config.bot_mxid && !m.is_undecryptable())
         .all(|m| config.is_user_trusted(&m.sender_mxid));
     if all_trusted {
         let lines = page_msgs
@@ -1982,7 +2015,7 @@ async fn screen_page_messages(
         let non_bot: Vec<&EventMessage> = chunk
             .iter()
             .copied()
-            .filter(|m| m.sender_mxid != config.bot_mxid)
+            .filter(|m| m.sender_mxid != config.bot_mxid && !m.is_undecryptable())
             .collect();
 
         if non_bot.is_empty() {
@@ -2038,18 +2071,23 @@ async fn screen_page_messages(
                         thread_root_id,
                         verdict.reason
                     );
-                    // If this chunk mixed trusted/bot lines with an untrusted line (when all fit in one chunk),
-                    // preserve the trusted/bot lines and drop the rejected untrusted line(s).
+                    // If this chunk mixed trusted/bot/undecryptable lines with an untrusted line (when all fit in one chunk),
+                    // preserve the trusted/bot/undecryptable lines and drop the rejected untrusted line(s).
                     let has_untrusted = chunk.iter().any(|m| {
-                        m.sender_mxid != config.bot_mxid && !config.is_user_trusted(&m.sender_mxid)
+                        m.sender_mxid != config.bot_mxid
+                            && !m.is_undecryptable()
+                            && !config.is_user_trusted(&m.sender_mxid)
                     });
-                    let has_trusted = chunk.iter().any(|m| {
-                        m.sender_mxid != config.bot_mxid && config.is_user_trusted(&m.sender_mxid)
+                    let has_preserved = chunk.iter().any(|m| {
+                        m.sender_mxid == config.bot_mxid
+                            || m.is_undecryptable()
+                            || config.is_user_trusted(&m.sender_mxid)
                     });
-                    if has_untrusted && has_trusted {
+                    if has_untrusted && has_preserved {
                         kept_non_bot_chunk = true;
                         for m in chunk {
                             if m.sender_mxid == config.bot_mxid
+                                || m.is_undecryptable()
                                 || config.is_user_trusted(&m.sender_mxid)
                             {
                                 kept_lines.push(format_context_line_with_screening(
@@ -2078,6 +2116,7 @@ async fn screen_page_messages(
                                 None,
                             ));
                         } else if m.sender_mxid == config.bot_mxid
+                            || m.is_undecryptable()
                             || config.is_user_trusted(&m.sender_mxid)
                         {
                             kept_lines.push(format_context_line_with_screening(
@@ -2812,6 +2851,7 @@ pub async fn handle_inbox_delivery_with_guard<I: SvcInbox + ?Sized>(
                     delivery,
                     delivery.text.trim(),
                     obj,
+                    config,
                     matrix,
                     store,
                     xmsg,
@@ -2834,6 +2874,7 @@ pub async fn handle_inbox_delivery_with_guard<I: SvcInbox + ?Sized>(
                                 delivery,
                                 inner_text.trim(),
                                 inner_obj,
+                                config,
                                 matrix,
                                 store,
                                 xmsg,
@@ -3511,6 +3552,210 @@ pub fn register_event_handlers_with_startup_ts(
     tracker
 }
 
+fn poll_sync_token_once(client: &matrix_sdk::Client) -> bool {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut fut = std::pin::pin!(client
+        .state_store()
+        .get_kv_data(matrix_sdk::store::StateStoreDataKey::SyncToken));
+    matches!(
+        std::future::Future::poll(fut.as_mut(), &mut cx),
+        std::task::Poll::Ready(Ok(Some(matrix_sdk::store::StateStoreDataValue::SyncToken(
+            _
+        ))))
+    )
+}
+
+async fn has_sdk_persisted_sync_token(
+    client: &matrix_sdk::Client,
+    initial_has_token: bool,
+    first_sync_batch: &std::sync::Mutex<Option<String>>,
+) -> bool {
+    let current_token = match client
+        .state_store()
+        .get_kv_data(matrix_sdk::store::StateStoreDataKey::SyncToken)
+        .await
+    {
+        Ok(Some(matrix_sdk::store::StateStoreDataValue::SyncToken(t))) => Some(t),
+        _ => None,
+    };
+    if initial_has_token {
+        return current_token.is_some();
+    }
+    let Some(tok) = current_token else {
+        return false;
+    };
+    let mut guard = first_sync_batch.lock().unwrap();
+    match guard.as_ref() {
+        None => {
+            *guard = Some(tok);
+            false
+        }
+        Some(first) => first != &tok,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_incoming_room_message(
+    event: &matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent,
+    room: &matrix_sdk::room::Room,
+    config: std::sync::Arc<Config>,
+    matrix: std::sync::Arc<dyn MatrixClient>,
+    xmsg: std::sync::Arc<dyn XmsgClient>,
+    store: std::sync::Arc<Store>,
+    startup_ts: i64,
+    initial_has_token: bool,
+    first_sync_batch: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    tracker: TaskTracker,
+) {
+    if let Some(incoming) = extract_incoming_event(event, room.room_id()) {
+        // R5: Backlog suppression: primary guard is the persisted sync token in the SDK state store (§4.7).
+        // On initial token-less sync, no skew tolerance is granted: events before startup_ts are backlog.
+        // On resumed sync with token, a 10s clock skew tolerance is allowed.
+        let has_persisted_token =
+            has_sdk_persisted_sync_token(&room.client(), initial_has_token, &first_sync_batch)
+                .await;
+        let cutoff_ts = if has_persisted_token {
+            startup_ts - 10_000
+        } else {
+            startup_ts
+        };
+
+        if incoming.timestamp_ms < cutoff_ts {
+            tracing::debug!(
+                "Ignoring historical backlog event {} (ts {} < cutoff {})",
+                incoming.event_id,
+                incoming.timestamp_ms,
+                cutoff_ts
+            );
+            return;
+        }
+
+        // F8 & N7: Self-sender guard
+        if incoming.sender_mxid == config.bot_mxid {
+            return;
+        }
+
+        // N3 Gate 1: Room allowlist check (synchronous)
+        if !config.is_room_allowlisted(&incoming.room_id) {
+            return;
+        }
+
+        // N3 Gate 2: Mention / Command / Reply check (synchronous)
+        let is_thread_escalate =
+            incoming.thread_root_id.is_some() && incoming.body.trim() == "!escalate";
+        let is_thread_deeper =
+            incoming.thread_root_id.is_some() && incoming.body.trim() == "!deeper";
+        let is_thread_trust = incoming.thread_root_id.is_some() && incoming.body.trim() == "!trust";
+        let is_approve_command = incoming.body.trim() == "!approve";
+        let is_mentioned = is_bot_mentioned(
+            &incoming.body,
+            incoming.formatted_body.as_deref(),
+            incoming.mentions.as_deref(),
+            &config.bot_mxid,
+        );
+        let is_reply_to_bot = if let Some(ref in_reply_to) = incoming.in_reply_to_event_id {
+            if !incoming.is_falling_back {
+                store
+                    .get_bot_message_thread(in_reply_to)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let is_engaged_thread = if let Some(ref root) = incoming.thread_root_id {
+            store.is_thread_engaged(root).unwrap_or(false)
+        } else {
+            false
+        };
+        if !is_thread_escalate
+            && !is_thread_deeper
+            && !is_thread_trust
+            && !is_approve_command
+            && !is_mentioned
+            && !is_reply_to_bot
+            && !is_engaged_thread
+        {
+            return;
+        }
+
+        // N3 Gate 3: Admission check (synchronous)
+        // For !deeper or edits, full authorization is checked in handle_incoming_event
+        let is_top_level = incoming.thread_root_id.is_none();
+        let is_trusted = config.is_user_trusted(&incoming.sender_mxid);
+        let is_promoted_thread = incoming
+            .thread_root_id
+            .as_deref()
+            .and_then(|r| store.is_thread_promoted(r).ok())
+            .unwrap_or(false);
+        let is_admitted = match config.admission {
+            Admission::Trusted => is_trusted || is_promoted_thread,
+            Admission::Public => {
+                is_trusted
+                    || is_top_level
+                    || is_promoted_thread
+                    || incoming.replaces_event_id.is_some()
+                    || incoming
+                        .thread_root_id
+                        .as_deref()
+                        .and_then(|r| store.get_thread_asker(r).ok().flatten())
+                        .as_deref()
+                        == Some(&incoming.sender_mxid)
+            }
+        };
+        if !is_thread_deeper && !is_admitted {
+            return;
+        }
+
+        // All synchronous gates passed! Track in-flight task and spawn pipeline.
+        let thread_root = incoming
+            .thread_root_id
+            .clone()
+            .or_else(|| incoming.replaces_event_id.clone())
+            .unwrap_or_else(|| incoming.event_id.clone());
+
+        let question = InFlightQuestion::new(
+            incoming.room_id.clone(),
+            thread_root,
+            incoming.sender_mxid.clone(),
+        );
+        let claimed = question.claimed.clone();
+
+        tracker
+            .track(question, move || async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+
+                let history = matrix
+                    .fetch_history(&incoming.room_id, config.history_n * 2)
+                    .await
+                    .unwrap_or_default();
+
+                if let Err(e) = handle_incoming_event_with_claim(
+                    &incoming,
+                    &history,
+                    &config,
+                    matrix.as_ref(),
+                    xmsg.as_ref(),
+                    &store,
+                    Some(&claimed),
+                )
+                .await
+                {
+                    tracing::error!("Error handling incoming event {}: {e}", incoming.event_id);
+                }
+            })
+            .await;
+    }
+}
+
 /// Registers event handlers with an explicit startup cutoff timestamp and task tracker.
 pub fn register_event_handlers_full(
     client: &matrix_sdk::Client,
@@ -3524,169 +3769,221 @@ pub fn register_event_handlers_full(
     matrix.set_store(store.clone());
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
 
+    let initial_has_token = matrix
+        .had_initial_sync_token()
+        .unwrap_or_else(|| poll_sync_token_once(client));
+    let first_sync_batch: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
     let config_msg = config.clone();
+    let matrix_msg = matrix.clone();
     let xmsg_msg = xmsg.clone();
     let store_msg = store.clone();
+    let sem_msg = semaphore.clone();
+    let tracker_msg = tracker.clone();
+    let first_sync_msg = first_sync_batch.clone();
 
     client.add_event_handler(
         move |event: matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent,
               room: matrix_sdk::room::Room| {
             let config = config_msg.clone();
-            let matrix = matrix.clone();
+            let matrix = matrix_msg.clone();
             let xmsg = xmsg_msg.clone();
             let store = store_msg.clone();
-            let sem = semaphore.clone();
-            let tracker = tracker.clone();
+            let sem = sem_msg.clone();
+            let tracker = tracker_msg.clone();
+            let first_sync_batch = first_sync_msg.clone();
 
             async move {
-                if let Some(incoming) = extract_incoming_event(&event, room.room_id()) {
-                    // R5: Backlog suppression: primary guard is the persisted sync token.
-                    // On initial token-less sync, no skew tolerance is granted: events before startup_ts are backlog.
-                    // On resumed sync with token, a 10s clock skew tolerance is allowed.
-                    let has_persisted_token = store.get_sync_token().ok().flatten().is_some();
+                process_incoming_room_message(
+                    &event,
+                    &room,
+                    config,
+                    matrix,
+                    xmsg,
+                    store,
+                    startup_ts,
+                    initial_has_token,
+                    first_sync_batch,
+                    sem,
+                    tracker,
+                )
+                .await;
+            }
+        },
+    );
+
+    // §5.1 & §5.2: Undecryptable event handler — spawns late-key wait off the sync loop,
+    // retries decryption when room keys arrive, and otherwise logs WARN + reacts with 🔒 on reply/engaged thread.
+    let config_enc = config.clone();
+    let matrix_enc = matrix.clone();
+    let xmsg_enc = xmsg.clone();
+    let store_enc = store.clone();
+    let sem_enc = semaphore.clone();
+    let tracker_enc = tracker.clone();
+    let first_sync_enc = first_sync_batch.clone();
+
+    client.add_event_handler(
+        move |event: matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent,
+              room: matrix_sdk::room::Room,
+              raw_event: matrix_sdk::event_handler::RawEvent| {
+            let config = config_enc.clone();
+            let matrix = matrix_enc.clone();
+            let xmsg = xmsg_enc.clone();
+            let store = store_enc.clone();
+            let sem = sem_enc.clone();
+            let tracker = tracker_enc.clone();
+            let first_sync_batch = first_sync_enc.clone();
+            let raw_event = matrix_sdk::ruma::serde::Raw::<
+                matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent,
+            >::from_json(raw_event.0);
+
+            async move {
+                // Spawn off the sync loop so later syncs can deliver the late room key (§5.1, gate C5).
+                tokio::spawn(async move {
+                    use futures_util::StreamExt;
+                    use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent};
+
+                    let keys_stream = room.client().encryption().room_keys_received_stream().await;
+
+                    // Try once immediately (also triggers BackupDownloadStrategy::AfterDecryptionFailure if applicable)
+                    if let Ok(decrypted) = room.decrypt_event(&raw_event, None).await {
+                        if let Ok(AnySyncTimelineEvent::MessageLike(
+                            AnySyncMessageLikeEvent::RoomMessage(sync_msg),
+                        )) = decrypted.raw().deserialize()
+                        {
+                            process_incoming_room_message(
+                                &sync_msg,
+                                &room,
+                                config,
+                                matrix,
+                                xmsg,
+                                store,
+                                startup_ts,
+                                initial_has_token,
+                                first_sync_batch,
+                                sem,
+                                tracker,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+
+                    let wait_dur = tokio::time::Duration::from_secs(config.undecryptable_wait_secs);
+                    if wait_dur > tokio::time::Duration::ZERO {
+                        if let Some(stream) = keys_stream {
+                            let mut stream = std::pin::pin!(stream);
+                            let deadline = tokio::time::Instant::now() + wait_dur;
+                            while let Ok(Some(_)) =
+                                tokio::time::timeout_at(deadline, stream.next()).await
+                            {
+                                if let Ok(decrypted) = room.decrypt_event(&raw_event, None).await {
+                                    if let Ok(AnySyncTimelineEvent::MessageLike(
+                                        AnySyncMessageLikeEvent::RoomMessage(sync_msg),
+                                    )) = decrypted.raw().deserialize()
+                                    {
+                                        process_incoming_room_message(
+                                            &sync_msg,
+                                            &room,
+                                            config,
+                                            matrix,
+                                            xmsg,
+                                            store,
+                                            startup_ts,
+                                            initial_has_token,
+                                            first_sync_batch,
+                                            sem,
+                                            tracker,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // §5.2: Timed out / still undecryptable — log loudly as WARN with room, event ID, and sender.
+                    let room_id_str = room.room_id().to_string();
+                    let event_id_str = event.event_id.to_string();
+                    let sender_str = event.sender.to_string();
+                    tracing::warn!(
+                        room_id = %room_id_str,
+                        event_id = %event_id_str,
+                        sender = %sender_str,
+                        "Undecryptable event {} in room {} from {}; not forwarding",
+                        event_id_str,
+                        room_id_str,
+                        sender_str
+                    );
+
+                    // Check R5 cutoff, self-sender, and room allowlist before considering 🔒 reaction
+                    let has_persisted_token = has_sdk_persisted_sync_token(
+                        &room.client(),
+                        initial_has_token,
+                        &first_sync_batch,
+                    )
+                    .await;
                     let cutoff_ts = if has_persisted_token {
                         startup_ts - 10_000
                     } else {
                         startup_ts
                     };
-
-                    if incoming.timestamp_ms < cutoff_ts {
-                        tracing::debug!(
-                            "Ignoring historical backlog event {} (ts {} < cutoff {})",
-                            incoming.event_id,
-                            incoming.timestamp_ms,
-                            cutoff_ts
-                        );
-                        return;
-                    }
-
-                    // F8 & N7: Self-sender guard
-                    if incoming.sender_mxid == config.bot_mxid {
-                        return;
-                    }
-
-                    // N3 Gate 1: Room allowlist check (synchronous)
-                    if !config.is_room_allowlisted(&incoming.room_id) {
-                        return;
-                    }
-
-                    // N3 Gate 2: Mention / Command / Reply check (synchronous)
-                    let is_thread_escalate =
-                        incoming.thread_root_id.is_some() && incoming.body.trim() == "!escalate";
-                    let is_thread_deeper =
-                        incoming.thread_root_id.is_some() && incoming.body.trim() == "!deeper";
-                    let is_thread_trust =
-                        incoming.thread_root_id.is_some() && incoming.body.trim() == "!trust";
-                    let is_approve_command = incoming.body.trim() == "!approve";
-                    let is_mentioned = is_bot_mentioned(
-                        &incoming.body,
-                        incoming.formatted_body.as_deref(),
-                        incoming.mentions.as_deref(),
-                        &config.bot_mxid,
-                    );
-                    let is_reply_to_bot =
-                        if let Some(ref in_reply_to) = incoming.in_reply_to_event_id {
-                            if !incoming.is_falling_back {
-                                store
-                                    .get_bot_message_thread(in_reply_to)
-                                    .ok()
-                                    .flatten()
-                                    .is_some()
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                    let is_engaged_thread = if let Some(ref root) = incoming.thread_root_id {
-                        store.is_thread_engaged(root).unwrap_or(false)
-                    } else {
-                        false
-                    };
-                    if !is_thread_escalate
-                        && !is_thread_deeper
-                        && !is_thread_trust
-                        && !is_approve_command
-                        && !is_mentioned
-                        && !is_reply_to_bot
-                        && !is_engaged_thread
+                    let ts_ms = u64::from(event.origin_server_ts.0) as i64;
+                    if ts_ms < cutoff_ts
+                        || sender_str == config.bot_mxid
+                        || !config.is_room_allowlisted(&room_id_str)
                     {
                         return;
                     }
 
-                    // N3 Gate 3: Admission check (synchronous)
-                    // For !deeper or edits, full authorization is checked in handle_incoming_event
-                    let is_top_level = incoming.thread_root_id.is_none();
-                    let is_trusted = config.is_user_trusted(&incoming.sender_mxid);
-                    let is_promoted_thread = incoming
-                        .thread_root_id
-                        .as_deref()
-                        .and_then(|r| store.is_thread_promoted(r).ok())
-                        .unwrap_or(false);
-                    let is_admitted = match config.admission {
-                        Admission::Trusted => is_trusted || is_promoted_thread,
-                        Admission::Public => {
-                            is_trusted
-                                || is_top_level
-                                || is_promoted_thread
-                                || incoming.replaces_event_id.is_some()
-                                || incoming
-                                    .thread_root_id
-                                    .as_deref()
-                                    .and_then(|r| store.get_thread_asker(r).ok().flatten())
-                                    .as_deref()
-                                    == Some(&incoming.sender_mxid)
-                        }
-                    };
-                    if !is_thread_deeper && !is_admitted {
-                        return;
-                    }
-
-                    // All synchronous gates passed! Track in-flight task and spawn pipeline.
-                    let thread_root = incoming
-                        .thread_root_id
-                        .clone()
-                        .or_else(|| incoming.replaces_event_id.clone())
-                        .unwrap_or_else(|| incoming.event_id.clone());
-
-                    let question = InFlightQuestion::new(
-                        incoming.room_id.clone(),
-                        thread_root,
-                        incoming.sender_mxid.clone(),
-                    );
-                    let claimed = question.claimed.clone();
-
-                    tracker
-                        .track(question, move || async move {
-                            let _permit = match sem.acquire_owned().await {
-                                Ok(p) => p,
-                                Err(_) => return,
-                            };
-
-                            let history = matrix
-                                .fetch_history(&incoming.room_id, config.history_n * 2)
-                                .await
-                                .unwrap_or_default();
-
-                            if let Err(e) = handle_incoming_event_with_claim(
-                                &incoming,
-                                &history,
-                                &config,
-                                matrix.as_ref(),
-                                xmsg.as_ref(),
-                                &store,
-                                Some(&claimed),
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    "Error handling incoming event {}: {e}",
-                                    incoming.event_id
-                                );
+                    use matrix_sdk::ruma::events::room::encrypted::Relation as EncryptedRelation;
+                    let (thread_root_id, in_reply_to_id, is_falling_back) =
+                        match &event.content.relates_to {
+                            Some(EncryptedRelation::Thread(t)) => (
+                                Some(t.event_id.to_string()),
+                                t.in_reply_to.as_ref().map(|r| r.event_id.to_string()),
+                                t.is_falling_back,
+                            ),
+                            Some(EncryptedRelation::Reply(rep)) => {
+                                (None, Some(rep.in_reply_to.event_id.to_string()), false)
                             }
-                        })
-                        .await;
-                }
+                            _ => (None, None, false),
+                        };
+
+                    let is_reply_to_bot = if let Some(ref reply_id) = in_reply_to_id {
+                        if !is_falling_back {
+                            store
+                                .get_bot_message_thread(reply_id)
+                                .ok()
+                                .flatten()
+                                .is_some()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    let is_engaged_thread = if let Some(ref root) = thread_root_id {
+                        store.is_thread_engaged(root).unwrap_or(false)
+                    } else {
+                        false
+                    };
+
+                    if is_reply_to_bot || is_engaged_thread {
+                        if let Err(e) = matrix
+                            .send_reaction(&room_id_str, &event_id_str, "🔒")
+                            .await
+                        {
+                            tracing::warn!(
+                                room_id = %room_id_str,
+                                event_id = %event_id_str,
+                                "Failed to send 🔒 reaction to undecryptable event: {e}"
+                            );
+                        }
+                    }
+                });
             }
         },
     );
@@ -3694,15 +3991,22 @@ pub fn register_event_handlers_full(
     let config_react = config.clone();
     let xmsg_react = xmsg.clone();
     let store_react = store.clone();
+    let first_sync_react = first_sync_batch;
     client.add_event_handler(
         move |event: matrix_sdk::ruma::events::reaction::SyncReactionEvent,
               room: matrix_sdk::room::Room| {
             let config = config_react.clone();
             let xmsg = xmsg_react.clone();
             let store = store_react.clone();
+            let first_sync_batch = first_sync_react.clone();
             async move {
                 if let Some(reaction) = extract_incoming_reaction(&event, room.room_id()) {
-                    let has_persisted_token = store.get_sync_token().ok().flatten().is_some();
+                    let has_persisted_token = has_sdk_persisted_sync_token(
+                        &room.client(),
+                        initial_has_token,
+                        &first_sync_batch,
+                    )
+                    .await;
                     let cutoff_ts = if has_persisted_token {
                         startup_ts - 10_000
                     } else {
@@ -3729,15 +4033,19 @@ pub fn register_event_handlers_full(
 /// Runs the continuous Matrix sync loop until a shutdown signal is received.
 pub async fn run_daemon_loop(
     client: &matrix_sdk::Client,
-    store: std::sync::Arc<Store>,
+    _store: std::sync::Arc<Store>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), AppError> {
     use matrix_sdk::config::SyncSettings;
     let mut sync_settings = SyncSettings::default();
 
-    // F1 & N9: Resume from persisted sync token if present
-    if let Ok(Some(saved_token)) = store.get_sync_token() {
-        tracing::info!("Resuming sync from saved token: {saved_token}");
+    // §4.7: One sync token — the SDK state store governs sync.
+    if let Ok(Some(matrix_sdk::store::StateStoreDataValue::SyncToken(saved_token))) = client
+        .state_store()
+        .get_kv_data(matrix_sdk::store::StateStoreDataKey::SyncToken)
+        .await
+    {
+        tracing::info!("Resuming sync from SDK state store token: {saved_token}");
         sync_settings = sync_settings.token(saved_token);
     }
 
@@ -3751,9 +4059,6 @@ pub async fn run_daemon_loop(
                 match res {
                     Ok(sync_resp) => {
                         sync_settings = sync_settings.token(sync_resp.next_batch.clone());
-                        if let Err(e) = store.set_sync_token(&sync_resp.next_batch) {
-                            tracing::error!("Failed to persist sync token: {e}");
-                        }
                     }
                     Err(e) => {
                         tracing::warn!("Sync error: {e}, retrying in 3 seconds");

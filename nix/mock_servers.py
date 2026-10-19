@@ -55,6 +55,26 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
         if not self.check_auth():
             return
 
+        if path == "/_matrix/client/v3/account/whoami":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "user_id": "@bot:test.local",
+                "device_id": "MOCK_BOT_DEVICE"
+            }).encode())
+            return
+
+        if "/state/m.room.encryption" in path:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "errcode": "M_NOT_FOUND",
+                "error": "Event not found."
+            }).encode())
+            return
+
         if path == "/_matrix/client/v3/sync":
             since = qs.get("since", [None])[0]
             with MatrixHandler.lock:
@@ -164,6 +184,48 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
         if not self.check_auth():
             return
 
+        parsed = urlparse(self.path)
+        path = parsed.path
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 0:
+            _ = self.rfile.read(length)
+
+        if path == "/_matrix/client/v3/keys/query":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "device_keys": {},
+                "master_keys": {},
+                "self_signing_keys": {},
+                "user_signing_keys": {},
+                "failures": {}
+            }).encode())
+            return
+
+        if path == "/_matrix/client/v3/keys/upload":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "one_time_key_counts": {"signed_curve25519": 50}
+            }).encode())
+            return
+
+        if path == "/_matrix/client/v3/keys/signatures/upload":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"failures": {}}).encode())
+            return
+
+        if "/join" in path:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"room_id": "!test:test.local"}).encode())
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -219,11 +281,12 @@ class AgentHandler(socketserver.StreamRequestHandler):
             else:
                 with open("/tmp/xmsg_query_received.json", "wb") as f:
                     f.write(line)
+                reply_text = os.environ.get("MOCK_EXPERT_REPLY", "pong from expert")
                 pushed.put({
                     "action": "deliver",
                     "messageId": f"01TESTREPLY{n:05d}",
                     "fromName": f"expert · mock-claude-session@{NODE}",
-                    "text": "pong from expert",
+                    "text": reply_text,
                     "envelope": "",
                     "inReplyTo": message_id,
                 })
@@ -285,8 +348,9 @@ def run_matrix_server():
 
 
 if __name__ == "__main__":
-    t1 = threading.Thread(target=run_matrix_server, daemon=True)
-    t1.start()
+    if os.environ.get("MOCK_XMSG_ONLY") != "1":
+        t1 = threading.Thread(target=run_matrix_server, daemon=True)
+        t1.start()
     if os.environ.get("MOCK_MATRIX_ONLY") == "1":
         print("Mock Matrix server listening on 127.0.0.1:8008 (Matrix only)")
     else:
@@ -296,7 +360,7 @@ if __name__ == "__main__":
         t3 = threading.Thread(target=run_unix_server, args=("agent.sock", AgentHandler), daemon=True)
         t2.start()
         t3.start()
-        print(f"Mock servers listening on 127.0.0.1:8008 (Matrix) and {SOCK_DIR} (xmsg)")
+        print(f"Mock servers listening on {SOCK_DIR} (xmsg)")
     sys.stdout.flush()
     while True:
         time.sleep(1)

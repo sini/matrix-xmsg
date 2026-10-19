@@ -173,6 +173,10 @@ let
     answerTimeoutSecs = 120;
     sessionLiveSecs = 1800;
     inboxRetryBudget = 7;
+    storePassphraseFile = "/run/secrets/custom-store-passphrase";
+    recoveryKeyFile = "/run/secrets/custom-recovery-key";
+    resetCryptoStore = true;
+    undecryptableWaitSecs = 15;
     dbPath = "/tmp/shared-state/custom.db";
   };
 

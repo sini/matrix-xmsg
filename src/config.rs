@@ -127,6 +127,10 @@ fn default_db_path() -> PathBuf {
     PathBuf::from("/var/lib/matrix-xmsg/matrix-xmsg.db")
 }
 
+fn default_undecryptable_wait_secs() -> u64 {
+    10
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Admission {
@@ -197,6 +201,8 @@ pub struct Config {
     pub homeserver_url: String,
     pub bot_mxid: String,
     pub access_token_file: PathBuf,
+    #[serde(default)]
+    pub store_passphrase_file: Option<PathBuf>,
     pub rooms: Vec<String>,
     pub trusted_mxids: Vec<String>,
     pub owner_mxid: String,
@@ -284,6 +290,9 @@ pub struct Config {
 
     #[serde(default = "default_session_live_secs")]
     pub session_live_secs: u64,
+
+    #[serde(default = "default_undecryptable_wait_secs")]
+    pub undecryptable_wait_secs: u64,
 
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
@@ -430,40 +439,67 @@ impl Config {
         }
     }
 
-    pub fn load_access_token(&self) -> Result<String, AppError> {
+    pub fn load_secret_file(path: &Path, label: &str) -> Result<String, AppError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let meta = fs::metadata(&self.access_token_file).map_err(|e| {
+            let meta = fs::metadata(path).map_err(|e| {
                 AppError::Config(format!(
-                    "Failed to read token from {}: {e}",
-                    self.access_token_file.display()
+                    "Failed to read {label} from {}: {e}",
+                    path.display()
                 ))
             })?;
             let mode = meta.permissions().mode() & 0o777;
             // systemd LoadCredential mounts /run/credentials/<unit> (0550) and writes
             // the credential file inside it with mode 0440.
-            let is_systemd_cred =
-                mode == 0o440 && self.access_token_file.starts_with("/run/credentials/");
+            let is_systemd_cred = mode == 0o440 && path.starts_with("/run/credentials/");
             if mode & 0o077 != 0 && !is_systemd_cred {
                 return Err(AppError::Config(format!(
-                    "Access token file {} has mode {:04o}; refusing to start because it is group- or world-readable (expected 0600 or 0400)",
-                    self.access_token_file.display(),
+                    "{label} file {} has mode {:04o}; refusing to start because it is group- or world-readable (expected 0600 or 0400)",
+                    path.display(),
                     mode
                 )));
             }
         }
-        let token = fs::read_to_string(&self.access_token_file).map_err(|e| {
+        let secret = fs::read_to_string(path).map_err(|e| {
             AppError::Config(format!(
-                "Failed to read token from {}: {e}",
-                self.access_token_file.display()
+                "Failed to read {label} from {}: {e}",
+                path.display()
             ))
         })?;
-        let trimmed = token.trim();
+        let trimmed = secret.trim();
         if trimmed.is_empty() {
-            return Err(AppError::Config("Access token file is empty".to_string()));
+            return Err(AppError::Config(format!(
+                "{label} file {} is empty",
+                path.display()
+            )));
         }
         Ok(trimmed.to_string())
+    }
+
+    pub fn load_access_token(&self) -> Result<String, AppError> {
+        Self::load_secret_file(&self.access_token_file, "Access token")
+    }
+
+    pub fn load_store_passphrase(&self) -> Result<String, AppError> {
+        let path = self.store_passphrase_file.as_ref().ok_or_else(|| {
+            AppError::Config(
+                "`store_passphrase_file` is required in config for E2EE crypto store".to_string(),
+            )
+        })?;
+        Self::load_secret_file(path, "Store passphrase")
+    }
+
+    pub fn load_recovery_key(path: &Path) -> Result<String, AppError> {
+        Self::load_secret_file(path, "Recovery key")
+    }
+
+    pub fn crypto_store_dir(&self) -> PathBuf {
+        self.db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("/var/lib/matrix-xmsg"))
+            .to_path_buf()
     }
 
     pub fn is_room_allowlisted(&self, room_id_or_alias: &str) -> bool {
