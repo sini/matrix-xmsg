@@ -19,63 +19,16 @@ let
     inherit lib pkgs;
   } cfg "/run/credentials/matrix-xmsg.service/access-token";
 
-  peerType = lib.types.submodule {
-    options = {
-      addr = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        default = null;
-        example = "127.0.0.1:7789";
-        description = ''
-          Host:port to dial outbound to. When null, the peer is inbound-only:
-          its certificate is trusted to connect to our listener and `allow`
-          governs what it may send us, without dialing out.
-        '';
-      };
-
-      cert = lib.mkOption {
-        type = lib.types.path;
-        description = "Path to the peer's public certificate.";
-      };
-
-      allow = lib.mkOption {
-        type = lib.types.listOf (
-          lib.types.enum [
-            "send"
-            "list"
-          ]
-        );
-        default = [
-          "send"
-          "list"
-        ];
-        description = "Capabilities granted to this peer inbound.";
-      };
-
-      principals = lib.mkOption {
-        type = lib.types.nullOr (lib.types.listOf lib.types.str);
-        default = null;
-        description = ''
-          Inbound sender allowlist for this peer. When null, any principal on
-          the peer may send; when set, only messages whose origin label or
-          service is in this list are accepted (`[]` accepts none).
-        '';
-      };
-    };
-  };
-
-  peersFile = pkgs.writeText "matrix-xmsg-xmsg-peers.json" (
-    builtins.toJSON (
-      lib.mapAttrs (
-        _: p:
-        {
-          cert = toString p.cert;
-          inherit (p) allow;
-        }
-        // lib.optionalAttrs (p.addr != null) { inherit (p) addr; }
-        // lib.optionalAttrs (p.principals != null) { inherit (p) principals; }
-      ) xmsgCfg.federation.peers
-    )
-  );
+  peersFile =
+    pkgs.runCommand "matrix-xmsg-xmsg-peers.json"
+      {
+        peersJson = builtins.toJSON xmsgCfg.federation.peers;
+        passAsFile = [ "peersJson" ];
+      }
+      ''
+        cp "$peersJsonPath" "$out"
+        ${lib.getExe xmsgCfg.package} check-peers "$out"
+      '';
 
   effectiveSvcExe = {
     matrix-xmsg = lib.getExe cfg.package;
@@ -105,7 +58,7 @@ let
       (toString peersFile)
     ]
     ++ lib.optionals (xmsgCfg.federation.reloadInterval != null) [
-      "--peers-reload-interval"
+      "--fed-reload-interval-secs"
       (toString xmsgCfg.federation.reloadInterval)
     ]
   );
@@ -188,27 +141,27 @@ in
               };
 
               cert = lib.mkOption {
-                type = lib.types.nullOr lib.types.path;
+                type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
                 default = null;
                 description = "Path to the federation TLS certificate (`--fed-cert`).";
               };
 
               key = lib.mkOption {
-                type = lib.types.nullOr lib.types.path;
+                type = lib.types.nullOr (lib.types.either lib.types.path lib.types.str);
                 default = null;
-                description = "Path to the federation TLS private key (`--fed-key`).";
+                description = "Runtime path to the federation TLS private key (`--fed-key`), never a `/nix/store` path.";
               };
 
               reloadInterval = lib.mkOption {
                 type = lib.types.nullOr lib.types.ints.positive;
                 default = null;
-                description = "Optional peers file reload interval in seconds (`--peers-reload-interval`).";
+                description = "Optional federation TLS credential and CA reload interval in seconds (`--fed-reload-interval-secs`).";
               };
 
               peers = lib.mkOption {
-                type = lib.types.attrsOf peerType;
+                type = lib.types.attrsOf (pkgs.formats.json { }).type;
                 default = { };
-                description = "Federation peers written to `--peers-file`.";
+                description = "Freeform federation peers written to `--peers-file` and validated at build time by `xmsg check-peers`.";
               };
             };
           };
@@ -235,6 +188,16 @@ in
           (xmsgCfg.enable && xmsgCfg.federation.enable)
           -> (xmsgCfg.federation.cert != null && xmsgCfg.federation.key != null);
         message = "services.matrix-xmsg.xmsg.federation.enable requires both cert and key to be set.";
+      }
+      {
+        assertion =
+          (xmsgCfg.enable && xmsgCfg.federation.enable && xmsgCfg.federation.key != null)
+          -> (
+            !(builtins.isPath xmsgCfg.federation.key)
+            && !builtins.hasContext (toString xmsgCfg.federation.key)
+            && !lib.hasPrefix builtins.storeDir (toString xmsgCfg.federation.key)
+          );
+        message = "services.matrix-xmsg.xmsg.federation.key must be a runtime secret path, never a /nix/store path.";
       }
     ];
 
@@ -331,6 +294,7 @@ in
         before = [ "matrix-xmsg.service" ];
         requiredBy = [ "matrix-xmsg.service" ];
         wantedBy = [ "multi-user.target" ];
+        restartTriggers = lib.optional xmsgCfg.federation.enable peersFile;
 
         environment = {
           HOME = toString cfg.stateDir;

@@ -68,6 +68,10 @@ let
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
               };
+              restartTriggers = lib.mkOption {
+                type = lib.types.listOf lib.types.unspecified;
+                default = [ ];
+              };
               environment = lib.mkOption {
                 type = lib.types.attrsOf lib.types.str;
                 default = { };
@@ -84,32 +88,139 @@ let
     };
   };
 
+  pkg = inputs.matrix-xmsg.packages.x86_64-linux.default;
+  xmsgNoCheck = inputs.xmsg.packages.x86_64-linux.default.overrideAttrs { doCheck = false; };
+
+  caCert = pkgs.writeText "test-ca.crt" ''
+    -----BEGIN CERTIFICATE-----
+    MIIBjjCCATWgAwIBAgIUZagzwQC8cigUO0sEt2oBGx2PpmowCgYIKoZIzj0EAwIw
+    HDEaMBgGA1UEAwwReG1zZyB0ZXN0IGZpeHR1cmUwIBcNMjYxMDEzMDM1NjA3WhgP
+    MjEyNjA5MTkwMzU2MDdaMBwxGjAYBgNVBAMMEXhtc2cgdGVzdCBmaXh0dXJlMFkw
+    EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEnErvvgOrXyY8zOqnYdJaOvDZZ/xEtxNJ
+    cz41XO7HULs9BBLryuxIJzkbaet3ZAxpmb53LL1s6a50iFGxq49E6qNTMFEwHQYD
+    VR0OBBYEFOG0Pm+jmQY5hOj8AwASuCRegHerMB8GA1UdIwQYMBaAFOG0Pm+jmQY5
+    hOj8AwASuCRegHerMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIg
+    N3ThKYvVXlZ198leQWRQ8jEMalKJvayuLeAz6ZVhqVMCIBX50tkVlQGhjqSVxPDW
+    4eMCzYXbyaRSnuTbpJqBPIFK
+    -----END CERTIFICATE-----
+  '';
+
+  cutoverPeers = {
+    "sini.bitstream" = {
+      address = "100.64.0.1:7788";
+      ca = "${caCert}";
+      identities = [ "spiffe://sini/host/bitstream/user/sini" ];
+      allow = [
+        "send"
+        "reply"
+      ];
+      dial = "outbound";
+    };
+    "sini.cortex" = {
+      address = "100.64.0.2:7788";
+      ca = "${caCert}";
+      identities = [ "spiffe://sini/host/cortex/user/sini" ];
+      allow = [
+        "send"
+        "reply"
+      ];
+      dial = "outbound";
+    };
+    "genie-guard.genie" = {
+      address = "genie-guard.genie.invalid:7788";
+      ca = "${caCert}";
+      identities = [ "spiffe://sini/ns/genie/sa/genie-guard" ];
+      leaf = true;
+      allow = [ "reply" ];
+      targets = [ "genie-guard" ];
+    };
+  };
+
+  evalModule =
+    serviceCfg:
+    lib.evalModules {
+      specialArgs = {
+        inherit pkgs;
+      };
+      modules = [
+        baseModule
+        matrixModule
+        {
+          services.matrix-xmsg = {
+            enable = true;
+            package = pkg;
+            homeserverUrl = "http://localhost:8008";
+            botMxid = "@bot:local";
+            accessTokenFile = "/run/token";
+            rooms = [ "!room:local" ];
+            ownerMxid = "@owner:local";
+          }
+          // serviceCfg;
+        }
+      ];
+    };
+
   evalConfig =
     serviceCfg:
     let
-      res = lib.evalModules {
-        specialArgs = {
-          inherit pkgs;
-        };
-        modules = [
-          baseModule
-          matrixModule
-          {
-            services.matrix-xmsg = {
-              enable = true;
-              package = inputs.matrix-xmsg.packages.x86_64-linux.default;
-              homeserverUrl = "http://localhost:8008";
-              botMxid = "@bot:local";
-              accessTokenFile = "/run/token";
-              rooms = [ "!room:local" ];
-              ownerMxid = "@owner:local";
-            }
-            // serviceCfg;
-          }
-        ];
-      };
+      res = evalModule serviceCfg;
     in
     map (a: a.message) (builtins.filter (a: !a.assertion) res.config.assertions);
+
+  cutoverRes = evalModule {
+    xmsg = {
+      enable = true;
+      package = xmsgNoCheck;
+      federation = {
+        enable = true;
+        listenAddress = "100.64.0.1";
+        port = 7791;
+        cert = "/run/agenix/matrix-xmsg-fed.crt";
+        key = "/run/agenix/matrix-xmsg-fed.key";
+        reloadInterval = 45;
+        peers = cutoverPeers;
+      };
+    };
+  };
+
+  outboundOnlyRes = evalModule {
+    xmsg = {
+      enable = true;
+      package = xmsgNoCheck;
+      federation = {
+        enable = true;
+        port = null;
+        cert = "/run/agenix/matrix-xmsg-fed.crt";
+        key = "/run/agenix/matrix-xmsg-fed.key";
+        peers = cutoverPeers;
+      };
+    };
+  };
+
+  bothPinAndCaRes = evalModule {
+    xmsg = {
+      enable = true;
+      package = xmsgNoCheck;
+      federation = {
+        enable = true;
+        cert = "/run/agenix/matrix-xmsg-fed.crt";
+        key = "/run/agenix/matrix-xmsg-fed.key";
+        peers = {
+          "sini.bitstream" = {
+            address = "100.64.0.1:7788";
+            pin = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+            ca = "${caCert}";
+            identities = [ "spiffe://sini/host/bitstream/user/sini" ];
+            allow = [
+              "send"
+              "reply"
+            ];
+            dial = "outbound";
+          };
+        };
+      };
+    };
+  };
 in
 {
   flake.tests.m7-module = {
@@ -148,7 +259,7 @@ in
               };
               services.matrix-xmsg = {
                 enable = true;
-                package = inputs.matrix-xmsg.packages.x86_64-linux.default;
+                package = pkg;
                 homeserverUrl = "http://localhost:8008";
                 botMxid = "@bot:local";
                 accessTokenFile = "/run/token";
@@ -187,29 +298,11 @@ in
 
     test-m28-own-xmsg-unit-and-socket-defaults =
       let
-        res = lib.evalModules {
-          specialArgs = {
-            inherit pkgs;
+        res = evalModule {
+          xmsg = {
+            enable = true;
+            package = xmsgNoCheck;
           };
-          modules = [
-            baseModule
-            matrixModule
-            {
-              services.matrix-xmsg = {
-                enable = true;
-                package = inputs.matrix-xmsg.packages.x86_64-linux.default;
-                homeserverUrl = "http://localhost:8008";
-                botMxid = "@bot:local";
-                accessTokenFile = "/run/token";
-                rooms = [ "!room:local" ];
-                ownerMxid = "@owner:local";
-                xmsg = {
-                  enable = true;
-                  package = inputs.xmsg.packages.x86_64-linux.default.overrideAttrs { doCheck = false; };
-                };
-              };
-            }
-          ];
         };
         cfg = res.config.services.matrix-xmsg;
         xmsgSvc = res.config.systemd.services.matrix-xmsg-xmsg;
@@ -276,5 +369,130 @@ in
           });
       expected = true;
     };
+
+    test-m28-1-federation-listening-cutover-argv-and-peers =
+      let
+        xmsgSvc = cutoverRes.config.systemd.services.matrix-xmsg-xmsg;
+        peersDrv = lib.head xmsgSvc.restartTriggers;
+      in
+      {
+        expr = {
+          assertions = map (a: a.message) (builtins.filter (a: !a.assertion) cutoverRes.config.assertions);
+          execStart = xmsgSvc.serviceConfig.ExecStart;
+          triggerCount = builtins.length xmsgSvc.restartTriggers;
+          peers = builtins.fromJSON (builtins.unsafeDiscardStringContext peersDrv.peersJson);
+        };
+        expected = {
+          assertions = [ ];
+          execStart = "${lib.getExe xmsgNoCheck} ${
+            lib.escapeShellArgs [
+              "serve"
+              "--svc-exe"
+              "matrix-xmsg=${lib.getExe pkg}"
+              "--fed-listen"
+              "100.64.0.1:7791"
+              "--fed-cert"
+              "/run/agenix/matrix-xmsg-fed.crt"
+              "--fed-key"
+              "/run/agenix/matrix-xmsg-fed.key"
+              "--peers-file"
+              (toString peersDrv)
+              "--fed-reload-interval-secs"
+              "45"
+            ]
+          }";
+          triggerCount = 1;
+          peers = builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.toJSON cutoverPeers));
+        };
+      };
+
+    test-m28-1-federation-outbound-only-omits-fed-listen =
+      let
+        xmsgSvc = outboundOnlyRes.config.systemd.services.matrix-xmsg-xmsg;
+        peersDrv = lib.head xmsgSvc.restartTriggers;
+      in
+      {
+        expr = {
+          assertions = map (a: a.message) (
+            builtins.filter (a: !a.assertion) outboundOnlyRes.config.assertions
+          );
+          execStart = xmsgSvc.serviceConfig.ExecStart;
+          hasFedListen = lib.hasInfix "--fed-listen" xmsgSvc.serviceConfig.ExecStart;
+        };
+        expected = {
+          assertions = [ ];
+          execStart = "${lib.getExe xmsgNoCheck} ${
+            lib.escapeShellArgs [
+              "serve"
+              "--svc-exe"
+              "matrix-xmsg=${lib.getExe pkg}"
+              "--fed-cert"
+              "/run/agenix/matrix-xmsg-fed.crt"
+              "--fed-key"
+              "/run/agenix/matrix-xmsg-fed.key"
+              "--peers-file"
+              (toString peersDrv)
+            ]
+          }";
+          hasFedListen = false;
+        };
+      };
+
+    test-m28-1-federation-key-rejects-store-path = {
+      expr =
+        builtins.elem
+          "services.matrix-xmsg.xmsg.federation.key must be a runtime secret path, never a /nix/store path."
+          (evalConfig {
+            xmsg = {
+              enable = true;
+              package = xmsgNoCheck;
+              federation = {
+                enable = true;
+                cert = "/run/agenix/matrix-xmsg-fed.crt";
+                key = "${caCert}";
+              };
+            };
+          });
+      expected = true;
+    };
   };
+
+  perSystem =
+    { system, ... }:
+    lib.optionalAttrs (system == "x86_64-linux") {
+      checks.peers-check =
+        let
+          goodPeersFile = lib.head cutoverRes.config.systemd.services.matrix-xmsg-xmsg.restartTriggers;
+          badPeersDrv = lib.head bothPinAndCaRes.config.systemd.services.matrix-xmsg-xmsg.restartTriggers;
+          badPeersFailure = pkgs.testers.testBuildFailure badPeersDrv;
+          expectedJson = pkgs.writeText "expected-peers.json" (builtins.toJSON cutoverPeers);
+        in
+        pkgs.runCommand "matrix-xmsg-peers-check"
+          {
+            nativeBuildInputs = [
+              pkgs.jq
+              pkgs.diffutils
+            ];
+          }
+          ''
+            # 1. Realizing goodPeersFile already ran `xmsg check-peers` at build time; verify JSON equality:
+            jq -S . "${goodPeersFile}" > actual.json
+            jq -S . "${expectedJson}" > expected.json
+            diff -u expected.json actual.json
+
+            # 2. Negative build oracle through the module: building badPeersDrv itself must fail via `xmsg check-peers`:
+            exit_code=$(cat "${badPeersFailure}/testBuildFailure.exit")
+            echo "badPeersDrv testBuildFailure.exit=$exit_code"
+            cat "${badPeersFailure}/testBuildFailure.log"
+            [ "$exit_code" -ne 0 ] || {
+              echo "expected badPeersDrv build to fail non-zero, got $exit_code" >&2
+              exit 1
+            }
+            grep -q "exactly one trust mechanism is allowed" "${badPeersFailure}/testBuildFailure.log" || {
+              echo "expected testBuildFailure.log to contain 'exactly one trust mechanism is allowed'" >&2
+              exit 1
+            }
+            touch "$out"
+          '';
+    };
 }

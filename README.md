@@ -214,9 +214,41 @@ The flake exports two modules sharing the same `services.matrix-xmsg` option set
     trustedMxids = [ "@owner:json64.dev" ];
     ownerMxid = "@owner:json64.dev";
     xmsgSocket = "/run/user/1000/xmsg";
-    expertRef = "claude";
-    dynamicUser = false;
-    user = "sini";
+    expertRef = "genie-support@sini.bitstream";
+    guardRef = "genie-guard@sini.bitstream";
+    openThreadNodes = [
+      "sini.bitstream"
+      "sini.cortex"
+    ];
+    xmsg = {
+      enable = true;
+      package = inputs.xmsg.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      federation = {
+        enable = true;
+        listenAddress = "100.64.0.1";
+        port = 7791;
+        cert = "/run/agenix/matrix-xmsg-fed.crt";
+        key = "/run/agenix/matrix-xmsg-fed.key";
+        # Freeform peers.json entries validated at build time by `xmsg check-peers`
+        peers = {
+          "sini.bitstream" = {
+            address = "100.64.0.1:7788";
+            ca = "${caCert}";
+            identities = [ "spiffe://sini/host/bitstream/user/sini" ];
+            allow = [ "send" "reply" ];
+            dial = "outbound";
+          };
+          "genie-guard.genie" = {
+            address = "genie-guard.genie.invalid:7788";
+            ca = "${caCert}";
+            identities = [ "spiffe://sini/ns/genie/sa/genie-guard" ];
+            leaf = true;
+            allow = [ "reply" ];
+            targets = [ "genie-guard" ];
+          };
+        };
+      };
+    };
   };
 }
 ```

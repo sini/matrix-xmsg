@@ -20,6 +20,7 @@ env:
     package
   INTEGRATION_CHECKS: >-
     integration
+    peers-check
   VM_CHECKS: >-
     hm-user-service
     hm-user-service-mutant-no-svcexe
