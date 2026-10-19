@@ -248,6 +248,10 @@ pkgs.testers.nixosTest {
         SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
       };
 
+      specialisation.reset-crypto-store.configuration = {
+        services.matrix-xmsg.resetCryptoStore = true;
+      };
+
       environment.systemPackages = [
         pkgs.matrix-synapse
         pkgs.matrix-authentication-service
@@ -329,16 +333,23 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("matrix-xmsg.service")
 
     # 6. Verify P3 on live systemd units:
-    #    - matrix-xmsg-e2ee-setup.service ran and exited 0
+    #    - matrix-xmsg-e2ee-setup.service ran and exited 0, creating /var/lib/matrix-xmsg/matrix-sdk-crypto.sqlite3
     #    - matrix-xmsg.service LoadCredential does NOT contain recovery-key
-    #    - /run/credentials/matrix-xmsg.service/recovery-key does NOT exist
+    #    - recovery-key is not mounted anywhere under /run/credentials after oneshot exit
+    setup_cond_1 = machine.succeed("systemctl show -p ConditionResult --value matrix-xmsg-e2ee-setup.service").strip()
+    assert setup_cond_1 == "yes", f"Expected ConditionResult=yes on first boot, got {setup_cond_1}"
     setup_status = machine.succeed("systemctl show -p ExecMainStatus --value matrix-xmsg-e2ee-setup.service").strip()
     assert setup_status == "0", f"Expected matrix-xmsg-e2ee-setup.service exit 0, got {setup_status}"
+    setup_start_ts_1 = int(machine.succeed("systemctl show -p ExecMainStartTimestampMonotonic --value matrix-xmsg-e2ee-setup.service").strip())
+    assert setup_start_ts_1 > 0, f"Expected positive ExecMainStartTimestampMonotonic on first boot, got {setup_start_ts_1}"
+    machine.succeed("test -s /var/lib/matrix-xmsg/matrix-sdk-crypto.sqlite3")
     bot_unit = machine.succeed("systemctl cat matrix-xmsg.service")
     assert "LoadCredential=store-passphrase:" in bot_unit, f"Expected store-passphrase in bot unit, got {bot_unit}"
     assert "recovery-key" not in bot_unit, f"P3 violation: recovery-key found in matrix-xmsg.service unit: {bot_unit}"
     machine.succeed("test -r /run/credentials/matrix-xmsg.service/store-passphrase")
     machine.succeed("test ! -e /run/credentials/matrix-xmsg.service/recovery-key")
+    recovery_mounts_1 = machine.succeed("find /run/credentials -name '*recovery*' || true").strip()
+    assert recovery_mounts_1 == "", f"P3 violation: recovery-key still mounted under /run/credentials after oneshot exit: {recovery_mounts_1}"
 
     # 7. §7.1 Roundtrip 1: Alice sends encrypted mention -> matrix-xmsg decrypts -> forwards to xmsg -> replies encrypted -> Alice decrypts
     rt1_out = machine.succeed(
@@ -358,9 +369,17 @@ pkgs.testers.nixosTest {
     assert m_pre_loss is not None
     pre_loss_ev_id = m_pre_loss.group(1)
 
-    # 8. §7.1 & §7.3 Restart: systemctl restart matrix-xmsg.service keeps the same device and still decrypts
+    # 8. §7.1 & §7.3 + M36.1 Cell 1 Restart:
+    #    systemctl restart matrix-xmsg.service skips matrix-xmsg-e2ee-setup.service (ConditionResult=no),
+    #    never mounts recovery-key under /run/credentials, and matrix-xmsg.service comes up and decrypts.
     machine.succeed("systemctl restart matrix-xmsg.service")
     machine.wait_for_unit("matrix-xmsg.service")
+    setup_cond_restart = machine.succeed("systemctl show -p ConditionResult --value matrix-xmsg-e2ee-setup.service").strip()
+    assert setup_cond_restart == "no", f"M36.1 Cell 1 failed: expected ConditionResult=no on restart when crypto store exists, got {setup_cond_restart}"
+    setup_start_ts_2 = int(machine.succeed("systemctl show -p ExecMainStartTimestampMonotonic --value matrix-xmsg-e2ee-setup.service").strip())
+    assert setup_start_ts_2 == setup_start_ts_1, f"M36.1 Cell 1 failed: matrix-xmsg-e2ee-setup.service re-ran on restart ({setup_start_ts_1} -> {setup_start_ts_2})"
+    recovery_mounts_restart = machine.succeed("find /run/credentials -name '*recovery*' || true").strip()
+    assert recovery_mounts_restart == "", f"M36.1 Cell 1 failed: recovery-key mounted under /run/credentials on restart: {recovery_mounts_restart}"
     rt2_out = machine.succeed(
         f"SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt "
         f"HOMESERVER_URL=https://${synapseDomain}:8448 "
@@ -421,5 +440,49 @@ pkgs.testers.nixosTest {
         "MAS_E2EE_ALL_CELLS_PASS",
     ]:
         assert marker in cells_out, f"Missing expected marker {marker} in cells_out: {cells_out}"
+
+    # 11. M36.1 Cell 2: with resetCryptoStore and an empty store, matrix-xmsg-e2ee-setup.service runs and recovers
+    reset_spec_unit = machine.succeed(
+        "cat /run/current-system/specialisation/reset-crypto-store/etc/systemd/system/matrix-xmsg-e2ee-setup.service"
+    )
+    assert "--reset-crypto-store" in reset_spec_unit, f"Expected --reset-crypto-store in resetCryptoStore unit: {reset_spec_unit}"
+    assert "ConditionPathExists=" not in reset_spec_unit, f"Expected no ConditionPathExists in resetCryptoStore unit: {reset_spec_unit}"
+
+    genie_out4 = machine.succeed(f"{mas_cmd} issue-compatibility-token genie MATRIX_XMSG_4 2>&1")
+    m_genie4 = re.search(r"Compatibility token issued:\s*(\S+)", genie_out4)
+    assert m_genie4 is not None
+    genie_token_4 = m_genie4.group(1)
+
+    machine.succeed(
+        f"printf '%s\\n' '{genie_token_4}' > /etc/matrix-token && chmod 0400 /etc/matrix-token && "
+        f"rm -f /var/lib/matrix-xmsg/matrix-sdk-crypto.sqlite3* && "
+        f"cp /run/current-system/specialisation/reset-crypto-store/etc/systemd/system/matrix-xmsg-e2ee-setup.service /run/systemd/system/matrix-xmsg-e2ee-setup.service && "
+        f"printf '[Service]\\nExecStart=\\nExecStart=${pkg}/bin/matrix-xmsg --config /etc/matrix-xmsg-setup-live.toml --e2ee-setup --recovery-key-file /run/credentials/matrix-xmsg-e2ee-setup.service/recovery-key --reset-crypto-store\\n' > /run/systemd/system/matrix-xmsg-e2ee-setup.service.d/override.conf && "
+        f"systemctl daemon-reload && "
+        f"systemctl start matrix-xmsg.service"
+    )
+    machine.wait_for_unit("matrix-xmsg.service")
+    setup_cond_reset = machine.succeed("systemctl show -p ConditionResult --value matrix-xmsg-e2ee-setup.service").strip()
+    assert setup_cond_reset == "yes", f"M36.1 Cell 2 failed: expected ConditionResult=yes with resetCryptoStore and empty store, got {setup_cond_reset}"
+    setup_start_ts_3 = int(machine.succeed("systemctl show -p ExecMainStartTimestampMonotonic --value matrix-xmsg-e2ee-setup.service").strip())
+    assert setup_start_ts_3 > setup_start_ts_2, f"M36.1 Cell 2 failed: matrix-xmsg-e2ee-setup.service did not run ({setup_start_ts_2} -> {setup_start_ts_3})"
+    setup_status_reset = machine.succeed("systemctl show -p ExecMainStatus --value matrix-xmsg-e2ee-setup.service").strip()
+    assert setup_status_reset == "0", f"M36.1 Cell 2 failed: expected matrix-xmsg-e2ee-setup.service exit 0, got {setup_status_reset}"
+    machine.succeed("test -s /var/lib/matrix-xmsg/matrix-sdk-crypto.sqlite3")
+    recovery_mounts_reset = machine.succeed("find /run/credentials -name '*recovery*' || true").strip()
+    assert recovery_mounts_reset == "", f"M36.1 Cell 2 failed: recovery-key still mounted after setup exit: {recovery_mounts_reset}"
+    rt3_out = machine.succeed(
+        f"SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt "
+        f"HOMESERVER_URL=https://${synapseDomain}:8448 "
+        f"ALICE_MXID=@alice:${synapseDomain} "
+        f"ALICE_TOKEN={alice_token} "
+        f"ALICE_DEVICE=ALICE_DEV "
+        f"GENIE_MXID=@genie:${synapseDomain} "
+        f"ROOM_ID='{room_id}' "
+        f"STORE_BASE_DIR=/tmp/mas-e2ee-probe "
+        f"mas-e2ee-probe verify-restart"
+    )
+    print(rt3_out)
+    assert "RESTART_ROUNDTRIP_PASS" in rt3_out
   '';
 }

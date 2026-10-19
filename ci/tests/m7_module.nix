@@ -60,6 +60,10 @@ let
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
               };
+              wants = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+              };
               requiredBy = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
@@ -74,6 +78,10 @@ let
               };
               environment = lib.mkOption {
                 type = lib.types.attrsOf lib.types.str;
+                default = { };
+              };
+              unitConfig = lib.mkOption {
+                type = lib.types.attrsOf lib.types.unspecified;
                 default = { };
               };
               serviceConfig = lib.mkOption {
@@ -508,6 +516,52 @@ in
           });
       expected = true;
     };
+
+    test-m36-1-e2ee-setup-condition-and-wants =
+      let
+        defaultRes = evalModule {
+          storePassphraseFile = "/run/agenix/matrix-xmsg-store-key";
+          recoveryKeyFile = "/run/agenix/matrix-xmsg-recovery-key";
+        };
+        defaultBot = defaultRes.config.systemd.services.matrix-xmsg;
+        defaultSetup = defaultRes.config.systemd.services.matrix-xmsg-e2ee-setup;
+
+        resetRes = evalModule {
+          storePassphraseFile = "/run/agenix/matrix-xmsg-store-key";
+          recoveryKeyFile = "/run/agenix/matrix-xmsg-recovery-key";
+          resetCryptoStore = true;
+        };
+        resetSetup = resetRes.config.systemd.services.matrix-xmsg-e2ee-setup;
+
+        customDbRes = evalModule {
+          storePassphraseFile = "/run/agenix/matrix-xmsg-store-key";
+          recoveryKeyFile = "/run/agenix/matrix-xmsg-recovery-key";
+          dbPath = "/var/lib/matrix-xmsg-custom/sub/matrix-xmsg.db";
+        };
+        customDbSetup = customDbRes.config.systemd.services.matrix-xmsg-e2ee-setup;
+      in
+      {
+        expr = {
+          botWants = defaultBot.wants;
+          botAfterHasSetup = builtins.elem "matrix-xmsg-e2ee-setup.service" defaultBot.after;
+          setupWantedBy = defaultSetup.wantedBy;
+          setupRequiredBy = defaultSetup.requiredBy;
+          setupRemainAfterExit = defaultSetup.serviceConfig.RemainAfterExit or false;
+          defaultCondition = defaultSetup.unitConfig.ConditionPathExists or null;
+          resetCondition = resetSetup.unitConfig.ConditionPathExists or null;
+          customDbCondition = customDbSetup.unitConfig.ConditionPathExists or null;
+        };
+        expected = {
+          botWants = [ "matrix-xmsg-e2ee-setup.service" ];
+          botAfterHasSetup = true;
+          setupWantedBy = [ "matrix-xmsg.service" ];
+          setupRequiredBy = [ ];
+          setupRemainAfterExit = false;
+          defaultCondition = "!/var/lib/matrix-xmsg/matrix-sdk-crypto.sqlite3";
+          resetCondition = null;
+          customDbCondition = "!/var/lib/matrix-xmsg-custom/sub/matrix-sdk-crypto.sqlite3";
+        };
+      };
   };
 
   perSystem =

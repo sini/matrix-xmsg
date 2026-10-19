@@ -33,6 +33,8 @@ let
         null;
   } cfg "/run/credentials/matrix-xmsg-e2ee-setup.service/access-token";
 
+  cryptoStorePath = "${dirOf (toString cfg.dbPath)}/matrix-sdk-crypto.sqlite3";
+
   peersFile =
     pkgs.runCommand "matrix-xmsg-xmsg-peers.json"
       {
@@ -239,6 +241,7 @@ in
         ]
         ++ lib.optional xmsgCfg.enable "matrix-xmsg-xmsg.service"
         ++ lib.optional (cfg.recoveryKeyFile != null) "matrix-xmsg-e2ee-setup.service";
+        wants = lib.optional (cfg.recoveryKeyFile != null) "matrix-xmsg-e2ee-setup.service";
         wantedBy = [ "multi-user.target" ];
 
         serviceConfig = {
@@ -315,12 +318,13 @@ in
         description = "matrix-xmsg E2EE bootstrap and recovery setup oneshot";
         after = [ "network.target" ];
         before = [ "matrix-xmsg.service" ];
-        requiredBy = [ "matrix-xmsg.service" ];
-        wantedBy = [ "multi-user.target" ];
+        wantedBy = [ "matrix-xmsg.service" ];
+        unitConfig = lib.optionalAttrs (!cfg.resetCryptoStore) {
+          ConditionPathExists = "!${cryptoStorePath}";
+        };
 
         serviceConfig = {
           Type = "oneshot";
-          RemainAfterExit = true;
           ExecStart =
             "${lib.getExe cfg.package} --config ${setupConfigToml} --e2ee-setup --recovery-key-file /run/credentials/matrix-xmsg-e2ee-setup.service/recovery-key"
             + lib.optionalString cfg.resetCryptoStore " --reset-crypto-store";

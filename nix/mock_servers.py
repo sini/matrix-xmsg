@@ -318,7 +318,12 @@ class RegisterHandler(socketserver.StreamRequestHandler):
                     sys.stderr.write(f"[xmsg-mock] deliver {frame['messageId']}\n")
                 except queue.Empty:
                     frame = {"action": "timeout"}
-                write_frame(self.wfile, frame)
+                try:
+                    write_frame(self.wfile, frame)
+                except (BrokenPipeError, ConnectionResetError):
+                    if frame.get("action") == "deliver":
+                        pushed.put(frame)
+                    break
             else:
                 write_frame(self.wfile, {"status": "ok"})
 

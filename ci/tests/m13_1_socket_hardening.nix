@@ -52,9 +52,17 @@ let
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
               };
+              wants = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+              };
               wantedBy = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
+              };
+              unitConfig = lib.mkOption {
+                type = lib.types.attrsOf lib.types.unspecified;
+                default = { };
               };
               serviceConfig = lib.mkOption {
                 type = lib.types.attrsOf lib.types.unspecified;
