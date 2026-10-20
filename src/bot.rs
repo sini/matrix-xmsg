@@ -1,6 +1,6 @@
 use crate::config::{route_for, Admission, Config, GuardFailureMode};
 use crate::context::{
-    build_structural_envelope_with_screening, compute_sender_tier,
+    build_structural_envelope_with_screening_and_withholding, compute_sender_tier,
     format_context_line_with_screening, format_paged_context_lines, format_paged_resync_lines,
     select_structural_context_messages, slice_messages_by_byte_offset, ContextMode, EventMessage,
 };
@@ -907,32 +907,32 @@ pub async fn handle_incoming_event_with_guard(
     let solicited_opt = store.get_solicited_thread(&thread_root)?;
     let should_screen = should_screen_room(config, &event.room_id, solicited_opt.is_some());
 
-    let (relay_trigger, is_rewritten, is_unscreened, fail_open_warning, all_trusted_primary) =
-        match screen_forward_context(
-            &trigger_msg,
-            room_history,
-            replied_to_msg.as_ref(),
-            &replied_thread_msgs,
-            &mode,
-            &event.room_id,
-            &thread_root,
-            should_screen,
-            config,
-            matrix,
-            guard,
-            store,
-            now_secs,
-        )
-        .await?
-        {
-            Ok(res) => res,
-            Err(outcome) => return Ok(outcome),
-        };
-
-    let envelope = build_structural_envelope_with_screening(
+    let screened = match screen_forward_context(
+        &trigger_msg,
+        room_history,
+        replied_to_msg.as_ref(),
+        &replied_thread_msgs,
+        &mode,
         &event.room_id,
         &thread_root,
-        &relay_trigger,
+        &reaction_target_id,
+        should_screen,
+        config,
+        matrix,
+        guard,
+        store,
+        now_secs,
+    )
+    .await?
+    {
+        Ok(res) => res,
+        Err(outcome) => return Ok(outcome),
+    };
+
+    let envelope = build_structural_envelope_with_screening_and_withholding(
+        &event.room_id,
+        &thread_root,
+        &screened.trigger,
         room_history,
         replied_to_msg.as_ref(),
         &replied_thread_msgs,
@@ -943,9 +943,11 @@ pub async fn handle_incoming_event_with_guard(
         config.history_byte_cap,
         is_addressed,
         mode.clone(),
-        is_rewritten,
-        is_unscreened,
-        fail_open_warning,
+        screened.rewritten,
+        screened.unscreened,
+        screened.fail_open_warning,
+        screened.withhold_untrusted_history,
+        &config.bot_mxid,
     );
 
     if let Some(solicited) = solicited_opt {
@@ -1064,7 +1066,7 @@ pub async fn handle_incoming_event_with_guard(
             let rebootstrap_mode = ContextMode::Rebootstrap {
                 supersedes: delta_message_id.clone(),
             };
-            let boot_screened = if all_trusted_primary {
+            let boot_screened = if screened.all_trusted {
                 screen_forward_context(
                     &trigger_msg,
                     room_history,
@@ -1073,6 +1075,7 @@ pub async fn handle_incoming_event_with_guard(
                     &rebootstrap_mode,
                     &event.room_id,
                     &thread_root,
+                    &reaction_target_id,
                     should_screen,
                     config,
                     matrix,
@@ -1083,22 +1086,14 @@ pub async fn handle_incoming_event_with_guard(
                 .await?
                 .ok()
             } else {
-                Some((
-                    relay_trigger.clone(),
-                    is_rewritten,
-                    is_unscreened,
-                    fail_open_warning,
-                    all_trusted_primary,
-                ))
+                Some(screened.clone())
             };
 
-            if let Some((boot_trigger, boot_rewritten, boot_unscreened, boot_fail_open, _)) =
-                boot_screened
-            {
-                let bootstrap_envelope = build_structural_envelope_with_screening(
+            if let Some(boot_s) = boot_screened {
+                let bootstrap_envelope = build_structural_envelope_with_screening_and_withholding(
                     &event.room_id,
                     &thread_root,
-                    &boot_trigger,
+                    &boot_s.trigger,
                     room_history,
                     replied_to_msg.as_ref(),
                     &replied_thread_msgs,
@@ -1109,9 +1104,11 @@ pub async fn handle_incoming_event_with_guard(
                     config.history_byte_cap,
                     is_addressed,
                     rebootstrap_mode,
-                    boot_rewritten,
-                    boot_unscreened,
-                    boot_fail_open,
+                    boot_s.rewritten,
+                    boot_s.unscreened,
+                    boot_s.fail_open_warning,
+                    boot_s.withhold_untrusted_history,
+                    &config.bot_mxid,
                 );
 
                 let key = forward_key("rebootstrap", &claim_id);
@@ -1790,6 +1787,16 @@ fn is_caller_bound_to_forward(
     Ok(!delivery.from_name.trim().is_empty())
 }
 
+#[derive(Debug, Clone)]
+struct ForwardScreening {
+    trigger: EventMessage,
+    rewritten: bool,
+    unscreened: bool,
+    fail_open_warning: bool,
+    all_trusted: bool,
+    withhold_untrusted_history: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn screen_forward_context(
     trigger_msg: &EventMessage,
@@ -1799,13 +1806,14 @@ async fn screen_forward_context(
     mode: &ContextMode,
     room_id: &str,
     thread_root: &str,
+    reaction_target_id: &str,
     should_screen: bool,
     config: &Config,
     matrix: &dyn MatrixClient,
     guard: &dyn GuardClient,
     store: &Store,
     now_secs: i64,
-) -> Result<Result<(EventMessage, bool, bool, bool, bool), BotOutcome>, AppError> {
+) -> Result<Result<ForwardScreening, BotOutcome>, AppError> {
     let selected = select_structural_context_messages(
         trigger_msg,
         room_history,
@@ -1824,14 +1832,28 @@ async fn screen_forward_context(
         Some(&config.owner_mxid),
     );
 
-    let all_trusted = config.is_user_trusted(&trigger_msg.sender_mxid)
-        && history.iter().all(|l| config.is_user_trusted(&l.sender));
+    let trigger_trusted = config.is_user_trusted(&trigger_msg.sender_mxid);
+    let all_trusted = trigger_trusted && history.iter().all(|l| config.is_user_trusted(&l.sender));
     if all_trusted {
-        return Ok(Ok((trigger_msg.clone(), false, false, false, true)));
+        return Ok(Ok(ForwardScreening {
+            trigger: trigger_msg.clone(),
+            rewritten: false,
+            unscreened: false,
+            fail_open_warning: false,
+            all_trusted: true,
+            withhold_untrusted_history: false,
+        }));
     }
 
     if !should_screen {
-        return Ok(Ok((trigger_msg.clone(), false, true, false, false)));
+        return Ok(Ok(ForwardScreening {
+            trigger: trigger_msg.clone(),
+            rewritten: false,
+            unscreened: true,
+            fail_open_warning: false,
+            all_trusted: false,
+            withhold_untrusted_history: false,
+        }));
     }
 
     let trigger_tier = compute_sender_tier(
@@ -1860,14 +1882,58 @@ async fn screen_forward_context(
                     thread_root,
                     verdict.reason
                 );
+                if trigger_trusted {
+                    return Ok(Ok(ForwardScreening {
+                        trigger: trigger_msg.clone(),
+                        rewritten: false,
+                        unscreened: false,
+                        fail_open_warning: false,
+                        all_trusted: false,
+                        withhold_untrusted_history: true,
+                    }));
+                }
+                if let Err(e) = matrix
+                    .send_reaction(room_id, reaction_target_id, "🚫")
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to send reject reaction for event {}: {}",
+                        reaction_target_id,
+                        e
+                    );
+                }
                 return Ok(Err(BotOutcome::GuardRejected));
             }
             if verdict.verdict == "rewrite" {
+                if trigger_trusted {
+                    return Ok(Ok(ForwardScreening {
+                        trigger: trigger_msg.clone(),
+                        rewritten: false,
+                        unscreened: false,
+                        fail_open_warning: false,
+                        all_trusted: false,
+                        withhold_untrusted_history: true,
+                    }));
+                }
                 let mut rew = trigger_msg.clone();
                 rew.body = verdict.cleaned_text;
-                Ok(Ok((rew, true, false, false, false)))
+                Ok(Ok(ForwardScreening {
+                    trigger: rew,
+                    rewritten: true,
+                    unscreened: false,
+                    fail_open_warning: false,
+                    all_trusted: false,
+                    withhold_untrusted_history: false,
+                }))
             } else {
-                Ok(Ok((trigger_msg.clone(), false, false, false, false)))
+                Ok(Ok(ForwardScreening {
+                    trigger: trigger_msg.clone(),
+                    rewritten: false,
+                    unscreened: false,
+                    fail_open_warning: false,
+                    all_trusted: false,
+                    withhold_untrusted_history: false,
+                }))
             }
         }
         Err(e) => {
@@ -1910,7 +1976,14 @@ async fn screen_forward_context(
                         );
                         let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
                     }
-                    Ok(Ok((trigger_msg.clone(), false, true, true, false)))
+                    Ok(Ok(ForwardScreening {
+                        trigger: trigger_msg.clone(),
+                        rewritten: false,
+                        unscreened: true,
+                        fail_open_warning: true,
+                        all_trusted: false,
+                        withhold_untrusted_history: false,
+                    }))
                 }
             }
         }
