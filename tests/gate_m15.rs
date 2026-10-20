@@ -924,9 +924,13 @@ async fn oracle_9_real_unix_guard_client_integration() {
         while counter.load(Ordering::SeqCst) < 1 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let verdict =
-            json!({ "verdict": "reject", "reason": "prompt injection detected", "cleaned_text": "" })
-                .to_string();
+        let verdict = json!({
+            "verdict": "reject",
+            "class": "directs_model",
+            "reason": "prompt injection detected",
+            "cleaned_text": ""
+        })
+        .to_string();
         let mut routed = push_verdict(&id, &verdict).await;
         for _ in 0..100 {
             if routed == BotOutcome::GuardVerdictRouted {

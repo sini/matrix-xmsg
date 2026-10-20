@@ -115,7 +115,13 @@ async fn a_verdict_reaches_only_the_check_it_answers() {
     // each verdict names its own ID and each check reports which one it got.
     for n in 0..N {
         let id = format!("01MAPINS5{n:04}");
-        let verdict = json!({ "verdict": "reject", "reason": id, "cleaned_text": "" }).to_string();
+        let verdict = json!({
+            "verdict": "reject",
+            "class": "directs_model",
+            "reason": id,
+            "cleaned_text": ""
+        })
+        .to_string();
         while !route_guard_reply(&id, &verdict).await {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
