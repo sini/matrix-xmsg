@@ -819,15 +819,17 @@ pub async fn handle_incoming_event_with_guard(
         return Ok(BotOutcome::SizeCapRefusal);
     }
 
-    // 5. Rate Limit Gate
-    if store
-        .check_and_record_rate_limit(
-            &event.sender_mxid,
-            config.rate_limit_count,
-            config.rate_limit_window_secs,
-            now_secs,
-        )
-        .is_err()
+    // 5. Rate Limit Gate (skip re-charging on guard retry attempts of the same event)
+    let prior_guard_attempts = store.get_guard_retries(&trigger_msg.event_id)?.unwrap_or(0);
+    if prior_guard_attempts == 0
+        && store
+            .check_and_record_rate_limit(
+                &event.sender_mxid,
+                config.rate_limit_count,
+                config.rate_limit_window_secs,
+                now_secs,
+            )
+            .is_err()
     {
         let notice = "Rate limit exceeded. Please wait before asking another question.";
         matrix
@@ -1834,6 +1836,16 @@ async fn screen_forward_context(
         return Ok(Ok((trigger_msg.clone(), false, true, false, false)));
     }
 
+    let is_solicited = store.get_solicited_thread(thread_root)?.is_some();
+    if !is_solicited
+        && config.guard_failure_mode == GuardFailureMode::Closed
+        && (store.has_guard_failure_dm_sent(&trigger_msg.event_id)?
+            || store.get_guard_retries(&trigger_msg.event_id)?.unwrap_or(0)
+                >= config.guard_retry_budget)
+    {
+        return Ok(Err(BotOutcome::GuardFailed));
+    }
+
     let trigger_tier = compute_sender_tier(
         &trigger_msg.sender_mxid,
         &config.trusted_mxids,
@@ -1894,6 +1906,9 @@ async fn screen_forward_context(
                             permalink
                         );
                         let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
+                        let _ = matrix
+                            .send_reaction(room_id, &trigger_msg.event_id, "⚠️")
+                            .await;
                         let _ = store.set_guard_failure_dm_sent(&trigger_msg.event_id);
                     }
                     Ok(Err(BotOutcome::GuardFailed))
@@ -2320,17 +2335,23 @@ async fn handle_resync_request<I: SvcInbox + ?Sized>(
     }
 
     // Rate: at most one resync sequence per thread per 60 s (advancing offset > last_offset is permitted)
-    if let Err(retry_after) =
-        store.check_and_record_thread_resync_page(&forward.thread_root_id, offset, now_secs, 60)?
-    {
-        let reply_json = serde_json::json!({
-            "resync": "throttled",
-            "retry_after": retry_after
-        })
-        .to_string();
-        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
-        inbox.ack(&delivery.message_id).await?;
-        return Ok(BotOutcome::ResyncThrottled);
+    let prior_guard_attempts = store.get_guard_retries(&delivery.message_id)?.unwrap_or(0);
+    if prior_guard_attempts == 0 {
+        if let Err(retry_after) = store.check_and_record_thread_resync_page(
+            &forward.thread_root_id,
+            offset,
+            now_secs,
+            60,
+        )? {
+            let reply_json = serde_json::json!({
+                "resync": "throttled",
+                "retry_after": retry_after
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::ResyncThrottled);
+        }
     }
 
     // M33 §3.1: Engaged thread only (from root to latest thread reply). Never room-wide.
@@ -2371,6 +2392,15 @@ async fn handle_resync_request<I: SvcInbox + ?Sized>(
         Err(outcome) => {
             if outcome == BotOutcome::GuardRejected {
                 inbox.ack(&delivery.message_id).await?;
+            } else if outcome == BotOutcome::GuardFailed {
+                let attempts = store.get_guard_retries(&delivery.message_id)?.unwrap_or(0);
+                if attempts >= config.guard_retry_budget {
+                    let err_reply = r#"{"error":"screening unavailable; try again later"}"#;
+                    let _ = xmsg.reply_message(&delivery.message_id, err_reply).await;
+                    inbox.ack(&delivery.message_id).await?;
+                    let _ = store.clear_guard_retries(&delivery.message_id);
+                    let _ = store.clear_inbox_retries(&delivery.message_id);
+                }
             }
             return Ok(outcome);
         }
@@ -2485,20 +2515,23 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
     }
 
     // §4 rule 4: Per-thread rate limit (default 6 per 600 s)
-    if let Err(retry_after) = store.check_and_record_context_rate_limit(
-        &forward.thread_root_id,
-        config.context_rate_limit_count,
-        config.context_rate_limit_window_secs,
-        now_secs,
-    )? {
-        let reply_json = serde_json::json!({
-            "context": "throttled",
-            "retry_after": retry_after
-        })
-        .to_string();
-        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
-        inbox.ack(&delivery.message_id).await?;
-        return Ok(BotOutcome::ContextThrottled);
+    let prior_guard_attempts = store.get_guard_retries(&delivery.message_id)?.unwrap_or(0);
+    if prior_guard_attempts == 0 {
+        if let Err(retry_after) = store.check_and_record_context_rate_limit(
+            &forward.thread_root_id,
+            config.context_rate_limit_count,
+            config.context_rate_limit_window_secs,
+            now_secs,
+        )? {
+            let reply_json = serde_json::json!({
+                "context": "throttled",
+                "retry_after": retry_after
+            })
+            .to_string();
+            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            inbox.ack(&delivery.message_id).await?;
+            return Ok(BotOutcome::ContextThrottled);
+        }
     }
 
     let scope = match ctx_obj.get("scope").and_then(|v| v.as_str()) {
@@ -2747,6 +2780,15 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
         Err(outcome) => {
             if outcome == BotOutcome::GuardRejected {
                 inbox.ack(&delivery.message_id).await?;
+            } else if outcome == BotOutcome::GuardFailed {
+                let attempts = store.get_guard_retries(&delivery.message_id)?.unwrap_or(0);
+                if attempts >= config.guard_retry_budget {
+                    let err_reply = r#"{"error":"screening unavailable; try again later"}"#;
+                    let _ = xmsg.reply_message(&delivery.message_id, err_reply).await;
+                    inbox.ack(&delivery.message_id).await?;
+                    let _ = store.clear_guard_retries(&delivery.message_id);
+                    let _ = store.clear_inbox_retries(&delivery.message_id);
+                }
             }
             return Ok(outcome);
         }
@@ -3097,6 +3139,75 @@ pub async fn sweep_answer_timeouts(
     Ok(count)
 }
 
+struct ChannelSvcInbox {
+    ack_tx: tokio::sync::mpsc::UnboundedSender<(
+        String,
+        tokio::sync::oneshot::Sender<Result<(), AppError>>,
+    )>,
+    node_name: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl SvcInbox for ChannelSvcInbox {
+    async fn poll(&mut self, _wait_secs: u64) -> Result<Option<SvcDelivery>, AppError> {
+        Ok(None)
+    }
+
+    async fn ack(&mut self, message_id: &str) -> Result<(), AppError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.ack_tx
+            .send((message_id.to_string(), tx))
+            .map_err(|_| AppError::Xmsg("Inbox loop closed before ack".to_string()))?;
+        rx.await
+            .map_err(|_| AppError::Xmsg("Inbox loop dropped ack responder".to_string()))?
+    }
+
+    fn node(&self) -> Option<String> {
+        self.node_name.clone()
+    }
+}
+
+fn delivery_thread_key(delivery: &SvcDelivery, store: &Store) -> String {
+    if let Some(orig_id) = delivery
+        .in_reply_to
+        .as_deref()
+        .or_else(|| parse_in_reply_to_id(&delivery.envelope))
+        .or_else(|| parse_in_reply_to_id(&delivery.text))
+    {
+        if let Ok(Some(fwd)) = store.get_forwarded_message(orig_id) {
+            return format!("thread:{}:{}", fwd.room_id, fwd.thread_root_id);
+        }
+        return format!("reply:{orig_id}");
+    }
+
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(delivery.text.trim()) {
+        if let Some(obj) = val.as_object() {
+            let extract_target =
+                |m: &serde_json::Map<String, serde_json::Value>| -> Option<String> {
+                    m.get("redact")
+                        .or_else(|| m.get("edit"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                };
+            let target_opt = extract_target(obj).or_else(|| {
+                obj.get("text")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim()).ok())
+                    .and_then(|inner| inner.as_object().and_then(extract_target))
+            });
+            if let Some(target_id) = target_opt {
+                if let Ok(Some(rec)) = store.get_bot_reply_event(&target_id) {
+                    return format!("thread:{}:{}", rec.room_id, rec.thread_root_id);
+                }
+            }
+        }
+    }
+
+    format!("msg:{}", delivery.message_id)
+}
+
 /// Runs the service inbox poll loop until shutdown signal is received.
 pub async fn run_inbox_loop<I: SvcInbox>(
     mut inbox: I,
@@ -3111,7 +3222,31 @@ pub async fn run_inbox_loop<I: SvcInbox>(
         tracing::warn!("Failed resolving configured rooms at startup: {e}");
     }
 
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        String,
+        tokio::sync::oneshot::Sender<Result<(), AppError>>,
+    )>();
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (node_tx, node_rx) = tokio::sync::watch::channel(inbox.node());
+    let (worker_shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+    let mut in_flight_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut duplicate_polled = false;
+    let mut thread_queues: std::collections::HashMap<
+        String,
+        tokio::sync::mpsc::UnboundedSender<SvcDelivery>,
+    > = std::collections::HashMap::new();
+
     loop {
+        while let Ok((ack_id, reply_tx)) = ack_rx.try_recv() {
+            let res = inbox.ack(&ack_id).await;
+            let _ = reply_tx.send(res);
+        }
+        while let Ok(done_id) = done_rx.try_recv() {
+            in_flight_ids.remove(&done_id);
+            duplicate_polled = false;
+        }
+
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3123,85 +3258,237 @@ pub async fn run_inbox_loop<I: SvcInbox>(
             tracing::warn!("Failed sweeping answer timeouts: {e}");
         }
 
+        if duplicate_polled && !in_flight_ids.is_empty() {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => {
+                    tracing::info!("Inbox loop received shutdown signal");
+                    let _ = worker_shutdown_tx.send(());
+                    break;
+                }
+                Some((ack_id, reply_tx)) = ack_rx.recv() => {
+                    let res = inbox.ack(&ack_id).await;
+                    let _ = reply_tx.send(res);
+                    continue;
+                }
+                Some(done_id) = done_rx.recv() => {
+                    in_flight_ids.remove(&done_id);
+                    duplicate_polled = false;
+                    continue;
+                }
+            }
+        }
+
+        let wait_secs = if in_flight_ids.is_empty() { 5 } else { 0 };
+
         tokio::select! {
+            biased;
             _ = shutdown_rx.recv() => {
                 tracing::info!("Inbox loop received shutdown signal");
+                let _ = worker_shutdown_tx.send(());
                 break;
             }
-            poll_res = inbox.poll(5) => {
+            poll_res = inbox.poll(wait_secs) => {
+                let _ = node_tx.send(inbox.node());
                 match poll_res {
                     Ok(Some(delivery)) => {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as i64;
-                        let prev_attempts = store
-                            .get_inbox_retries(&delivery.message_id)
-                            .unwrap_or(None)
-                            .map(|(a, _)| a)
-                            .unwrap_or(0);
-
-                        match handle_inbox_delivery_with_xmsg(
-                            &delivery,
-                            &config,
-                            matrix.as_ref(),
-                            store.as_ref(),
-                            xmsg.as_ref(),
-                            &mut inbox,
-                            now,
-                        ).await {
-                            Ok(_) => {
-                                if prev_attempts > 0 {
-                                    let _ = store.clear_inbox_retries(&delivery.message_id);
-                                }
-                            }
-                            Err(e) => {
-                                let attempt = prev_attempts + 1;
-                                if attempt >= config.inbox_retry_budget {
-                                    tracing::error!(
-                                        "Delivery {} permanently failed after {} attempts: {e}; giving up",
-                                        delivery.message_id,
-                                        attempt
-                                    );
-                                    let err_reply = serde_json::json!({
-                                        "error": format!("{e}")
-                                    })
-                                    .to_string();
-                                    let _ = xmsg.reply_message(&delivery.message_id, &err_reply).await;
-                                    let dm_text = format!(
-                                        "[matrix-xmsg] Delivery {} permanently failed after {} attempts: {e}",
-                                        delivery.message_id,
-                                        attempt
-                                    );
-                                    let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
-                                    if let Err(ack_err) = inbox.ack(&delivery.message_id).await {
-                                        tracing::error!(
-                                            "Failed to ack delivery {} on give-up: {ack_err}",
-                                            delivery.message_id
-                                        );
-                                    }
-                                    let _ = store.clear_inbox_retries(&delivery.message_id);
-                                } else {
-                                    let _ = store.record_inbox_retry(&delivery.message_id, attempt, now);
-                                    let backoff_secs = (1u64 << (attempt - 1).min(30)).min(300);
+                        // Verdict routing never waits behind a handler (M38 §1): route guard
+                        // replies on the inbox loop and ack them before dispatching handlers.
+                        let reply_to_candidate = delivery
+                            .in_reply_to
+                            .as_deref()
+                            .or_else(|| parse_in_reply_to_id(&delivery.envelope));
+                        if let Some(in_reply_to) = reply_to_candidate {
+                            if route_guard_reply(in_reply_to, &delivery.text).await {
+                                if let Err(e) = inbox.ack(&delivery.message_id).await {
                                     tracing::warn!(
-                                        "Delivery {} attempt {} failed: {e}; retrying in {}s",
-                                        delivery.message_id,
-                                        attempt,
-                                        backoff_secs
+                                        "Failed to ack guard verdict {}: {e}",
+                                        delivery.message_id
                                     );
-                                    tokio::select! {
-                                        _ = shutdown_rx.recv() => {
-                                            tracing::info!("Inbox loop received shutdown signal during retry backoff");
-                                            break;
-                                        }
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                                    }
+                                }
+                                continue;
+                            }
+                        }
+
+                        if in_flight_ids.contains(&delivery.message_id) {
+                            duplicate_polled = true;
+                            continue;
+                        }
+
+                        in_flight_ids.insert(delivery.message_id.clone());
+                        let thread_key = delivery_thread_key(&delivery, store.as_ref());
+                        let mut to_send = Some(delivery);
+
+                        if let Some(tx) = thread_queues.get(&thread_key) {
+                            match tx.send(to_send.take().unwrap()) {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    to_send = Some(err.0);
+                                    thread_queues.remove(&thread_key);
                                 }
                             }
                         }
+
+                        if let Some(first_delivery) = to_send {
+                            let (tx, mut rx) =
+                                tokio::sync::mpsc::unbounded_channel::<SvcDelivery>();
+                            let _ = tx.send(first_delivery);
+                            thread_queues.insert(thread_key, tx);
+
+                            let config = config.clone();
+                            let matrix = matrix.clone();
+                            let store = store.clone();
+                            let xmsg = xmsg.clone();
+                            let ack_tx = ack_tx.clone();
+                            let done_tx = done_tx.clone();
+                            let node_rx = node_rx.clone();
+                            let sem = sem.clone();
+                            let mut worker_shutdown_rx = worker_shutdown_tx.subscribe();
+
+                            tokio::spawn(async move {
+                                while let Some(delivery) = rx.recv().await {
+                                    let _permit = match sem.clone().acquire_owned().await {
+                                        Ok(p) => p,
+                                        Err(_) => break,
+                                    };
+
+                                    loop {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs() as i64;
+                                        let prev_attempts = store
+                                            .get_inbox_retries(&delivery.message_id)
+                                            .unwrap_or(None)
+                                            .map(|(a, _)| a)
+                                            .unwrap_or(0);
+                                        let mut chan_inbox = ChannelSvcInbox {
+                                            ack_tx: ack_tx.clone(),
+                                            node_name: node_rx.borrow().clone(),
+                                        };
+
+                                        match handle_inbox_delivery_with_xmsg(
+                                            &delivery,
+                                            &config,
+                                            matrix.as_ref(),
+                                            store.as_ref(),
+                                            xmsg.as_ref(),
+                                            &mut chan_inbox,
+                                            now,
+                                        )
+                                        .await
+                                        {
+                                            Ok(BotOutcome::GuardFailed) => {
+                                                let remaining = store
+                                                    .get_guard_retries(&delivery.message_id)
+                                                    .unwrap_or(None)
+                                                    .unwrap_or(0);
+                                                if remaining == 0 {
+                                                    break;
+                                                }
+                                                let backoff_secs =
+                                                    (1u64 << (remaining.saturating_sub(1)).min(30))
+                                                        .min(300);
+                                                tokio::select! {
+                                                    _ = worker_shutdown_rx.recv() => break,
+                                                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                                                }
+                                            }
+                                            Ok(_) => {
+                                                if prev_attempts > 0 {
+                                                    let _ = store.clear_inbox_retries(&delivery.message_id);
+                                                }
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                let attempt = prev_attempts + 1;
+                                                if attempt >= config.inbox_retry_budget {
+                                                    tracing::error!(
+                                                        "Delivery {} permanently failed after {} attempts: {e}; giving up",
+                                                        delivery.message_id,
+                                                        attempt
+                                                    );
+                                                    let err_reply = serde_json::json!({
+                                                        "error": format!("{e}")
+                                                    })
+                                                    .to_string();
+                                                    let _ = xmsg.reply_message(&delivery.message_id, &err_reply).await;
+                                                    let dm_text = format!(
+                                                        "[matrix-xmsg] Delivery {} permanently failed after {} attempts: {e}",
+                                                        delivery.message_id,
+                                                        attempt
+                                                    );
+                                                    let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
+                                                    if let Err(ack_err) = chan_inbox.ack(&delivery.message_id).await {
+                                                        tracing::error!(
+                                                            "Failed to ack delivery {} on give-up: {ack_err}",
+                                                            delivery.message_id
+                                                        );
+                                                    }
+                                                    let _ = store.clear_inbox_retries(&delivery.message_id);
+                                                    break;
+                                                } else {
+                                                    let _ = store.record_inbox_retry(&delivery.message_id, attempt, now);
+                                                    let backoff_secs = (1u64 << (attempt - 1).min(30)).min(300);
+                                                    tracing::warn!(
+                                                        "Delivery {} attempt {} failed: {e}; retrying in {}s",
+                                                        delivery.message_id,
+                                                        attempt,
+                                                        backoff_secs
+                                                    );
+                                                    tokio::select! {
+                                                        _ = worker_shutdown_rx.recv() => {
+                                                            tracing::info!("Inbox loop received shutdown signal during retry backoff");
+                                                            break;
+                                                        }
+                                                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let _ = done_tx.send(delivery.message_id.clone());
+                                }
+                            });
+                        }
+
+                        tokio::select! {
+                            biased;
+                            Some((ack_id, reply_tx)) = ack_rx.recv() => {
+                                let res = inbox.ack(&ack_id).await;
+                                let _ = reply_tx.send(res);
+                            }
+                            Some(done_id) = done_rx.recv() => {
+                                in_flight_ids.remove(&done_id);
+                                duplicate_polled = false;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                        }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if !in_flight_ids.is_empty() {
+                            tokio::select! {
+                                biased;
+                                _ = shutdown_rx.recv() => {
+                                    tracing::info!("Inbox loop received shutdown signal");
+                                    let _ = worker_shutdown_tx.send(());
+                                    break;
+                                }
+                                Some((ack_id, reply_tx)) = ack_rx.recv() => {
+                                    let res = inbox.ack(&ack_id).await;
+                                    let _ = reply_tx.send(res);
+                                }
+                                Some(done_id) = done_rx.recv() => {
+                                    in_flight_ids.remove(&done_id);
+                                    duplicate_polled = false;
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+                            }
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!("Error polling svc inbox: {e}");
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -3738,18 +4025,38 @@ async fn process_incoming_room_message(
                     .await
                     .unwrap_or_default();
 
-                if let Err(e) = handle_incoming_event_with_claim(
-                    &incoming,
-                    &history,
-                    &config,
-                    matrix.as_ref(),
-                    xmsg.as_ref(),
-                    &store,
-                    Some(&claimed),
-                )
-                .await
-                {
-                    tracing::error!("Error handling incoming event {}: {e}", incoming.event_id);
+                let mut retry_delay = std::time::Duration::from_millis(200);
+                loop {
+                    match handle_incoming_event_with_claim(
+                        &incoming,
+                        &history,
+                        &config,
+                        matrix.as_ref(),
+                        xmsg.as_ref(),
+                        &store,
+                        Some(&claimed),
+                    )
+                    .await
+                    {
+                        Ok(BotOutcome::GuardFailed) => {
+                            if store
+                                .has_guard_failure_dm_sent(&incoming.event_id)
+                                .unwrap_or(true)
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(5));
+                        }
+                        Ok(_) => break,
+                        Err(e) => {
+                            tracing::error!(
+                                "Error handling incoming event {}: {e}",
+                                incoming.event_id
+                            );
+                            break;
+                        }
+                    }
                 }
             })
             .await;

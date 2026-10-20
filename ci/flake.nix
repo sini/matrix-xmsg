@@ -12,7 +12,7 @@
     # before delivery, `reply` taking `idempotency_key`), which every forward send now carries.
     # The addressing plan's re-verify step moves it.
     xmsg = {
-      url = "github:sini/xmsg/a6f7adf31516e4ebc56fb409cd302a54c18647b6";
+      url = "github:sini/xmsg/cca3de77fbe95ea1ad90ab8ba7a83eb741fc9cb9";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.crane.follows = "crane";
     };

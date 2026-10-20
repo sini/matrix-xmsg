@@ -7,6 +7,61 @@
 let
   system = pkgs.stdenv.hostPlatform.system;
 
+  mockGuard = pkgs.writeScriptBin "mock-guard" ''
+    #!${pkgs.python3}/bin/python3
+    import json
+    import socket
+    import sys
+
+    SOCK_DIR = "/run/matrix-xmsg-xmsg/xmsg"
+
+    def recv_frame(f):
+        line = f.readline()
+        if not line:
+            raise RuntimeError("EOF from xmsg socket")
+        return json.loads(line)
+
+    def send_frame(sock, obj):
+        sock.sendall((json.dumps(obj) + "\n").encode())
+
+    reg = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    reg.connect(f"{SOCK_DIR}/register.sock")
+    reg_f = reg.makefile("r", encoding="utf-8")
+    send_frame(reg, {"harness": "svc", "name": "genie-guard", "cwd": "/"})
+    ok = recv_frame(reg_f)
+    if ok.get("status") != "ok":
+        raise RuntimeError(f"svc registration failed: {ok}")
+    sys.stderr.write(f"[mock-guard] registered on xmsg: {ok}\n")
+    with open("/run/matrix-xmsg-xmsg/genie-guard.ready", "w") as rf:
+        rf.write("ready\n")
+
+    while True:
+        send_frame(reg, {"action": "poll", "waitSecs": 30})
+        frame = recv_frame(reg_f)
+        if frame.get("action") == "deliver":
+            msg_id = frame["messageId"]
+            sys.stderr.write(f"[mock-guard] received guard request {msg_id}\n")
+            with open("/tmp/own_xmsg_guard_received.json", "w") as out:
+                json.dump(frame, out)
+            agent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            agent.connect(f"{SOCK_DIR}/agent.sock")
+            agent_f = agent.makefile("r", encoding="utf-8")
+            send_frame(agent, {
+                "action": "reply",
+                "message_id": msg_id,
+                "text": json.dumps({
+                    "verdict": "allow",
+                    "reason": "clean",
+                    "cleaned_text": "",
+                }),
+            })
+            reply_resp = recv_frame(agent_f)
+            agent.close()
+            sys.stderr.write(f"[mock-guard] replied: {reply_resp}\n")
+            send_frame(reg, {"action": "ack", "messageId": msg_id})
+            recv_frame(reg_f)
+  '';
+
   mockExpert = pkgs.writeScriptBin "mock-expert" ''
     #!${pkgs.python3}/bin/python3
     import json
@@ -36,29 +91,52 @@ let
     with open("/run/matrix-xmsg-xmsg/claude.ready", "w") as rf:
         rf.write("ready\n")
 
+    forward_msg_id = None
+
     while True:
         send_frame(reg, {"action": "poll", "waitSecs": 30})
         frame = recv_frame(reg_f)
         action = frame.get("action")
         if action == "deliver":
             msg_id = frame["messageId"]
+            text = frame.get("text", "")
             sys.stderr.write(f"[mock-expert] received delivery {msg_id}\n")
-            with open("/tmp/own_xmsg_forward_received.json", "w") as out:
-                json.dump(frame, out)
-            # Reply via agent.sock
-            agent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            agent.connect(f"{SOCK_DIR}/agent.sock")
-            agent_f = agent.makefile("r", encoding="utf-8")
-            send_frame(agent, {
-                "action": "reply",
-                "message_id": msg_id,
-                "text": "pong from real xmsg expert",
-            })
-            reply_resp = recv_frame(agent_f)
-            agent.close()
-            sys.stderr.write(f"[mock-expert] replied: {reply_resp}\n")
-            send_frame(reg, {"action": "ack", "messageId": msg_id})
-            recv_frame(reg_f)
+            if forward_msg_id is None:
+                forward_msg_id = msg_id
+                with open("/tmp/own_xmsg_forward_received.json", "w") as out:
+                    json.dump(frame, out)
+                send_frame(reg, {"action": "ack", "messageId": msg_id})
+                recv_frame(reg_f)
+                # Request room context first (which triggers genie-guard while the context
+                # delivery is in-flight on matrix-xmsg's register.sock inbox)
+                agent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                agent.connect(f"{SOCK_DIR}/agent.sock")
+                agent_f = agent.makefile("r", encoding="utf-8")
+                send_frame(agent, {
+                    "action": "reply",
+                    "message_id": forward_msg_id,
+                    "text": json.dumps({"context": {"scope": "room", "limit": 5}}),
+                })
+                ctx_req_resp = recv_frame(agent_f)
+                agent.close()
+                sys.stderr.write(f"[mock-expert] requested context: {ctx_req_resp}\n")
+            else:
+                with open("/tmp/own_xmsg_context_received.json", "w") as out:
+                    json.dump(frame, out)
+                send_frame(reg, {"action": "ack", "messageId": msg_id})
+                recv_frame(reg_f)
+                # Now send the final expert reply to the original forward
+                agent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                agent.connect(f"{SOCK_DIR}/agent.sock")
+                agent_f = agent.makefile("r", encoding="utf-8")
+                send_frame(agent, {
+                    "action": "reply",
+                    "message_id": forward_msg_id,
+                    "text": "pong from real xmsg expert",
+                })
+                reply_resp = recv_frame(agent_f)
+                agent.close()
+                sys.stderr.write(f"[mock-expert] replied: {reply_resp}\n")
   '';
 in
 pkgs.testers.nixosTest {
@@ -92,6 +170,24 @@ pkgs.testers.nixosTest {
         };
       };
 
+      systemd.services.mock-guard = {
+        description = "Mock genie-guard registered on matrix-xmsg's own xmsg node";
+        after = [ "matrix-xmsg-xmsg.service" ];
+        wants = [ "matrix-xmsg-xmsg.service" ];
+        before = [ "matrix-xmsg.service" ];
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "simple";
+          User = "matrix-xmsg";
+          Group = "matrix-xmsg";
+          ExecStartPre = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do [ -S /run/matrix-xmsg-xmsg/xmsg/register.sock ] && exit 0; sleep 0.1; done; exit 1'";
+          ExecStart = "${mockGuard}/bin/mock-guard";
+          ExecStartPost = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do [ -f /run/matrix-xmsg-xmsg/genie-guard.ready ] && exit 0; sleep 0.1; done; exit 1'";
+          Restart = "on-failure";
+          RestartSec = "1s";
+        };
+      };
+
       systemd.services.mock-expert = {
         description = "Mock expert registered on matrix-xmsg's own xmsg node";
         after = [ "matrix-xmsg-xmsg.service" ];
@@ -111,8 +207,14 @@ pkgs.testers.nixosTest {
       };
 
       systemd.services.matrix-xmsg = {
-        after = [ "mock-expert.service" ];
-        wants = [ "mock-expert.service" ];
+        after = [
+          "mock-guard.service"
+          "mock-expert.service"
+        ];
+        wants = [
+          "mock-guard.service"
+          "mock-expert.service"
+        ];
         environment.RUST_LOG = "info";
       };
 
@@ -126,13 +228,15 @@ pkgs.testers.nixosTest {
         rooms = [ "!test:test.local" ];
         trustedMxids = [ "@trusted:test.local" ];
         ownerMxid = "@owner:test.local";
-        screenMentions = false;
+        screenMentions = true;
+        guardTimeoutSecs = 10;
         expertRef = "claude";
         xmsg = {
           enable = true;
           package = xmsg.packages.${system}.default.overrideAttrs { doCheck = false; };
           svcExe = {
             claude = pkgs.python3.interpreter;
+            genie-guard = pkgs.python3.interpreter;
           };
         };
       };
@@ -146,6 +250,7 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("matrix-xmsg-xmsg.service")
     machine.wait_for_file("/run/matrix-xmsg-xmsg/xmsg/register.sock")
     machine.wait_for_file("/run/matrix-xmsg-xmsg/xmsg/agent.sock")
+    machine.wait_for_unit("mock-guard.service")
     machine.wait_for_unit("mock-expert.service")
     machine.wait_for_unit("matrix-xmsg.service")
 
@@ -165,9 +270,15 @@ pkgs.testers.nixosTest {
         timeout=30,
     )
 
-    # 4. Verify full round-trip: Matrix -> matrix-xmsg -> real xmsg -> mock-expert -> real xmsg -> matrix-xmsg -> Matrix
+    # 4. Verify full round-trip including in-flight context request screened by genie-guard:
+    # Matrix -> matrix-xmsg (guard check 1) -> mock-expert -> context request -> matrix-xmsg (guard check 2 while context in-flight) -> mock-expert -> final reply -> Matrix
     machine.wait_for_file("/tmp/own_xmsg_forward_received.json", timeout=30)
+    machine.wait_for_file("/tmp/own_xmsg_guard_received.json", timeout=30)
+    machine.wait_for_file("/tmp/own_xmsg_context_received.json", timeout=30)
     machine.wait_for_file("/tmp/matrix_reply_received.json", timeout=30)
+
+    ctx_content = machine.succeed("cat /tmp/own_xmsg_context_received.json")
+    assert "untrusted room context line for m38" in ctx_content, f"Expected screened room context in expert reply, got: {ctx_content}"
 
     reply_content = machine.succeed("cat /tmp/matrix_reply_received.json")
     assert "pong from real xmsg expert" in reply_content, f"Expected expert answer in Matrix reply, got: {reply_content}"

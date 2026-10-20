@@ -142,11 +142,25 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if "/messages" in path:
+            chunk = []
+            if os.environ.get("MOCK_MATRIX_ONLY") == "1":
+                chunk = [
+                    {
+                        "type": "m.room.message",
+                        "sender": "@stranger:test.local",
+                        "content": {
+                            "msgtype": "m.text",
+                            "body": "untrusted room context line for m38",
+                        },
+                        "event_id": "$ev_untrusted_hist_01",
+                        "origin_server_ts": int(time.time() * 1000) - 5000,
+                    }
+                ]
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({
-                "chunk": [],
+                "chunk": chunk,
                 "start": "s0",
                 "end": "s1"
             }).encode())

@@ -864,6 +864,12 @@ pub fn parse_guard_reply(reply_text: &str) -> Result<GuardVerdict, AppError> {
         .unwrap_or("")
         .to_string();
 
+    if verdict == "rewrite" && cleaned_text.trim().is_empty() {
+        return Err(AppError::Xmsg(
+            "Missing or empty 'cleaned_text' in rewrite verdict".to_string(),
+        ));
+    }
+
     Ok(GuardVerdict {
         verdict: verdict.to_string(),
         reason,
@@ -990,6 +996,12 @@ mod tests {
         assert_eq!(v.verdict, "rewrite");
         assert_eq!(v.reason, "sanitized");
         assert_eq!(v.cleaned_text, "safe text");
+
+        let empty = r#"{"verdict": "rewrite", "reason": "sanitized", "cleaned_text": ""}"#;
+        assert!(parse_guard_reply(empty).is_err());
+
+        let whitespace = r#"{"verdict": "rewrite", "reason": "sanitized", "cleaned_text": "   "}"#;
+        assert!(parse_guard_reply(whitespace).is_err());
     }
 
     #[test]
