@@ -826,6 +826,19 @@ impl UnixGuardClient {
     }
 }
 
+pub const GUARD_REJECT_CLASSES: &[&str] = &[
+    "directs_model",
+    "seeks_holdings",
+    "coerces_tool",
+    "exfil_channel",
+    "hidden_instruction",
+    "guard_error",
+];
+
+pub fn is_valid_guard_reject_class(class: Option<&str>) -> bool {
+    matches!(class, Some(c) if GUARD_REJECT_CLASSES.contains(&c))
+}
+
 pub fn parse_guard_reply(reply_text: &str) -> Result<GuardVerdict, AppError> {
     let val: Value = serde_json::from_str(reply_text.trim()).map_err(|e| {
         AppError::Xmsg(format!(
@@ -863,6 +876,24 @@ pub fn parse_guard_reply(reply_text: &str) -> Result<GuardVerdict, AppError> {
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string();
+
+    if verdict == "reject" {
+        let class = obj.get("class").and_then(|c| c.as_str());
+        if !is_valid_guard_reject_class(class) {
+            tracing::warn!(
+                class = ?class,
+                reason = %reason,
+                "genie-guard: reject without valid class ({:?}) treated as allow: {}",
+                class,
+                reason
+            );
+            return Ok(GuardVerdict {
+                verdict: "allow".to_string(),
+                reason,
+                cleaned_text: String::new(),
+            });
+        }
+    }
 
     Ok(GuardVerdict {
         verdict: verdict.to_string(),
@@ -994,10 +1025,42 @@ mod tests {
 
     #[test]
     fn test_parse_guard_reply_reject() {
-        let text = r#"{"verdict": "reject", "reason": "attack detected", "cleaned_text": ""}"#;
-        let v = parse_guard_reply(text).unwrap();
-        assert_eq!(v.verdict, "reject");
-        assert_eq!(v.reason, "attack detected");
+        for class in GUARD_REJECT_CLASSES {
+            let text = serde_json::json!({
+                "verdict": "reject",
+                "class": class,
+                "reason": "attack detected",
+                "cleaned_text": ""
+            })
+            .to_string();
+            let v = parse_guard_reply(&text).unwrap();
+            assert_eq!(v.verdict, "reject", "class {class} must remain reject");
+            assert_eq!(v.reason, "attack detected");
+        }
+    }
+
+    #[test]
+    fn oracle_gi12b_reject_without_valid_class_treated_as_allow_and_guard_error_stays_reject() {
+        for bad in [
+            r#"{"verdict": "reject", "reason": "status report, not a question", "cleaned_text": ""}"#,
+            r#"{"verdict": "reject", "class": "not_a_question", "reason": "not a question", "cleaned_text": ""}"#,
+            r#"{"verdict": "reject", "class": "", "reason": "empty class", "cleaned_text": ""}"#,
+        ] {
+            let v = parse_guard_reply(bad).unwrap();
+            assert_eq!(
+                v.verdict, "allow",
+                "classless/invalid-class reject must become allow: {bad}"
+            );
+            assert_eq!(v.cleaned_text, "");
+        }
+
+        let guard_err = r#"{"verdict": "reject", "class": "guard_error", "reason": "guard-in output invalid: unparseable", "cleaned_text": ""}"#;
+        let v_err = parse_guard_reply(guard_err).unwrap();
+        assert_eq!(
+            v_err.verdict, "reject",
+            "guard_error class must stay reject"
+        );
+        assert_eq!(v_err.reason, "guard-in output invalid: unparseable");
     }
 
     #[test]
