@@ -374,7 +374,7 @@ pub async fn handle_incoming_event_with_guard(
         }
     }
 
-    // Check for !release command on solicited thread opening post
+    // Check for !release command on solicited thread opening post or escalated thread (M15, M39)
     if event.body.trim() == "!release" {
         let target_root = event
             .thread_root_id
@@ -392,6 +392,24 @@ pub async fn handle_incoming_event_with_guard(
                     } else {
                         return Ok(BotOutcome::IgnoredReleaseNotOwner);
                     }
+                }
+            }
+            if store.get_thread_escalation(root_id)?.is_some() {
+                if config.is_user_trusted(&event.sender_mxid) {
+                    store.release_thread_escalation(root_id)?;
+                    if let Err(e) = matrix
+                        .send_reaction(&event.room_id, &event.event_id, "✅")
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to send release reaction for event {}: {}",
+                            event.event_id,
+                            e
+                        );
+                    }
+                    return Ok(BotOutcome::Unbound);
+                } else {
+                    return Ok(BotOutcome::IgnoredReleaseNotOwner);
                 }
             }
         }
@@ -561,11 +579,18 @@ pub async fn handle_incoming_event_with_guard(
             } else {
                 false
             };
+            let is_escalation_asker = if let Some(ref root) = event.thread_root_id {
+                store.get_thread_escalation_asker(root)?.as_deref() == Some(&event.sender_mxid)
+            } else {
+                false
+            };
             let is_addressed = is_mentioned
                 || is_reply_to_bot
                 || is_thread_escalate
                 || is_thread_deeper
-                || is_approval_reply;
+                || is_thread_trust
+                || is_approval_reply
+                || is_escalation_asker;
 
             let is_engaged_thread = if let Some(ref root) = event.thread_root_id {
                 store.is_thread_engaged(root)?
@@ -763,7 +788,7 @@ pub async fn handle_incoming_event_with_guard(
                 false
             };
             let is_admitted = match config.admission {
-                Admission::Trusted => is_trusted || is_promoted_thread,
+                Admission::Trusted => is_trusted || is_promoted_thread || is_escalation_asker,
                 Admission::Public => {
                     is_trusted
                         || is_top_level
@@ -1039,6 +1064,34 @@ pub async fn handle_incoming_event_with_guard(
     // Record relay claim in SQLite
     store.record_event_relayed(&claim_id, now_secs)?;
 
+    // M39 §2.1: At the first forward in a thread, when the sender is trusted, look up the root
+    // before taking `forward_gate` (check `room_history` first, calling `fetch_event` only on a miss).
+    let escalation_root_author = if event.thread_root_id.is_some()
+        && thread_root != event.event_id
+        && config.is_user_trusted(&event.sender_mxid)
+        && store.get_thread_asker(&thread_root)?.is_none()
+    {
+        let root_msg = match room_history.iter().find(|m| m.event_id == thread_root) {
+            Some(m) => Some(m.clone()),
+            None => matrix
+                .fetch_event(&event.room_id, &thread_root)
+                .await
+                .ok()
+                .flatten(),
+        };
+        root_msg.and_then(|root_ev| {
+            if !config.is_user_trusted(&root_ev.sender_mxid)
+                && root_ev.sender_mxid != config.bot_mxid
+            {
+                Some(root_ev.sender_mxid)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
     // 8. Send to xmsg Expert Inbox, recording the forward under `Store::forward_gate`.
     let mapped_sender = map_sender_mxid(&event.sender_mxid);
     let gate = store.forward_gate.read().await;
@@ -1144,7 +1197,11 @@ pub async fn handle_incoming_event_with_guard(
     if let Some(ref r_msg_id) = rebootstrap_message_id {
         store.record_thread_message(&thread_root, r_msg_id, now_secs)?;
     }
-    store.record_thread_asker(&thread_root, &event.sender_mxid)?;
+    if let Some(ref root_asker) = escalation_root_author {
+        store.record_thread_escalation(&thread_root, root_asker, &event.sender_mxid, now_secs)?;
+    } else {
+        store.record_thread_asker(&thread_root, &event.sender_mxid)?;
+    }
 
     // Record forwarded message for inbox reply routing and timeout tracking:
     // Both delta and rebootstrap message IDs are recorded so a reply to EITHER is attributed to the thread.
@@ -3752,7 +3809,7 @@ impl InFlightQuestion {
 pub struct TaskTracker {
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     tasks: std::sync::Arc<
-        tokio::sync::Mutex<
+        std::sync::Mutex<
             std::collections::HashMap<u64, (InFlightQuestion, tokio::task::AbortHandle)>,
         >,
     >,
@@ -3761,6 +3818,27 @@ pub struct TaskTracker {
 impl TaskTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn next_id(&self) -> u64 {
+        self.counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn insert_task(
+        &self,
+        id: u64,
+        question: InFlightQuestion,
+        abort_handle: tokio::task::AbortHandle,
+    ) {
+        self.tasks
+            .lock()
+            .unwrap()
+            .insert(id, (question, abort_handle));
+    }
+
+    fn complete(&self, id: u64) {
+        self.tasks.lock().unwrap().remove(&id);
     }
 
     pub async fn track<F, Fut>(
@@ -3772,14 +3850,12 @@ impl TaskTracker {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let id = self
-            .counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self.next_id();
         let tasks = self.tasks.clone();
-        let mut guard = self.tasks.lock().await;
+        let mut guard = self.tasks.lock().unwrap();
         let handle = tokio::spawn(async move {
             future_fn().await;
-            tasks.lock().await.remove(&id);
+            tasks.lock().unwrap().remove(&id);
         });
         guard.insert(id, (question, handle.abort_handle()));
         drop(guard);
@@ -3794,7 +3870,7 @@ impl TaskTracker {
         let start = tokio::time::Instant::now();
         loop {
             {
-                let guard = self.tasks.lock().await;
+                let guard = self.tasks.lock().unwrap();
                 if guard.is_empty() {
                     return;
                 }
@@ -3807,7 +3883,7 @@ impl TaskTracker {
 
         // Grace period expired: abort in-flight tasks and post notice
         let remaining: Vec<(InFlightQuestion, tokio::task::AbortHandle)> = {
-            let mut guard = self.tasks.lock().await;
+            let mut guard = self.tasks.lock().unwrap();
             guard.drain().map(|(_, v)| v).collect()
         };
 
@@ -3955,6 +4031,199 @@ async fn has_sdk_persisted_sync_token(
     }
 }
 
+struct QueuedSyncEvent {
+    incoming: IncomingMatrixEvent,
+    task_id: u64,
+    claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct SyncThreadQueue {
+    tx: tokio::sync::mpsc::UnboundedSender<QueuedSyncEvent>,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+type SyncThreadQueues =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, SyncThreadQueue>>>;
+
+async fn process_queued_sync_event(
+    incoming: &IncomingMatrixEvent,
+    claimed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    config: &std::sync::Arc<Config>,
+    matrix: &std::sync::Arc<dyn MatrixClient>,
+    xmsg: &std::sync::Arc<dyn XmsgClient>,
+    store: &std::sync::Arc<Store>,
+    sem: &std::sync::Arc<tokio::sync::Semaphore>,
+) {
+    // N3 Gate 2: Mention / Command / Reply check
+    let is_thread_escalate =
+        incoming.thread_root_id.is_some() && incoming.body.trim() == "!escalate";
+    let is_thread_deeper = incoming.thread_root_id.is_some() && incoming.body.trim() == "!deeper";
+    let is_thread_trust = incoming.thread_root_id.is_some() && incoming.body.trim() == "!trust";
+    let is_approve_command = incoming.body.trim() == "!approve";
+    let is_mentioned = is_bot_mentioned(
+        &incoming.body,
+        incoming.formatted_body.as_deref(),
+        incoming.mentions.as_deref(),
+        &config.bot_mxid,
+    );
+    let is_reply_to_bot = if let Some(ref in_reply_to) = incoming.in_reply_to_event_id {
+        if !incoming.is_falling_back {
+            store
+                .get_bot_message_thread(in_reply_to)
+                .ok()
+                .flatten()
+                .is_some()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let is_engaged_thread = if let Some(ref root) = incoming.thread_root_id {
+        store.is_thread_engaged(root).unwrap_or(false)
+    } else {
+        false
+    };
+    if !is_thread_escalate
+        && !is_thread_deeper
+        && !is_thread_trust
+        && !is_approve_command
+        && !is_mentioned
+        && !is_reply_to_bot
+        && !is_engaged_thread
+    {
+        return;
+    }
+
+    // N3 Gate 3: Admission check
+    // For !deeper or edits, full authorization is checked in handle_incoming_event
+    let is_top_level = incoming.thread_root_id.is_none();
+    let is_trusted = config.is_user_trusted(&incoming.sender_mxid);
+    let is_promoted_thread = incoming
+        .thread_root_id
+        .as_deref()
+        .and_then(|r| store.is_thread_promoted(r).ok())
+        .unwrap_or(false);
+    let is_escalation_asker = incoming
+        .thread_root_id
+        .as_deref()
+        .and_then(|r| store.get_thread_escalation_asker(r).ok().flatten())
+        .as_deref()
+        == Some(incoming.sender_mxid.as_str());
+    let is_admitted = match config.admission {
+        Admission::Trusted => is_trusted || is_promoted_thread || is_escalation_asker,
+        Admission::Public => {
+            is_trusted
+                || is_top_level
+                || is_promoted_thread
+                || incoming.replaces_event_id.is_some()
+                || incoming
+                    .thread_root_id
+                    .as_deref()
+                    .and_then(|r| store.get_thread_asker(r).ok().flatten())
+                    .as_deref()
+                    == Some(&incoming.sender_mxid)
+        }
+    };
+    if !is_thread_deeper && !is_admitted {
+        return;
+    }
+
+    let _permit = match sem.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let history = matrix
+        .fetch_history(&incoming.room_id, config.history_n * 2)
+        .await
+        .unwrap_or_default();
+
+    let mut retry_delay = std::time::Duration::from_millis(200);
+    loop {
+        match handle_incoming_event_with_claim(
+            incoming,
+            &history,
+            config,
+            matrix.as_ref(),
+            xmsg.as_ref(),
+            store,
+            Some(claimed),
+        )
+        .await
+        {
+            Ok(BotOutcome::GuardFailed) => {
+                if store
+                    .has_guard_failure_dm_sent(&incoming.event_id)
+                    .unwrap_or(true)
+                {
+                    break;
+                }
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(5));
+            }
+            Ok(_) => break,
+            Err(e) => {
+                tracing::error!("Error handling incoming event {}: {e}", incoming.event_id);
+                break;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_sync_thread_worker(
+    thread_root: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<QueuedSyncEvent>,
+    thread_queues: SyncThreadQueues,
+    config: std::sync::Arc<Config>,
+    matrix: std::sync::Arc<dyn MatrixClient>,
+    xmsg: std::sync::Arc<dyn XmsgClient>,
+    store: std::sync::Arc<Store>,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+    tracker: TaskTracker,
+) {
+    let mut current = match rx.recv().await {
+        Some(ev) => ev,
+        None => {
+            let mut queues = thread_queues.lock().unwrap();
+            queues.remove(&thread_root);
+            return;
+        }
+    };
+
+    loop {
+        process_queued_sync_event(
+            &current.incoming,
+            &current.claimed,
+            &config,
+            &matrix,
+            &xmsg,
+            &store,
+            &sem,
+        )
+        .await;
+        tracker.complete(current.task_id);
+
+        if let Ok(next) = rx.try_recv() {
+            current = next;
+            continue;
+        }
+
+        let mut queues = thread_queues.lock().unwrap();
+        match rx.try_recv() {
+            Ok(next) => {
+                drop(queues);
+                current = next;
+            }
+            Err(_) => {
+                queues.remove(&thread_root);
+                return;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_incoming_room_message(
     event: &matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent,
@@ -3968,6 +4237,7 @@ async fn process_incoming_room_message(
     first_sync_batch: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     sem: std::sync::Arc<tokio::sync::Semaphore>,
     tracker: TaskTracker,
+    thread_queues: SyncThreadQueues,
 ) {
     if let Some(incoming) = extract_incoming_event(event, room.room_id()) {
         // R5: Backlog suppression: primary guard is the persisted sync token in the SDK state store (§4.7).
@@ -4002,77 +4272,6 @@ async fn process_incoming_room_message(
             return;
         }
 
-        // N3 Gate 2: Mention / Command / Reply check (synchronous)
-        let is_thread_escalate =
-            incoming.thread_root_id.is_some() && incoming.body.trim() == "!escalate";
-        let is_thread_deeper =
-            incoming.thread_root_id.is_some() && incoming.body.trim() == "!deeper";
-        let is_thread_trust = incoming.thread_root_id.is_some() && incoming.body.trim() == "!trust";
-        let is_approve_command = incoming.body.trim() == "!approve";
-        let is_mentioned = is_bot_mentioned(
-            &incoming.body,
-            incoming.formatted_body.as_deref(),
-            incoming.mentions.as_deref(),
-            &config.bot_mxid,
-        );
-        let is_reply_to_bot = if let Some(ref in_reply_to) = incoming.in_reply_to_event_id {
-            if !incoming.is_falling_back {
-                store
-                    .get_bot_message_thread(in_reply_to)
-                    .ok()
-                    .flatten()
-                    .is_some()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        let is_engaged_thread = if let Some(ref root) = incoming.thread_root_id {
-            store.is_thread_engaged(root).unwrap_or(false)
-        } else {
-            false
-        };
-        if !is_thread_escalate
-            && !is_thread_deeper
-            && !is_thread_trust
-            && !is_approve_command
-            && !is_mentioned
-            && !is_reply_to_bot
-            && !is_engaged_thread
-        {
-            return;
-        }
-
-        // N3 Gate 3: Admission check (synchronous)
-        // For !deeper or edits, full authorization is checked in handle_incoming_event
-        let is_top_level = incoming.thread_root_id.is_none();
-        let is_trusted = config.is_user_trusted(&incoming.sender_mxid);
-        let is_promoted_thread = incoming
-            .thread_root_id
-            .as_deref()
-            .and_then(|r| store.is_thread_promoted(r).ok())
-            .unwrap_or(false);
-        let is_admitted = match config.admission {
-            Admission::Trusted => is_trusted || is_promoted_thread,
-            Admission::Public => {
-                is_trusted
-                    || is_top_level
-                    || is_promoted_thread
-                    || incoming.replaces_event_id.is_some()
-                    || incoming
-                        .thread_root_id
-                        .as_deref()
-                        .and_then(|r| store.get_thread_asker(r).ok().flatten())
-                        .as_deref()
-                        == Some(&incoming.sender_mxid)
-            }
-        };
-        if !is_thread_deeper && !is_admitted {
-            return;
-        }
-
-        // All synchronous gates passed! Track in-flight task and spawn pipeline.
         let thread_root = incoming
             .thread_root_id
             .clone()
@@ -4081,58 +4280,47 @@ async fn process_incoming_room_message(
 
         let question = InFlightQuestion::new(
             incoming.room_id.clone(),
-            thread_root,
+            thread_root.clone(),
             incoming.sender_mxid.clone(),
         );
         let claimed = question.claimed.clone();
+        let task_id = tracker.next_id();
+        let mut queued_ev = QueuedSyncEvent {
+            incoming,
+            task_id,
+            claimed,
+        };
 
-        tracker
-            .track(question, move || async move {
-                let _permit = match sem.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-
-                let history = matrix
-                    .fetch_history(&incoming.room_id, config.history_n * 2)
-                    .await
-                    .unwrap_or_default();
-
-                let mut retry_delay = std::time::Duration::from_millis(200);
-                loop {
-                    match handle_incoming_event_with_claim(
-                        &incoming,
-                        &history,
-                        &config,
-                        matrix.as_ref(),
-                        xmsg.as_ref(),
-                        &store,
-                        Some(&claimed),
-                    )
-                    .await
-                    {
-                        Ok(BotOutcome::GuardFailed) => {
-                            if store
-                                .has_guard_failure_dm_sent(&incoming.event_id)
-                                .unwrap_or(true)
-                            {
-                                break;
-                            }
-                            tokio::time::sleep(retry_delay).await;
-                            retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(5));
-                        }
-                        Ok(_) => break,
-                        Err(e) => {
-                            tracing::error!(
-                                "Error handling incoming event {}: {e}",
-                                incoming.event_id
-                            );
-                            break;
-                        }
-                    }
+        let mut queues = thread_queues.lock().unwrap();
+        if let Some(existing) = queues.get(&thread_root) {
+            tracker.insert_task(task_id, question.clone(), existing.abort_handle.clone());
+            match existing.tx.send(queued_ev) {
+                Ok(()) => return,
+                Err(tokio::sync::mpsc::error::SendError(ev)) => {
+                    queued_ev = ev;
                 }
-            })
-            .await;
+            }
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker_queues = thread_queues.clone();
+        let worker_root = thread_root.clone();
+        let worker_tracker = tracker.clone();
+        let handle = tokio::spawn(run_sync_thread_worker(
+            worker_root,
+            rx,
+            worker_queues,
+            config,
+            matrix,
+            xmsg,
+            store,
+            sem,
+            worker_tracker,
+        ));
+        let abort_handle = handle.abort_handle();
+        tracker.insert_task(task_id, question, abort_handle.clone());
+        let _ = tx.send(queued_ev);
+        queues.insert(thread_root, SyncThreadQueue { tx, abort_handle });
     }
 }
 
@@ -4148,6 +4336,8 @@ pub fn register_event_handlers_full(
 ) {
     matrix.set_store(store.clone());
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+    let thread_queues: SyncThreadQueues =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let initial_has_token = matrix
         .had_initial_sync_token()
@@ -4162,6 +4352,7 @@ pub fn register_event_handlers_full(
     let sem_msg = semaphore.clone();
     let tracker_msg = tracker.clone();
     let first_sync_msg = first_sync_batch.clone();
+    let queues_msg = thread_queues.clone();
 
     client.add_event_handler(
         move |event: matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent,
@@ -4173,6 +4364,7 @@ pub fn register_event_handlers_full(
             let sem = sem_msg.clone();
             let tracker = tracker_msg.clone();
             let first_sync_batch = first_sync_msg.clone();
+            let thread_queues = queues_msg.clone();
 
             async move {
                 process_incoming_room_message(
@@ -4187,6 +4379,7 @@ pub fn register_event_handlers_full(
                     first_sync_batch,
                     sem,
                     tracker,
+                    thread_queues,
                 )
                 .await;
             }
@@ -4202,6 +4395,7 @@ pub fn register_event_handlers_full(
     let sem_enc = semaphore.clone();
     let tracker_enc = tracker.clone();
     let first_sync_enc = first_sync_batch.clone();
+    let queues_enc = thread_queues;
 
     client.add_event_handler(
         move |event: matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent,
@@ -4214,6 +4408,7 @@ pub fn register_event_handlers_full(
             let sem = sem_enc.clone();
             let tracker = tracker_enc.clone();
             let first_sync_batch = first_sync_enc.clone();
+            let thread_queues = queues_enc.clone();
             let raw_event = matrix_sdk::ruma::serde::Raw::<
                 matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent,
             >::from_json(raw_event.0);
@@ -4244,6 +4439,7 @@ pub fn register_event_handlers_full(
                                 first_sync_batch,
                                 sem,
                                 tracker,
+                                thread_queues,
                             )
                             .await;
                             return;
@@ -4275,6 +4471,7 @@ pub fn register_event_handlers_full(
                                             first_sync_batch,
                                             sem,
                                             tracker,
+                                            thread_queues,
                                         )
                                         .await;
                                         return;

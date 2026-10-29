@@ -218,6 +218,12 @@ impl Store {
                 author_principal TEXT NOT NULL,
                 answered_mxid TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS thread_escalations (
+                thread_root_id TEXT PRIMARY KEY,
+                asker_mxid TEXT NOT NULL,
+                escalated_by TEXT NOT NULL,
+                escalated_at INTEGER NOT NULL
             );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
@@ -397,6 +403,86 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AppError::Store(e.to_string())),
         }
+    }
+
+    /// Records a thread escalation and sets the original root author as the thread's asker.
+    pub fn record_thread_escalation(
+        &self,
+        thread_root_id: &str,
+        asker_mxid: &str,
+        escalated_by: &str,
+        escalated_at: i64,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO thread_escalations (thread_root_id, asker_mxid, escalated_by, escalated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![thread_root_id, asker_mxid, escalated_by, escalated_at],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to record thread escalation: {e}")))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO thread_askers (thread_root_id, asker_mxid) VALUES (?1, ?2)",
+            params![thread_root_id, asker_mxid],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to record thread asker: {e}")))?;
+        Ok(())
+    }
+
+    /// Retrieves a thread escalation record by thread root event ID.
+    pub fn get_thread_escalation(
+        &self,
+        thread_root_id: &str,
+    ) -> Result<Option<ThreadEscalationRecord>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT thread_root_id, asker_mxid, escalated_by, escalated_at
+                 FROM thread_escalations WHERE thread_root_id = ?1",
+            )
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let res = stmt.query_row(params![thread_root_id], |row| {
+            Ok(ThreadEscalationRecord {
+                thread_root_id: row.get(0)?,
+                asker_mxid: row.get(1)?,
+                escalated_by: row.get(2)?,
+                escalated_at: row.get(3)?,
+            })
+        });
+        match res {
+            Ok(rec) => Ok(Some(rec)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Store(e.to_string())),
+        }
+    }
+
+    /// Retrieves the escalated asker MXID for a thread root event ID, if escalated.
+    pub fn get_thread_escalation_asker(
+        &self,
+        thread_root_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        Ok(self
+            .get_thread_escalation(thread_root_id)?
+            .map(|r| r.asker_mxid))
+    }
+
+    /// Releases a thread escalation: deletes the `thread_escalations` row and resets
+    /// `thread_askers.asker_mxid` to `escalated_by`.
+    pub fn release_thread_escalation(&self, thread_root_id: &str) -> Result<bool, AppError> {
+        let Some(rec) = self.get_thread_escalation(thread_root_id)? else {
+            return Ok(false);
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM thread_escalations WHERE thread_root_id = ?1",
+            params![thread_root_id],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to delete thread escalation: {e}")))?;
+        conn.execute(
+            "UPDATE thread_askers SET asker_mxid = ?2 WHERE thread_root_id = ?1",
+            params![thread_root_id, rec.escalated_by],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to reset thread asker on release: {e}")))?;
+        Ok(true)
     }
 
     /// Records an event_id posted by the bot in a given thread.
@@ -985,6 +1071,7 @@ impl Store {
             "solicited_threads",
             "guard_retries",
             "bot_reply_events",
+            "thread_escalations",
         ];
         let mut total = 0;
         for table in tables {
@@ -1335,6 +1422,14 @@ impl Store {
             Ok(None)
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadEscalationRecord {
+    pub thread_root_id: String,
+    pub asker_mxid: String,
+    pub escalated_by: String,
+    pub escalated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
