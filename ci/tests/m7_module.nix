@@ -322,8 +322,10 @@ in
           hasXmsgUnit = res.config.systemd.services ? matrix-xmsg-xmsg;
           xmsgUser = xmsgSvc.serviceConfig.User;
           runtimeDir = xmsgSvc.serviceConfig.RuntimeDirectory;
+          runtimeDirPreserve = xmsgSvc.serviceConfig.RuntimeDirectoryPreserve;
           xdgRuntimeDir = xmsgSvc.environment.XDG_RUNTIME_DIR;
           requiredBy = xmsgSvc.requiredBy;
+          wantedBy = xmsgSvc.wantedBy;
         };
         expected = {
           dynamicUser = false;
@@ -334,8 +336,13 @@ in
             "matrix-xmsg-xmsg"
             "matrix-xmsg-xmsg/xmsg"
           ];
+          runtimeDirPreserve = "yes";
           xdgRuntimeDir = "/run/matrix-xmsg-xmsg";
-          requiredBy = [ "matrix-xmsg.service" ];
+          requiredBy = [ ];
+          wantedBy = [
+            "matrix-xmsg.service"
+            "multi-user.target"
+          ];
         };
       };
 

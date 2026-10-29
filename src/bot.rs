@@ -3166,6 +3166,14 @@ pub async fn handle_inbox_delivery_with_guard<I: SvcInbox + ?Sized>(
             let is_approval =
                 envelope_is_approval || is_approval_delivery(&delivery.text, &rendered_reply);
             let author_principal = origin_author_key(delivery).unwrap_or_default();
+            if store.get_bot_reply_event(&delivery.message_id)?.is_some() {
+                inbox.ack(&delivery.message_id).await?;
+                return Ok(if is_escalate {
+                    BotOutcome::RepliedAndEscalated
+                } else {
+                    BotOutcome::Replied
+                });
+            }
             if is_escalate {
                 let dm_text = format!(
                     "[matrix-xmsg] Expert requested escalation in room {} thread {} for message {}",
@@ -3356,24 +3364,37 @@ pub async fn run_inbox_loop<I: SvcInbox>(
         String,
         tokio::sync::oneshot::Sender<Result<(), AppError>>,
     )>();
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<(String, u64)>();
     let (node_tx, node_rx) = tokio::sync::watch::channel(inbox.node());
+    let mut conn_gen: u64 = 0;
+    let mut last_connected = inbox.node().is_some();
+    let (conn_gen_tx, conn_gen_rx) = tokio::sync::watch::channel(conn_gen);
     let (worker_shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
-    let mut in_flight_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut in_flight_ids: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     let mut duplicate_polled = false;
     let mut thread_queues: std::collections::HashMap<
         String,
-        tokio::sync::mpsc::UnboundedSender<SvcDelivery>,
+        tokio::sync::mpsc::UnboundedSender<(SvcDelivery, u64)>,
     > = std::collections::HashMap::new();
 
     loop {
         while let Ok((ack_id, reply_tx)) = ack_rx.try_recv() {
             let res = inbox.ack(&ack_id).await;
+            let now_connected = inbox.node().is_some();
+            if last_connected && !now_connected {
+                conn_gen += 1;
+                let _ = conn_gen_tx.send(conn_gen);
+            }
+            last_connected = now_connected;
+            let _ = node_tx.send(inbox.node());
             let _ = reply_tx.send(res);
         }
-        while let Ok(done_id) = done_rx.try_recv() {
-            in_flight_ids.remove(&done_id);
+        while let Ok((done_id, done_gen)) = done_rx.try_recv() {
+            if in_flight_ids.get(&done_id) == Some(&done_gen) {
+                in_flight_ids.remove(&done_id);
+            }
             duplicate_polled = false;
         }
 
@@ -3398,11 +3419,20 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                 }
                 Some((ack_id, reply_tx)) = ack_rx.recv() => {
                     let res = inbox.ack(&ack_id).await;
+                    let now_connected = inbox.node().is_some();
+                    if last_connected && !now_connected {
+                        conn_gen += 1;
+                        let _ = conn_gen_tx.send(conn_gen);
+                    }
+                    last_connected = now_connected;
+                    let _ = node_tx.send(inbox.node());
                     let _ = reply_tx.send(res);
                     continue;
                 }
-                Some(done_id) = done_rx.recv() => {
-                    in_flight_ids.remove(&done_id);
+                Some((done_id, done_gen)) = done_rx.recv() => {
+                    if in_flight_ids.get(&done_id) == Some(&done_gen) {
+                        in_flight_ids.remove(&done_id);
+                    }
                     duplicate_polled = false;
                     continue;
                 }
@@ -3419,6 +3449,12 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                 break;
             }
             poll_res = inbox.poll(wait_secs) => {
+                let now_connected = inbox.node().is_some();
+                if last_connected && !now_connected {
+                    conn_gen += 1;
+                    let _ = conn_gen_tx.send(conn_gen);
+                }
+                last_connected = now_connected;
                 let _ = node_tx.send(inbox.node());
                 match poll_res {
                     Ok(Some(delivery)) => {
@@ -3440,14 +3476,14 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                             }
                         }
 
-                        if in_flight_ids.contains(&delivery.message_id) {
+                        if in_flight_ids.get(&delivery.message_id) == Some(&conn_gen) {
                             duplicate_polled = true;
                             continue;
                         }
 
-                        in_flight_ids.insert(delivery.message_id.clone());
+                        in_flight_ids.insert(delivery.message_id.clone(), conn_gen);
                         let thread_key = delivery_thread_key(&delivery, store.as_ref());
-                        let mut to_send = Some(delivery);
+                        let mut to_send = Some((delivery, conn_gen));
 
                         if let Some(tx) = thread_queues.get(&thread_key) {
                             match tx.send(to_send.take().unwrap()) {
@@ -3461,7 +3497,7 @@ pub async fn run_inbox_loop<I: SvcInbox>(
 
                         if let Some(first_delivery) = to_send {
                             let (tx, mut rx) =
-                                tokio::sync::mpsc::unbounded_channel::<SvcDelivery>();
+                                tokio::sync::mpsc::unbounded_channel::<(SvcDelivery, u64)>();
                             let _ = tx.send(first_delivery);
                             thread_queues.insert(thread_key, tx);
 
@@ -3472,11 +3508,12 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                             let ack_tx = ack_tx.clone();
                             let done_tx = done_tx.clone();
                             let node_rx = node_rx.clone();
+                            let conn_gen_rx = conn_gen_rx.clone();
                             let sem = sem.clone();
                             let mut worker_shutdown_rx = worker_shutdown_tx.subscribe();
 
                             tokio::spawn(async move {
-                                while let Some(delivery) = rx.recv().await {
+                                while let Some((delivery, delivery_conn_gen)) = rx.recv().await {
                                     let _permit = match sem.clone().acquire_owned().await {
                                         Ok(p) => p,
                                         Err(_) => break,
@@ -3531,6 +3568,13 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                                                 break;
                                             }
                                             Err(e) => {
+                                                if *conn_gen_rx.borrow() != delivery_conn_gen {
+                                                    tracing::warn!(
+                                                        "Delivery {} failed after xmsg connection loss ({e}); awaiting redelivery on reconnect",
+                                                        delivery.message_id
+                                                    );
+                                                    break;
+                                                }
                                                 let attempt = prev_attempts + 1;
                                                 if attempt >= config.inbox_retry_budget {
                                                     tracing::error!(
@@ -3573,12 +3617,15 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                                                         }
                                                         _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
                                                     }
+                                                    if *conn_gen_rx.borrow() != delivery_conn_gen {
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
                                     }
 
-                                    let _ = done_tx.send(delivery.message_id.clone());
+                                    let _ = done_tx.send((delivery.message_id.clone(), delivery_conn_gen));
                                 }
                             });
                         }
@@ -3587,10 +3634,19 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                             biased;
                             Some((ack_id, reply_tx)) = ack_rx.recv() => {
                                 let res = inbox.ack(&ack_id).await;
+                                let now_connected = inbox.node().is_some();
+                                if last_connected && !now_connected {
+                                    conn_gen += 1;
+                                    let _ = conn_gen_tx.send(conn_gen);
+                                }
+                                last_connected = now_connected;
+                                let _ = node_tx.send(inbox.node());
                                 let _ = reply_tx.send(res);
                             }
-                            Some(done_id) = done_rx.recv() => {
-                                in_flight_ids.remove(&done_id);
+                            Some((done_id, done_gen)) = done_rx.recv() => {
+                                if in_flight_ids.get(&done_id) == Some(&done_gen) {
+                                    in_flight_ids.remove(&done_id);
+                                }
                                 duplicate_polled = false;
                             }
                             _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
@@ -3607,10 +3663,19 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                                 }
                                 Some((ack_id, reply_tx)) = ack_rx.recv() => {
                                     let res = inbox.ack(&ack_id).await;
+                                    let now_connected = inbox.node().is_some();
+                                    if last_connected && !now_connected {
+                                        conn_gen += 1;
+                                        let _ = conn_gen_tx.send(conn_gen);
+                                    }
+                                    last_connected = now_connected;
+                                    let _ = node_tx.send(inbox.node());
                                     let _ = reply_tx.send(res);
                                 }
-                                Some(done_id) = done_rx.recv() => {
-                                    in_flight_ids.remove(&done_id);
+                                Some((done_id, done_gen)) = done_rx.recv() => {
+                                    if in_flight_ids.get(&done_id) == Some(&done_gen) {
+                                        in_flight_ids.remove(&done_id);
+                                    }
                                     duplicate_polled = false;
                                 }
                                 _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}

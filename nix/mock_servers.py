@@ -14,6 +14,9 @@ VALID_TOKEN = "syt_valid_test_token_12345"
 
 class MatrixHandler(http.server.BaseHTTPRequestHandler):
     sync_count = 0
+    inject_line_idx = 0
+    batch_seq = 3
+    reply_seq = 1
     lock = threading.Lock()
 
     def log_message(self, format, *args):
@@ -96,6 +99,12 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
                                     "events": [],
                                     "prev_batch": "s0"
                                 }
+                            },
+                            "!dm_owner:test.local": {
+                                "timeline": {
+                                    "events": [],
+                                    "prev_batch": "s0"
+                                }
                             }
                         }
                     }
@@ -131,12 +140,41 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
                     }
                 }
             else:
-                # Subsequent syncs: block slightly for long poll, return empty
-                time.sleep(1)
-                resp = {
-                    "next_batch": "s3",
-                    "rooms": {}
-                }
+                injected = []
+                with MatrixHandler.lock:
+                    if os.path.exists("/tmp/matrix_inject_events.jsonl"):
+                        with open("/tmp/matrix_inject_events.jsonl", "r", encoding="utf-8") as inf:
+                            lines = [ln.strip() for ln in inf.readlines() if ln.strip()]
+                        if MatrixHandler.inject_line_idx < len(lines):
+                            now_base = int(time.time() * 1000)
+                            for idx_offset, raw in enumerate(lines[MatrixHandler.inject_line_idx:]):
+                                ev = json.loads(raw)
+                                ev["origin_server_ts"] = now_base + idx_offset
+                                injected.append(ev)
+                            MatrixHandler.inject_line_idx = len(lines)
+                            next_b = f"s{MatrixHandler.batch_seq}"
+                            MatrixHandler.batch_seq += 1
+                if injected:
+                    resp = {
+                        "next_batch": next_b,
+                        "rooms": {
+                            "join": {
+                                "!test:test.local": {
+                                    "timeline": {
+                                        "events": injected,
+                                        "prev_batch": since,
+                                    }
+                                }
+                            }
+                        },
+                    }
+                else:
+                    # Subsequent syncs: block slightly for long poll, return empty
+                    time.sleep(0.2)
+                    resp = {
+                        "next_batch": since,
+                        "rooms": {}
+                    }
 
             self.wfile.write(json.dumps(resp).encode())
             return
@@ -181,18 +219,92 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length > 0 else b""
 
         if "/send/m.room.message" in parsed.path:
-            with open("/tmp/matrix_reply_received.json", "wb") as f:
-                f.write(body)
+            try:
+                body_obj = json.loads(body.decode("utf-8"))
+            except Exception:
+                body_obj = {}
+            msg_body = body_obj.get("body", "")
+
+            if "%21dm_owner" in parsed.path or "!dm_owner" in parsed.path:
+                with MatrixHandler.lock:
+                    seq = MatrixHandler.reply_seq
+                    MatrixHandler.reply_seq += 1
+                    with open("/tmp/matrix_dms.jsonl", "a", encoding="utf-8") as f:
+                        f.write(json.dumps(body_obj, ensure_ascii=False) + "\n")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"event_id": f"$dm_ev_{seq}"}).encode())
+                return
+
+            # Cell (a) hook: hold first post of m18 reply while xmsg restarts, then fail once
+            if "m18 reply across xmsg restart" in msg_body and os.path.exists("/tmp/m18_fail_first_post"):
+                try:
+                    os.remove("/tmp/m18_fail_first_post")
+                except FileNotFoundError:
+                    pass
+                with open("/tmp/m18_delivery_in_flight", "w", encoding="utf-8") as f:
+                    f.write("in_flight\n")
+                deadline = time.monotonic() + 15.0
+                while time.monotonic() < deadline and not os.path.exists("/tmp/m18_xmsg_restarted"):
+                    time.sleep(0.05)
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "errcode": "M_UNKNOWN",
+                    "error": "simulated transient failure during xmsg restart",
+                }).encode())
+                return
+
+            # Cell (b) hook: hold slow answer for thread A until unblocked
+            if "slow answer for thread A" in msg_body:
+                with open("/tmp/m38_thread_a_blocked", "w", encoding="utf-8") as f:
+                    f.write("blocked\n")
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline and not os.path.exists("/tmp/m38_unblock_thread_a"):
+                    time.sleep(0.05)
+
+            with MatrixHandler.lock:
+                seq = MatrixHandler.reply_seq
+                MatrixHandler.reply_seq += 1
+                with open("/tmp/matrix_reply_received.json", "wb") as f:
+                    f.write(body)
+                with open("/tmp/matrix_replies.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(body_obj, ensure_ascii=False) + "\n")
+                if "slow answer for thread A" in msg_body:
+                    with open("/tmp/m38_thread_a_posted", "w", encoding="utf-8") as f:
+                        f.write("posted\n")
+                if "fast answer for thread B" in msg_body:
+                    with open("/tmp/m38_thread_b_posted", "w", encoding="utf-8") as f:
+                        f.write("posted\n")
+
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"event_id": "$reply_ev_999"}).encode())
+            self.wfile.write(json.dumps({"event_id": f"$reply_ev_{seq}"}).encode())
+            return
+
+        if "/send/m.reaction" in parsed.path:
+            try:
+                react_obj = json.loads(body.decode("utf-8"))
+            except Exception:
+                react_obj = {}
+            with MatrixHandler.lock:
+                seq = MatrixHandler.reply_seq
+                MatrixHandler.reply_seq += 1
+                with open("/tmp/matrix_reactions.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(react_obj, ensure_ascii=False) + "\n")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"event_id": f"$react_ev_{seq}"}).encode())
             return
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b"{}")
+        self.wfile.write(json.dumps({"event_id": "$generic_ev_999"}).encode())
 
     def do_POST(self):
         if not self.check_auth():
@@ -238,6 +350,13 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"room_id": "!test:test.local"}).encode())
+            return
+
+        if "/createRoom" in path:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"room_id": "!dm_owner:test.local"}).encode())
             return
 
         self.send_response(200)

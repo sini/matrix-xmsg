@@ -241,7 +241,9 @@ in
         ]
         ++ lib.optional xmsgCfg.enable "matrix-xmsg-xmsg.service"
         ++ lib.optional (cfg.recoveryKeyFile != null) "matrix-xmsg-e2ee-setup.service";
-        wants = lib.optional (cfg.recoveryKeyFile != null) "matrix-xmsg-e2ee-setup.service";
+        wants =
+          lib.optional xmsgCfg.enable "matrix-xmsg-xmsg.service"
+          ++ lib.optional (cfg.recoveryKeyFile != null) "matrix-xmsg-e2ee-setup.service";
         wantedBy = [ "multi-user.target" ];
 
         serviceConfig = {
@@ -387,8 +389,10 @@ in
         description = "xmsg daemon for matrix-xmsg";
         after = [ "network.target" ];
         before = [ "matrix-xmsg.service" ];
-        requiredBy = [ "matrix-xmsg.service" ];
-        wantedBy = [ "multi-user.target" ];
+        wantedBy = [
+          "matrix-xmsg.service"
+          "multi-user.target"
+        ];
         restartTriggers = lib.optional xmsgCfg.federation.enable peersFile;
 
         environment = {
@@ -406,6 +410,7 @@ in
             "matrix-xmsg-xmsg/xmsg"
           ];
           RuntimeDirectoryMode = "0700";
+          RuntimeDirectoryPreserve = "yes";
           StateDirectory = "matrix-xmsg-xmsg";
           StateDirectoryMode = "0700";
           ExecStart = "${lib.getExe xmsgCfg.package} ${lib.escapeShellArgs xmsgArgs}";
