@@ -182,12 +182,6 @@ impl MockSvcInbox {
         }
     }
 
-    /// Simulates a reconnect on this inbox view by clearing its per-connection `in_flight` set.
-    /// Any unacked delivery still in `queue` will be redelivered from the head on the next `poll`.
-    pub fn reconnect(&self) {
-        self.in_flight.lock().unwrap().clear();
-    }
-
     /// Opens a fresh connection view sharing `queue` and `acks` with its own empty `in_flight` set.
     pub fn new_connection(&self) -> Self {
         Self {
