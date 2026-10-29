@@ -1,16 +1,18 @@
 use async_trait::async_trait;
 use matrix_xmsg::bot::{
-    handle_inbox_delivery_with_guard, handle_incoming_event_with_guard, run_inbox_loop, BotOutcome,
-    IncomingMatrixEvent,
+    handle_inbox_delivery_with_guard, handle_inbox_delivery_with_xmsg,
+    handle_incoming_event_with_guard, run_inbox_loop, BotOutcome, IncomingMatrixEvent,
 };
 use matrix_xmsg::config::{Admission, Config, GuardFailureMode};
 use matrix_xmsg::context::EventMessage;
 use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::{MatrixClient, MockMatrixClient};
 use matrix_xmsg::store::Store;
-use matrix_xmsg::xmsg::{MockGuardClient, SendResponse, SvcDelivery, SvcInbox, XmsgClient};
+use matrix_xmsg::xmsg::{
+    route_guard_reply, MockGuardClient, MockSvcInbox, SendResponse, SvcDelivery, SvcInbox,
+    XmsgClient,
+};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,38 +64,6 @@ impl XmsgClient for MockXmsgClient {
         let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let sess = self.session_id.lock().unwrap().clone();
         Ok(SendResponse::new(format!("01M38REPLY{id:06}"), sess))
-    }
-}
-
-#[derive(Default, Clone)]
-pub struct QueueInbox {
-    pub queue: Arc<Mutex<VecDeque<SvcDelivery>>>,
-    pub acks: Arc<Mutex<Vec<String>>>,
-}
-
-impl QueueInbox {
-    pub fn push(&self, delivery: SvcDelivery) {
-        self.queue.lock().unwrap().push_back(delivery);
-    }
-}
-
-#[async_trait]
-impl SvcInbox for QueueInbox {
-    async fn poll(&mut self, _wait_secs: u64) -> Result<Option<SvcDelivery>, AppError> {
-        let next = self.queue.lock().unwrap().pop_front();
-        if next.is_none() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        Ok(next)
-    }
-
-    async fn ack(&mut self, message_id: &str) -> Result<(), AppError> {
-        self.acks.lock().unwrap().push(message_id.to_string());
-        Ok(())
-    }
-
-    fn node(&self) -> Option<String> {
-        Some("sini.test".to_string())
     }
 }
 
@@ -177,7 +147,7 @@ async fn oracle_1_context_request_requiring_inbox_guard_verdict_completes() {
     let agent_sock_path = tmp.path().join("agent.sock");
     let agent_listener = UnixListener::bind(&agent_sock_path).unwrap();
 
-    let inbox = QueueInbox::default();
+    let inbox = MockSvcInbox::default();
     let inbox_for_guard = inbox.clone();
 
     // Mock agent.sock for UnixGuardClient: when check_guard sends to genie-guard, push the guard
@@ -343,6 +313,184 @@ async fn oracle_1_context_request_requiring_inbox_guard_verdict_completes() {
             .contains(&"01M38GUARDVERDICT000001".to_string()),
         "Expected guard verdict delivery to be routed and acked on the inbox"
     );
+    assert!(
+        inbox.queue.lock().unwrap().is_empty(),
+        "Expected acked deliveries to be removed from the shared inbox queue"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Oracle 2 (XM2): The other half of Oracle 1 — a handler that awaits a second delivery while the
+// first is unacked deadlocks against the pop-free real model unless M38's routing is present.
+// Mutant: make the shared mock (`MockSvcInbox::poll_now`) pop on poll again => the unacked head
+// delivery is popped on the first poll, the second poll returns the guard verdict even without
+// M38's routing, and the handler completes instead of deadlocking => RED.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn oracle_2_unacked_head_delivery_deadlocks_awaiting_second_delivery_without_m38_routing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent_sock_path = tmp.path().join("agent.sock");
+    let agent_listener = UnixListener::bind(&agent_sock_path).unwrap();
+
+    let inbox = MockSvcInbox::default();
+    let inbox_for_guard = inbox.clone();
+
+    let guard_counter = Arc::new(AtomicUsize::new(1));
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = agent_listener.accept().await {
+            let (r, mut w) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(r).lines();
+            let inbox_clone = inbox_for_guard.clone();
+            let counter = Arc::clone(&guard_counter);
+            tokio::spawn(async move {
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                        if val.get("action").and_then(|a| a.as_str()) == Some("send") {
+                            let n = counter.fetch_add(1, Ordering::SeqCst);
+                            let guard_req_id = format!("01M38GUARDREQ2_{n:06}");
+                            let resp = json!({
+                                "status": "ok",
+                                "message_id": guard_req_id,
+                            });
+                            let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
+                            let _ = w.flush().await;
+
+                            let verdict_id = format!("01M38GUARDVERDICT2_{n:06}");
+                            inbox_clone.push(SvcDelivery {
+                                message_id: verdict_id,
+                                from_name: "genie-guard@sini.test".to_string(),
+                                text: json!({
+                                    "verdict": "allow",
+                                    "reason": "clean room context",
+                                    "cleaned_text": "",
+                                })
+                                .to_string(),
+                                envelope: String::new(),
+                                origin: None,
+                                in_reply_to: Some(guard_req_id),
+                            });
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let mut cfg = test_config();
+    cfg.xmsg_socket = tmp.path().to_path_buf();
+    cfg.guard_timeout_secs = 1;
+    let config = Arc::new(cfg);
+
+    let matrix = Arc::new(MockMatrixClient::default());
+    matrix.canned_room_history.lock().unwrap().insert(
+        "!support:example.org".to_string(),
+        vec![EventMessage {
+            event_id: "$room_untrusted_2".to_string(),
+            sender_mxid: "@stranger:example.org".to_string(),
+            timestamp_ms: 1_000_000,
+            body: "Untrusted room question that must be screened".to_string(),
+            thread_root_id: None,
+        }],
+    );
+
+    let store = Arc::new(Store::new_in_memory().unwrap());
+    let xmsg = Arc::new(MockXmsgClient::default());
+
+    let trigger = make_event(
+        "$trig_2",
+        "@trusted:example.org",
+        "@genie:example.org help",
+        true,
+        None,
+        1005,
+    );
+    let mock_guard = MockGuardClient::new();
+    handle_incoming_event_with_guard(
+        &trigger,
+        &[],
+        &config,
+        matrix.as_ref(),
+        xmsg.as_ref(),
+        &mock_guard,
+        &store,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Push the first delivery (`01M38CTX_REQ_02`), whose handler awaits a second delivery
+    // (`01M38GUARDVERDICT2_000001`) while `01M38CTX_REQ_02` remains unacked.
+    inbox.push(SvcDelivery {
+        message_id: "01M38CTX_REQ_02".to_string(),
+        from_name: "claude · session-m38@sini.test".to_string(),
+        text: json!({"context": {"scope": "room", "limit": 5}}).to_string(),
+        envelope: String::new(),
+        origin: None,
+        in_reply_to: Some("01M38MSG000001".to_string()),
+    });
+
+    // Poll the first delivery on a consumer without M38's single-connection inbox routing:
+    // the handler runs while `01M38CTX_REQ_02` is unacked, and a second reader (or reconnected
+    // poll without XF6/M38 routing) polls `inbox` for the second delivery.
+    let mut handler_inbox = inbox.clone();
+    let d1 = handler_inbox
+        .poll(1)
+        .await
+        .unwrap()
+        .expect("must poll first delivery");
+    assert_eq!(d1.message_id, "01M38CTX_REQ_02");
+
+    // Without M38's routing + XF6 in-flight tracking, polling for the second delivery while the
+    // first is unacked on a pop-free inbox re-serves the unacked head delivery `d1` until `d1`
+    // is acked.
+    let mut second_poller = inbox.new_connection().without_in_flight();
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let poller_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                res = second_poller.poll(0) => {
+                    if let Ok(Some(d)) = res {
+                        if d.message_id != "01M38CTX_REQ_02" {
+                            if let Some(ref reply_to) = d.in_reply_to {
+                                if route_guard_reply(reply_to, &d.text).await {
+                                    let _ = second_poller.ack(&d.message_id).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    });
+
+    let completed = tokio::time::timeout(
+        Duration::from_millis(350),
+        handle_inbox_delivery_with_xmsg(
+            &d1,
+            &config,
+            matrix.as_ref(),
+            store.as_ref(),
+            xmsg.as_ref(),
+            &mut handler_inbox,
+            1010,
+        ),
+    )
+    .await;
+
+    let _ = stop_tx.send(());
+    let _ = poller_handle.await;
+
+    assert!(
+        completed.is_err(),
+        "Handler awaiting a second delivery while the first is unacked must deadlock against the pop-free inbox model without M38 routing (did MockSvcInbox pop on poll?)"
+    );
+    assert!(
+        xmsg.replies.lock().unwrap().is_empty(),
+        "Deadlocked context handler must not have produced a <context> reply"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -399,7 +547,7 @@ async fn oracle_3_fail_closed_budget_exhaustion_replies_on_context_and_reacts_on
         .unwrap();
 
     // 2. Test `context` request exhausting guard_retry_budget (3 attempts)
-    let mut inbox = QueueInbox::default();
+    let mut inbox = MockSvcInbox::default();
     let ctx_delivery = SvcDelivery {
         message_id: "01M38CTX_FAIL".to_string(),
         from_name: "claude · session-m38@sini.test".to_string(),
@@ -737,7 +885,7 @@ async fn oracle_4_stuck_delivery_in_thread_a_does_not_delay_thread_b() {
     .await
     .unwrap();
 
-    let inbox = QueueInbox::default();
+    let inbox = MockSvcInbox::default();
     // Queue stuck delivery for thread A first, followed by fast delivery for thread B
     inbox.push(SvcDelivery {
         message_id: "01M38_DELIV_A".to_string(),
@@ -827,7 +975,7 @@ async fn oracle_5_seventeen_concurrent_context_requests_complete_via_verdict_fas
     let agent_sock = tmp.path().join("agent.sock");
     let listener = UnixListener::bind(&agent_sock).unwrap();
 
-    let inbox = QueueInbox::default();
+    let inbox = MockSvcInbox::default();
     let inbox_clone = inbox.clone();
 
     // Stub agent.sock: accept guard sends from UnixGuardClient::check_guard, reply with a
@@ -946,8 +1094,8 @@ async fn oracle_5_seventeen_concurrent_context_requests_complete_via_verdict_fas
         loop {
             let replies_len = xmsg.replies.lock().unwrap().len();
             let acks = inbox.acks.lock().unwrap().clone();
-            let all_req_acked = (1..=N_REQUESTS)
-                .all(|i| acks.contains(&format!("01M38CTX5_REQ_{i:02}")));
+            let all_req_acked =
+                (1..=N_REQUESTS).all(|i| acks.contains(&format!("01M38CTX5_REQ_{i:02}")));
             if replies_len == N_REQUESTS && all_req_acked {
                 break;
             }

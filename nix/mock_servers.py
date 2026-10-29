@@ -248,8 +248,48 @@ class MatrixHandler(http.server.BaseHTTPRequestHandler):
 
 SOCK_DIR = "/run/xmsg-mock"
 NODE = "test"
-pushed = queue.Queue()
 send_ids = itertools.count(1)
+
+
+class MockSvcInbox:
+    """Shared svc inbox queue matching real xmsg at cca3de7+: deliveries remain in
+    _queue until acked, in-flight messageIds are tracked per connection (XF6), and
+    unacked deliveries are redelivered on reconnect."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._queue = []
+        self.acks = []
+
+    def put(self, frame):
+        with self._cond:
+            self._queue.append(frame)
+            self._cond.notify_all()
+
+    def poll(self, in_flight, timeout):
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                for frame in self._queue:
+                    msg_id = frame.get("messageId")
+                    if msg_id not in in_flight:
+                        in_flight.add(msg_id)
+                        return frame
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cond.wait(timeout=remaining)
+
+    def ack(self, msg_id, in_flight):
+        with self._cond:
+            if msg_id:
+                self.acks.append(msg_id)
+                self._queue = [f for f in self._queue if f.get("messageId") != msg_id]
+                in_flight.discard(msg_id)
+            self._cond.notify_all()
+
+
+pushed = MockSvcInbox()
 
 
 def write_frame(wfile, frame):
@@ -324,20 +364,25 @@ class RegisterHandler(socketserver.StreamRequestHandler):
         name = json.loads(line).get("name", "")
         sys.stderr.write(f"[xmsg-mock] register.sock registered {name}\n")
         write_frame(self.wfile, {"status": "ok", "node": NODE, "address": f"{name}@{NODE}"})
+        in_flight = set()
         for line in self.rfile:
             req = json.loads(line)
-            if req.get("action") == "poll":
-                try:
-                    frame = pushed.get(timeout=min(int(req.get("waitSecs", 1)), 1))
+            action = req.get("action")
+            if action == "poll":
+                frame = pushed.poll(in_flight, timeout=min(int(req.get("waitSecs", 1)), 1))
+                if frame is not None:
                     sys.stderr.write(f"[xmsg-mock] deliver {frame['messageId']}\n")
-                except queue.Empty:
+                else:
                     frame = {"action": "timeout"}
                 try:
                     write_frame(self.wfile, frame)
                 except (BrokenPipeError, ConnectionResetError):
                     if frame.get("action") == "deliver":
-                        pushed.put(frame)
+                        in_flight.discard(frame.get("messageId"))
                     break
+            elif action == "ack":
+                pushed.ack(req.get("messageId"), in_flight)
+                write_frame(self.wfile, {"status": "ok"})
             else:
                 write_frame(self.wfile, {"status": "ok"})
 

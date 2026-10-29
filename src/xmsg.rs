@@ -3,8 +3,9 @@ use crate::error::AppError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -81,6 +82,39 @@ impl SvcDelivery {
             in_reply_to: None,
         }
     }
+
+    pub fn from_deliver_frame(val: &Value) -> Option<Self> {
+        let str_field = |k: &str| val.get(k).and_then(|v| v.as_str()).map(String::from);
+        let message_id = str_field("messageId").or_else(|| str_field("message_id"))?;
+        Some(Self {
+            message_id,
+            from_name: str_field("fromName")
+                .or_else(|| str_field("from_name"))
+                .unwrap_or_default(),
+            text: str_field("text").unwrap_or_default(),
+            envelope: str_field("envelope").unwrap_or_default(),
+            origin: val.get("origin").cloned(),
+            in_reply_to: str_field("inReplyTo").or_else(|| str_field("in_reply_to")),
+        })
+    }
+
+    pub fn to_deliver_frame(&self) -> Value {
+        let mut obj = serde_json::json!({
+            "status": "ok",
+            "action": "deliver",
+            "messageId": self.message_id,
+            "fromName": self.from_name,
+            "text": self.text,
+            "envelope": self.envelope,
+        });
+        if let Some(ref origin) = self.origin {
+            obj["origin"] = origin.clone();
+        }
+        if let Some(ref in_reply_to) = self.in_reply_to {
+            obj["inReplyTo"] = Value::String(in_reply_to.clone());
+        }
+        obj
+    }
 }
 
 /// Service inbox trait for polling deliveries and acknowledging them.
@@ -96,6 +130,127 @@ pub trait SvcInbox: Send + Sync {
     /// This node's name, from the registration's `ok` frame; `None` while unregistered.
     fn node(&self) -> Option<String> {
         None
+    }
+}
+
+/// Shared test-support `SvcInbox` mock that behaves like real `xmsg` at `cca3de7` (XF6) or later:
+/// - The head delivery remains in `queue` and is re-served until `ack` removes it (`poll` never pops).
+/// - `in_flight` is tracked per connection as in XF6, so subsequent polls on the same connection
+///   advance past in-flight unacked deliveries when `track_in_flight` is enabled.
+/// - Reconnecting (`reconnect` or `new_connection`) resets the connection's `in_flight` set so any
+///   unacked delivery in `queue` is redelivered from the head.
+#[derive(Clone)]
+pub struct MockSvcInbox {
+    pub queue: Arc<Mutex<VecDeque<SvcDelivery>>>,
+    pub acks: Arc<Mutex<Vec<String>>>,
+    pub in_flight: Arc<Mutex<HashSet<String>>>,
+    pub track_in_flight: Arc<AtomicBool>,
+    pub node_name: Option<String>,
+}
+
+impl Default for MockSvcInbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockSvcInbox {
+    pub fn new() -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            acks: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            track_in_flight: Arc::new(AtomicBool::new(true)),
+            node_name: Some("sini.test".to_string()),
+        }
+    }
+
+    /// Disables XF6 per-connection in-flight tracking so `poll` re-serves the head unacked
+    /// delivery on every call until `ack` removes it.
+    pub fn without_in_flight(self) -> Self {
+        self.track_in_flight.store(false, Ordering::SeqCst);
+        self
+    }
+
+    pub fn push(&self, delivery: SvcDelivery) {
+        self.queue.lock().unwrap().push_back(delivery);
+    }
+
+    pub fn push_json_frame(&self, frame: &Value) {
+        if let Some(d) = SvcDelivery::from_deliver_frame(frame) {
+            self.push(d);
+        }
+    }
+
+    /// Simulates a reconnect on this inbox view by clearing its per-connection `in_flight` set.
+    /// Any unacked delivery still in `queue` will be redelivered from the head on the next `poll`.
+    pub fn reconnect(&self) {
+        self.in_flight.lock().unwrap().clear();
+    }
+
+    /// Opens a fresh connection view sharing `queue` and `acks` with its own empty `in_flight` set.
+    pub fn new_connection(&self) -> Self {
+        Self {
+            queue: Arc::clone(&self.queue),
+            acks: Arc::clone(&self.acks),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            track_in_flight: Arc::clone(&self.track_in_flight),
+            node_name: self.node_name.clone(),
+        }
+    }
+
+    pub fn poll_now(&self) -> Option<SvcDelivery> {
+        let q = self.queue.lock().unwrap();
+        let mut in_flight = self.in_flight.lock().unwrap();
+        let next = q
+            .iter()
+            .find(|d| !in_flight.contains(&d.message_id))
+            .cloned();
+        if let Some(ref d) = next {
+            if self.track_in_flight.load(Ordering::SeqCst) {
+                in_flight.insert(d.message_id.clone());
+            }
+        }
+        next
+    }
+
+    pub fn poll_json_frame(&self) -> Value {
+        match self.poll_now() {
+            Some(d) => d.to_deliver_frame(),
+            None => serde_json::json!({
+                "status": "ok",
+                "action": "timeout",
+            }),
+        }
+    }
+
+    pub fn ack_now(&self, message_id: &str) {
+        self.acks.lock().unwrap().push(message_id.to_string());
+        self.queue
+            .lock()
+            .unwrap()
+            .retain(|d| d.message_id != message_id);
+        self.in_flight.lock().unwrap().remove(message_id);
+    }
+}
+
+#[async_trait]
+impl SvcInbox for MockSvcInbox {
+    async fn poll(&mut self, _wait_secs: u64) -> Result<Option<SvcDelivery>, AppError> {
+        let next = self.poll_now();
+        if next.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(next)
+    }
+
+    async fn ack(&mut self, message_id: &str) -> Result<(), AppError> {
+        self.ack_now(message_id);
+        Ok(())
+    }
+
+    fn node(&self) -> Option<String> {
+        self.node_name.clone()
     }
 }
 

@@ -4,9 +4,8 @@ use matrix_xmsg::bot::{
 use matrix_xmsg::config::{Admission, Config};
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::store::Store;
-use matrix_xmsg::xmsg::{create_xmsg_client, register_svc, SvcInbox, UnixXmsgClient};
+use matrix_xmsg::xmsg::{create_xmsg_client, register_svc, MockSvcInbox, SvcInbox, UnixXmsgClient};
 use serde_json::Value;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -17,8 +16,7 @@ use tokio::sync::Mutex;
 pub struct MockXmsgSockets {
     pub dir: PathBuf,
     pub recorded_sends: Arc<Mutex<Vec<Value>>>,
-    pub recorded_acks: Arc<Mutex<Vec<String>>>,
-    pub queued_deliveries: Arc<Mutex<VecDeque<Value>>>,
+    pub inbox: MockSvcInbox,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -33,14 +31,12 @@ impl MockXmsgSockets {
         let agent_listener = UnixListener::bind(&agent_sock_path).expect("bind agent.sock");
 
         let recorded_sends = Arc::new(Mutex::new(Vec::new()));
-        let recorded_acks = Arc::new(Mutex::new(Vec::new()));
-        let queued_deliveries = Arc::new(Mutex::new(VecDeque::new()));
+        let inbox = MockSvcInbox::new();
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let sends_clone = Arc::clone(&recorded_sends);
-        let acks_clone = Arc::clone(&recorded_acks);
-        let deliveries_clone = Arc::clone(&queued_deliveries);
+        let inbox_clone = inbox.clone();
 
         tokio::spawn(async move {
             tokio::select! {
@@ -74,14 +70,12 @@ impl MockXmsgSockets {
                     };
 
                     let reg_task = {
-                        let acks = Arc::clone(&acks_clone);
-                        let deliveries = Arc::clone(&deliveries_clone);
+                        let inbox = inbox_clone.clone();
                         tokio::spawn(async move {
                             while let Ok((stream, _)) = reg_listener.accept().await {
                                 let (r, mut w) = stream.into_split();
                                 let mut lines = tokio::io::BufReader::new(r).lines();
-                                let acks = Arc::clone(&acks);
-                                let deliveries = Arc::clone(&deliveries);
+                                let conn_inbox = inbox.new_connection();
                                 tokio::spawn(async move {
                                     // First line is register
                                     if let Ok(Some(line)) = lines.next_line().await {
@@ -103,19 +97,12 @@ impl MockXmsgSockets {
                                         if let Ok(val) = serde_json::from_str::<Value>(&line) {
                                             let action = val.get("action").and_then(|a| a.as_str()).unwrap_or("");
                                             if action == "poll" {
-                                                let delivery = deliveries.lock().await.pop_front();
-                                                let resp = match delivery {
-                                                    Some(d) => d,
-                                                    None => serde_json::json!({
-                                                        "status": "ok",
-                                                        "action": "timeout",
-                                                    }),
-                                                };
+                                                let resp = conn_inbox.poll_json_frame();
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;
                                             } else if action == "ack" {
                                                 if let Some(msg_id) = val.get("messageId").and_then(|m| m.as_str()) {
-                                                    acks.lock().await.push(msg_id.to_string());
+                                                    conn_inbox.ack_now(msg_id);
                                                 }
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
@@ -138,14 +125,17 @@ impl MockXmsgSockets {
         Self {
             dir: dir.to_path_buf(),
             recorded_sends,
-            recorded_acks,
-            queued_deliveries,
+            inbox,
             shutdown_tx: Some(shutdown_tx),
         }
     }
 
     pub async fn queue_delivery(&self, delivery: Value) {
-        self.queued_deliveries.lock().await.push_back(delivery);
+        self.inbox.push_json_frame(&delivery);
+    }
+
+    pub fn recorded_acks(&self) -> Vec<String> {
+        self.inbox.acks.lock().unwrap().clone()
     }
 }
 
@@ -319,7 +309,7 @@ async fn oracle_2_reply_delivered_via_svc_inbox_and_bot_posts_reply() {
         );
     }
 
-    let acks = server.recorded_acks.lock().await.clone();
+    let acks = server.recorded_acks();
     assert_eq!(acks, vec!["01M7REPLYID".to_string()]);
 }
 

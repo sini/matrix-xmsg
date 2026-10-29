@@ -2,9 +2,8 @@ use matrix_xmsg::config::{Admission, Config};
 use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::{MatrixClient, MockMatrixClient};
 use matrix_xmsg::store::Store;
-use matrix_xmsg::xmsg::{create_xmsg_client, ReconnectingSvcInbox};
+use matrix_xmsg::xmsg::{create_xmsg_client, MockSvcInbox, ReconnectingSvcInbox};
 use serde_json::Value;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,9 +15,7 @@ use tokio::sync::Mutex;
 pub struct MockXmsgSockets {
     pub dir: PathBuf,
     pub recorded_sends: Arc<Mutex<Vec<Value>>>,
-    pub recorded_acks: Arc<Mutex<Vec<String>>>,
-    pub queued_deliveries: Arc<Mutex<VecDeque<Value>>>,
-    pub in_flight: Arc<Mutex<VecDeque<Value>>>,
+    pub inbox: MockSvcInbox,
     pub send_counter: Arc<AtomicUsize>,
     pub registration_count: Arc<AtomicUsize>,
     pub refuse_registration: Arc<AtomicBool>,
@@ -35,9 +32,7 @@ impl MockXmsgSockets {
         let agent_listener = UnixListener::bind(&agent_sock_path).expect("bind agent.sock");
 
         let recorded_sends = Arc::new(Mutex::new(Vec::new()));
-        let recorded_acks = Arc::new(Mutex::new(Vec::new()));
-        let queued_deliveries = Arc::new(Mutex::new(VecDeque::new()));
-        let in_flight = Arc::new(Mutex::new(VecDeque::new()));
+        let inbox = MockSvcInbox::new();
         let send_counter = Arc::new(AtomicUsize::new(1));
         let registration_count = Arc::new(AtomicUsize::new(0));
         let refuse_registration = Arc::new(AtomicBool::new(false));
@@ -84,9 +79,7 @@ impl MockXmsgSockets {
         let mock = Self {
             dir: dir.to_path_buf(),
             recorded_sends,
-            recorded_acks,
-            queued_deliveries,
-            in_flight,
+            inbox,
             send_counter,
             registration_count,
             refuse_registration,
@@ -100,7 +93,11 @@ impl MockXmsgSockets {
     }
 
     pub async fn queue_delivery(&self, delivery: Value) {
-        self.queued_deliveries.lock().await.push_back(delivery);
+        self.inbox.push_json_frame(&delivery);
+    }
+
+    pub fn recorded_acks(&self) -> Vec<String> {
+        self.inbox.acks.lock().unwrap().clone()
     }
 
     pub async fn drop_active_registration(&self) {
@@ -128,9 +125,7 @@ impl MockXmsgSockets {
         let (reg_tx, mut reg_rx) = tokio::sync::oneshot::channel::<()>();
         *self.reg_shutdown_tx.lock().await = Some(reg_tx);
 
-        let acks = Arc::clone(&self.recorded_acks);
-        let deliveries = Arc::clone(&self.queued_deliveries);
-        let in_flight = Arc::clone(&self.in_flight);
+        let inbox = self.inbox.clone();
         let registration_count = Arc::clone(&self.registration_count);
         let refuse_registration = Arc::clone(&self.refuse_registration);
         let active_client_abort = Arc::clone(&self.active_client_abort);
@@ -142,9 +137,7 @@ impl MockXmsgSockets {
                     while let Ok((stream, _)) = reg_listener.accept().await {
                         let (r, mut w) = stream.into_split();
                         let mut lines = tokio::io::BufReader::new(r).lines();
-                        let acks = Arc::clone(&acks);
-                        let deliveries = Arc::clone(&deliveries);
-                        let in_flight = Arc::clone(&in_flight);
+                        let conn_inbox = inbox.new_connection();
                         let registration_count = Arc::clone(&registration_count);
                         let refuse_registration = Arc::clone(&refuse_registration);
 
@@ -153,14 +146,7 @@ impl MockXmsgSockets {
 
                         tokio::spawn(async move {
                             tokio::select! {
-                                _ = &mut client_abort_rx => {
-                                    // Connection aborted: return unacked in_flight to front of queue
-                                    let mut inflight = in_flight.lock().await;
-                                    let mut q = deliveries.lock().await;
-                                    while let Some(d) = inflight.pop_back() {
-                                        q.push_front(d);
-                                    }
-                                }
+                                _ = &mut client_abort_rx => {}
                                 _ = async {
                                     // 1. Registration line
                                     if let Ok(Some(line)) = lines.next_line().await {
@@ -192,26 +178,12 @@ impl MockXmsgSockets {
                                         if let Ok(val) = serde_json::from_str::<Value>(&line) {
                                             let action = val.get("action").and_then(|a| a.as_str()).unwrap_or("");
                                             if action == "poll" {
-                                                let delivery = deliveries.lock().await.pop_front();
-                                                if let Some(ref d) = delivery {
-                                                    in_flight.lock().await.push_back(d.clone());
-                                                }
-                                                let resp = match delivery {
-                                                    Some(d) => d,
-                                                    None => serde_json::json!({
-                                                        "status": "ok",
-                                                        "action": "timeout",
-                                                    }),
-                                                };
+                                                let resp = conn_inbox.poll_json_frame();
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;
                                             } else if action == "ack" {
                                                 if let Some(msg_id) = val.get("messageId").and_then(|m| m.as_str()) {
-                                                    acks.lock().await.push(msg_id.to_string());
-                                                    in_flight.lock().await.retain(|d| {
-                                                        let id = d.get("messageId").or_else(|| d.get("message_id")).and_then(|v| v.as_str()).unwrap_or("");
-                                                        id != msg_id
-                                                    });
+                                                    conn_inbox.ack_now(msg_id);
                                                 }
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
@@ -220,13 +192,6 @@ impl MockXmsgSockets {
                                                 let _ = w.flush().await;
                                             }
                                         }
-                                    }
-
-                                    // Connection closed or EOF: return unacked in_flight to front of queue
-                                    let mut inflight = in_flight.lock().await;
-                                    let mut q = deliveries.lock().await;
-                                    while let Some(d) = inflight.pop_back() {
-                                        q.push_front(d);
                                     }
                                 } => {}
                             }
@@ -395,7 +360,7 @@ async fn oracle_1_mock_server_drops_connection_and_bot_reregisters() {
     }
 
     // Verify delivery was acked
-    let acks = server.recorded_acks.lock().await.clone();
+    let acks = server.recorded_acks();
     assert_eq!(acks, vec!["01M18REPLY00000000000001".to_string()]);
 
     let _ = shutdown_tx.send(());
@@ -578,7 +543,7 @@ async fn oracle_2_unacked_delivery_before_drop_is_redelivered_and_posted_once() 
     let notices = matrix.inner.sent_notices.lock().unwrap().clone();
     assert_eq!(notices.len(), 1, "Must be posted exactly once");
 
-    let acks = server.recorded_acks.lock().await.clone();
+    let acks = server.recorded_acks();
     assert_eq!(
         acks,
         vec!["01M18DELIVERY0000000002".to_string()],

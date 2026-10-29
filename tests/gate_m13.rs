@@ -7,9 +7,8 @@ use matrix_xmsg::context::EventMessage;
 use matrix_xmsg::error::AppError;
 use matrix_xmsg::matrix::{MatrixClient, MockMatrixClient};
 use matrix_xmsg::store::Store;
-use matrix_xmsg::xmsg::{create_xmsg_client, register_svc, SvcInbox};
+use matrix_xmsg::xmsg::{create_xmsg_client, register_svc, MockSvcInbox, SvcInbox};
 use serde_json::Value;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -20,8 +19,7 @@ use tokio::sync::Mutex;
 pub struct MockXmsgSockets {
     pub dir: PathBuf,
     pub recorded_sends: Arc<Mutex<Vec<Value>>>,
-    pub recorded_acks: Arc<Mutex<Vec<String>>>,
-    pub queued_deliveries: Arc<Mutex<VecDeque<Value>>>,
+    pub inbox: MockSvcInbox,
     pub send_counter: Arc<AtomicUsize>,
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -37,15 +35,13 @@ impl MockXmsgSockets {
         let agent_listener = UnixListener::bind(&agent_sock_path).expect("bind agent.sock");
 
         let recorded_sends = Arc::new(Mutex::new(Vec::new()));
-        let recorded_acks = Arc::new(Mutex::new(Vec::new()));
-        let queued_deliveries = Arc::new(Mutex::new(VecDeque::new()));
+        let inbox = MockSvcInbox::new();
         let send_counter = Arc::new(AtomicUsize::new(1));
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let sends_clone = Arc::clone(&recorded_sends);
-        let acks_clone = Arc::clone(&recorded_acks);
-        let deliveries_clone = Arc::clone(&queued_deliveries);
+        let inbox_clone = inbox.clone();
         let counter_clone = Arc::clone(&send_counter);
 
         tokio::spawn(async move {
@@ -84,14 +80,12 @@ impl MockXmsgSockets {
                     };
 
                     let reg_task = {
-                        let acks = Arc::clone(&acks_clone);
-                        let deliveries = Arc::clone(&deliveries_clone);
+                        let inbox = inbox_clone.clone();
                         tokio::spawn(async move {
                             while let Ok((stream, _)) = reg_listener.accept().await {
                                 let (r, mut w) = stream.into_split();
                                 let mut lines = tokio::io::BufReader::new(r).lines();
-                                let acks = Arc::clone(&acks);
-                                let deliveries = Arc::clone(&deliveries);
+                                let conn_inbox = inbox.new_connection();
                                 tokio::spawn(async move {
                                     // First line is register
                                     if let Ok(Some(line)) = lines.next_line().await {
@@ -113,19 +107,12 @@ impl MockXmsgSockets {
                                         if let Ok(val) = serde_json::from_str::<Value>(&line) {
                                             let action = val.get("action").and_then(|a| a.as_str()).unwrap_or("");
                                             if action == "poll" {
-                                                let delivery = deliveries.lock().await.pop_front();
-                                                let resp = match delivery {
-                                                    Some(d) => d,
-                                                    None => serde_json::json!({
-                                                        "status": "ok",
-                                                        "action": "timeout",
-                                                    }),
-                                                };
+                                                let resp = conn_inbox.poll_json_frame();
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;
                                             } else if action == "ack" {
                                                 if let Some(msg_id) = val.get("messageId").and_then(|m| m.as_str()) {
-                                                    acks.lock().await.push(msg_id.to_string());
+                                                    conn_inbox.ack_now(msg_id);
                                                 }
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
@@ -148,15 +135,18 @@ impl MockXmsgSockets {
         Self {
             dir: dir.to_path_buf(),
             recorded_sends,
-            recorded_acks,
-            queued_deliveries,
+            inbox,
             send_counter,
             shutdown_tx: Some(shutdown_tx),
         }
     }
 
     pub async fn queue_delivery(&self, delivery: Value) {
-        self.queued_deliveries.lock().await.push_back(delivery);
+        self.inbox.push_json_frame(&delivery);
+    }
+
+    pub fn recorded_acks(&self) -> Vec<String> {
+        self.inbox.acks.lock().unwrap().clone()
     }
 }
 
@@ -373,7 +363,7 @@ async fn oracle_1_two_replies_to_one_forward_yield_two_posts_in_order() {
     );
 
     // Both deliveries acked
-    let acks = server.recorded_acks.lock().await.clone();
+    let acks = server.recorded_acks();
     assert_eq!(
         acks,
         vec![
@@ -517,15 +507,18 @@ async fn oracle_3_reply_post_failure_not_acked_and_posted_on_redelivery() {
     );
 
     // Verify NOT acked on failure
-    let acks_after_fail = server.recorded_acks.lock().await.clone();
+    let acks_after_fail = server.recorded_acks();
     assert!(
         acks_after_fail.is_empty(),
         "Failed delivery must NOT be acknowledged"
     );
 
-    // Attempt 2: Re-delivery succeeds
+    // Attempt 2: Re-delivery on reconnect succeeds (without re-queuing: the unacked delivery
+    // remains in MockSvcInbox's queue and is redelivered on reconnect as in real xmsg at cca3de7)
     matrix.fail_notice.store(false, Ordering::SeqCst);
-    server.queue_delivery(delivery_json).await;
+    let mut inbox = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
+        .await
+        .expect("register_svc reconnect must succeed");
     let d2 = inbox.poll(1).await.unwrap().unwrap();
     let res2 = handle_inbox_delivery(&d2, &config, &matrix, &store, &mut inbox, 1002).await;
     assert_eq!(
@@ -539,7 +532,7 @@ async fn oracle_3_reply_post_failure_not_acked_and_posted_on_redelivery() {
     assert_eq!(notices.len(), 1, "Must post exactly one notice on retry");
     assert!(notices[0].body.contains("Answer to be retried"));
 
-    let acks_after_success = server.recorded_acks.lock().await.clone();
+    let acks_after_success = server.recorded_acks();
     assert_eq!(
         acks_after_success,
         vec!["01M13RETRYMSG".to_string()],
@@ -754,7 +747,7 @@ async fn oracle_6_silent_decline_swaps_eye_for_salute_and_posts_nothing() {
     );
 
     // 4. Delivery was acked
-    let acks = server.recorded_acks.lock().await.clone();
+    let acks = server.recorded_acks();
     assert_eq!(acks, vec!["01M13DECLINE001".to_string()]);
 }
 
