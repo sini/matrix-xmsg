@@ -612,8 +612,8 @@ pkgs.testers.nixosTest {
     )
     machine.wait_until_succeeds(
         "${pkgs.python3}/bin/python3 -c 'import sqlite3, sys; "
-        "c = sqlite3.connect(\"/var/lib/matrix-xmsg/xmsg/xmsg.db\"); "
-        "unacked = c.execute(\"SELECT count(*) FROM messages WHERE recipient_address LIKE \\\"matrix-xmsg%\\\" AND outcome != \\\"delivered\\\"\").fetchone()[0]; "
+        "c = sqlite3.connect(\"/var/lib/matrix-xmsg-xmsg/xmsg.db\"); "
+        "unacked = c.execute(\"SELECT count(*) FROM svc_pending_messages WHERE session_id = \\\"matrix-xmsg\\\" AND delivered_at IS NULL\").fetchone()[0]; "
         "sys.exit(0 if unacked == 0 else 1)'",
         timeout=25,
     )
