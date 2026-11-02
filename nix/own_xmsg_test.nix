@@ -478,8 +478,8 @@ pkgs.testers.nixosTest {
             f"[ -n \"$pid\" ] && [ \"$pid\" -gt 0 ] && [ \"$pid\" != \"{prev_pid}\" ] && "
             f"[ \"$(readlink /proc/$pid/ns/mnt)\" != \"$(readlink /proc/1/ns/mnt)\" ] && "
             f"case \"$(readlink /proc/$pid/exe)\" in */xmsg) true ;; *) false ;; esac && "
-            f"${pkgs.python3}/bin/python3 -c 'import socket; "
-            f"[ (s:=socket.socket(socket.AF_UNIX), s.connect(f\"/run/matrix-xmsg-xmsg/xmsg/{n}.sock\"), s.close()) for n in (\"register\",\"agent\",\"http\") ]'",
+            "${pkgs.python3}/bin/python3 -c 'import socket; "
+            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(f\"/run/matrix-xmsg-xmsg/xmsg/{n}.sock\"), s.close()) for n in (\"register\",\"agent\",\"http\") ]'",
             timeout=30,
         )
 

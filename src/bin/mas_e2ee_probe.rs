@@ -263,21 +263,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let backup_deadline = std::time::Instant::now() + Duration::from_secs(15);
             let mut key_backed_up = false;
             while std::time::Instant::now() < backup_deadline {
-                if let Ok(resp) = http
-                    .get(format!("{homeserver_url}/_matrix/client/v3/room_keys/keys"))
+                let mut version_opt: Option<String> = None;
+                if let Ok(v_resp) = http
+                    .get(format!("{homeserver_url}/_matrix/client/v3/room_keys/version"))
                     .bearer_auth(&genie_token)
                     .send()
                     .await
                 {
-                    if resp.status().is_success() {
-                        if let Ok(bytes) = resp.bytes().await {
-                            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                if val["rooms"][room_id.as_str()]["sessions"]
-                                    .as_object()
-                                    .is_some_and(|s| !s.is_empty())
+                    if v_resp.status().is_success() {
+                        if let Ok(v_bytes) = v_resp.bytes().await {
+                            if let Ok(v_val) = serde_json::from_slice::<serde_json::Value>(&v_bytes)
+                            {
+                                version_opt = v_val["version"].as_str().map(str::to_owned);
+                            }
+                        }
+                    }
+                }
+                if let Some(ver) = version_opt {
+                    if let Ok(resp) = http
+                        .get(format!(
+                            "{homeserver_url}/_matrix/client/v3/room_keys/keys?version={ver}"
+                        ))
+                        .bearer_auth(&genie_token)
+                        .send()
+                        .await
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(bytes) = resp.bytes().await {
+                                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
                                 {
-                                    key_backed_up = true;
-                                    break;
+                                    if val["rooms"][room_id.as_str()]["sessions"]
+                                        .as_object()
+                                        .is_some_and(|s| !s.is_empty())
+                                    {
+                                        key_backed_up = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
