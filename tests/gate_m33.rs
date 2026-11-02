@@ -1669,7 +1669,7 @@ mod real_xmsg_oracle_f {
                 }
                 let up = ["http.sock", "agent.sock", "register.sock"]
                     .iter()
-                    .all(|s| run.join(s).exists());
+                    .all(|s| UnixStream::connect(run.join(s)).is_ok());
                 if up {
                     return Some(Node {
                         tmp,

@@ -74,7 +74,13 @@ pkgs.testers.nixosTest {
         # 1. Wait for mock servers to bind
         machine.wait_for_unit("mock-servers.service")
         machine.wait_for_open_port(8008)
-        machine.wait_for_file("/run/xmsg-mock/agent.sock")
+        machine.wait_until_succeeds(
+            "${pkgs.python3}/bin/python3 -c 'import os, socket; "
+            "socks = [\"/run/xmsg-mock/register.sock\", \"/run/xmsg-mock/agent.sock\"]; "
+            "assert all((os.stat(p).st_mode & 0o777) == 0o666 for p in socks); "
+            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(p), s.close()) for p in socks ]'",
+            timeout=30,
+        )
 
         # 2. Verify that matrix-xmsg fails to become active due to missing credential
         machine.wait_until_fails("systemctl is-active --quiet matrix-xmsg.service")
@@ -96,7 +102,13 @@ pkgs.testers.nixosTest {
         # 1. Wait for mock servers to bind
         machine.wait_for_unit("mock-servers.service")
         machine.wait_for_open_port(8008)
-        machine.wait_for_file("/run/xmsg-mock/agent.sock")
+        machine.wait_until_succeeds(
+            "${pkgs.python3}/bin/python3 -c 'import os, socket; "
+            "socks = [\"/run/xmsg-mock/register.sock\", \"/run/xmsg-mock/agent.sock\"]; "
+            "assert all((os.stat(p).st_mode & 0o777) == 0o666 for p in socks); "
+            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(p), s.close()) for p in socks ]'",
+            timeout=30,
+        )
 
         # 2. Wait for matrix-xmsg service to start
         machine.wait_for_unit("matrix-xmsg.service")
@@ -139,7 +151,13 @@ pkgs.testers.nixosTest {
         # 1. Wait for mock servers to bind
         machine.wait_for_unit("mock-servers.service")
         machine.wait_for_open_port(8008)
-        machine.wait_for_file("/run/xmsg-mock/agent.sock")
+        machine.wait_until_succeeds(
+            "${pkgs.python3}/bin/python3 -c 'import os, socket; "
+            "socks = [\"/run/xmsg-mock/register.sock\", \"/run/xmsg-mock/agent.sock\"]; "
+            "assert all((os.stat(p).st_mode & 0o777) == 0o666 for p in socks); "
+            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(p), s.close()) for p in socks ]'",
+            timeout=30,
+        )
 
         # 2. Wait for matrix-xmsg to start up and load token credential
         machine.wait_for_unit("matrix-xmsg.service")

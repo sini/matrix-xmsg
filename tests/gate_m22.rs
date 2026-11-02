@@ -186,7 +186,7 @@ async fn oracle_1_reply_with_matrix_to_link_produces_mentions_and_pill() {
             .await
             .unwrap(),
     );
-    register_event_handlers(
+    let tracker = register_event_handlers(
         client.inner(),
         config.clone(),
         client.clone(),
@@ -199,7 +199,9 @@ async fn oracle_1_reply_with_matrix_to_link_produces_mentions_and_pill() {
         .sync_once(matrix_sdk::config::SyncSettings::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tracker
+        .drain_or_notify(client.as_ref(), Duration::from_secs(5))
+        .await;
 
     // Delivery containing [vic](https://matrix.to/#/@vborja:matrix.org)
     let reply_text = "[vic](https://matrix.to/#/@vborja:matrix.org) here is the solution";
@@ -349,7 +351,7 @@ async fn oracle_2_plain_reply_mentions_only_asker_and_no_other_thread_participan
             .await
             .unwrap(),
     );
-    register_event_handlers(
+    let tracker = register_event_handlers(
         client.inner(),
         config.clone(),
         client.clone(),
@@ -362,7 +364,9 @@ async fn oracle_2_plain_reply_mentions_only_asker_and_no_other_thread_participan
         .sync_once(matrix_sdk::config::SyncSettings::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tracker
+        .drain_or_notify(client.as_ref(), Duration::from_secs(5))
+        .await;
 
     // Delivery with NO matrix.to link
     let reply_text = "Here is an answer without mentioning anyone.";
@@ -481,7 +485,7 @@ async fn oracle_3_at_room_in_text_sets_no_room_mention() {
             .await
             .unwrap(),
     );
-    register_event_handlers(
+    let tracker = register_event_handlers(
         client.inner(),
         config.clone(),
         client.clone(),
@@ -494,7 +498,9 @@ async fn oracle_3_at_room_in_text_sets_no_room_mention() {
         .sync_once(matrix_sdk::config::SyncSettings::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tracker
+        .drain_or_notify(client.as_ref(), Duration::from_secs(5))
+        .await;
 
     // Delivery containing `@room`
     let reply_text = "@room Please be advised that service maintenance is scheduled tonight.";

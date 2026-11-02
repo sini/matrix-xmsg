@@ -87,8 +87,11 @@ pkgs.testers.nixosTest {
         machine.wait_for_unit("mock-matrix.service")
         machine.wait_for_open_port(8008)
         machine.wait_for_unit("user@1000.service")
-        machine.wait_for_file("/run/user/1000/xmsg/register.sock")
-        machine.wait_for_file("/run/user/1000/xmsg/agent.sock")
+        machine.wait_until_succeeds(
+            "${pkgs.python3}/bin/python3 -c 'import socket; "
+            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(f\"/run/user/1000/xmsg/{n}.sock\"), s.close()) for n in (\"register\",\"agent\",\"http\") ]'",
+            timeout=30,
+        )
 
         # Real xmsg refuses registration when svcExe.matrix-xmsg is dropped
         machine.wait_until_succeeds(
@@ -116,8 +119,11 @@ pkgs.testers.nixosTest {
         machine.wait_for_unit("mock-matrix.service")
         machine.wait_for_open_port(8008)
         machine.wait_for_unit("user@1000.service")
-        machine.wait_for_file("/run/user/1000/xmsg/register.sock")
-        machine.wait_for_file("/run/user/1000/xmsg/agent.sock")
+        machine.wait_until_succeeds(
+            "${pkgs.python3}/bin/python3 -c 'import socket; "
+            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(f\"/run/user/1000/xmsg/{n}.sock\"), s.close()) for n in (\"register\",\"agent\",\"http\") ]'",
+            timeout=30,
+        )
 
         # SQLite database created under ~/.local/state/matrix-xmsg with 0600 permissions
         machine.wait_for_file("/home/alice/.local/state/matrix-xmsg/matrix-xmsg.db")

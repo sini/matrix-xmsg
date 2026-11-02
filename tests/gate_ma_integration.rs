@@ -190,7 +190,7 @@ impl Node {
             }
             let up = ["http.sock", "agent.sock", "register.sock"]
                 .iter()
-                .all(|s| run.join(s).exists())
+                .all(|s| UnixStream::connect(run.join(s)).is_ok())
                 && spec
                     .fed_listen
                     .is_none_or(|p| std::net::TcpStream::connect(("127.0.0.1", p)).is_ok());

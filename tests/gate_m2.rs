@@ -17,6 +17,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 struct TestXmsgMock {
     sent_payloads: Mutex<Vec<(String, String, String)>>,
     send_counter: AtomicUsize,
+    entered: AtomicUsize,
     delay: Duration,
 }
 
@@ -25,6 +26,7 @@ impl TestXmsgMock {
         Self {
             sent_payloads: Mutex::new(Vec::new()),
             send_counter: AtomicUsize::new(0),
+            entered: AtomicUsize::new(0),
             delay: Duration::from_millis(0),
         }
     }
@@ -33,6 +35,7 @@ impl TestXmsgMock {
         Self {
             sent_payloads: Mutex::new(Vec::new()),
             send_counter: AtomicUsize::new(0),
+            entered: AtomicUsize::new(0),
             delay: Duration::from_millis(0),
         }
     }
@@ -41,6 +44,7 @@ impl TestXmsgMock {
         Self {
             sent_payloads: Mutex::new(Vec::new()),
             send_counter: AtomicUsize::new(0),
+            entered: AtomicUsize::new(0),
             delay,
         }
     }
@@ -54,6 +58,7 @@ impl XmsgClient for TestXmsgMock {
         from: &str,
         text: &str,
     ) -> Result<SendResponse, AppError> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
         if self.delay > Duration::from_millis(0) {
             tokio::time::sleep(self.delay).await;
         }
@@ -294,7 +299,7 @@ async fn test_sdk_full_sync_and_threaded_reply_loop() {
             .expect("SDK client must initialize cleanly against mock versions"),
     );
 
-    register_event_handlers(
+    let tracker = register_event_handlers(
         sdk_client.inner(),
         config.clone(),
         sdk_client.clone(),
@@ -308,7 +313,9 @@ async fn test_sdk_full_sync_and_threaded_reply_loop() {
         sync_res1.is_ok(),
         "initial sync_once must succeed: {sync_res1:?}"
     );
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tracker
+        .drain_or_notify(sdk_client.as_ref(), Duration::from_secs(5))
+        .await;
     assert_eq!(
         xmsg.sent_payloads.lock().unwrap().len(),
         0,
@@ -324,13 +331,9 @@ async fn test_sdk_full_sync_and_threaded_reply_loop() {
         sync_res2.is_ok(),
         "second sync_once must succeed: {sync_res2:?}"
     );
-    for _ in 0..50 {
-        if !xmsg.sent_payloads.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tracker
+        .drain_or_notify(sdk_client.as_ref(), Duration::from_secs(5))
+        .await;
     {
         let sent = xmsg.sent_payloads.lock().unwrap();
         assert_eq!(
@@ -435,7 +438,7 @@ async fn test_sdk_anti_oracle_untrusted_mention_is_silent() {
             .expect("SDK client must initialize cleanly"),
     );
 
-    register_event_handlers(
+    let tracker = register_event_handlers(
         sdk_client.inner(),
         config.clone(),
         sdk_client.clone(),
@@ -448,7 +451,9 @@ async fn test_sdk_anti_oracle_untrusted_mention_is_silent() {
         .sync_once(SyncSettings::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tracker
+        .drain_or_notify(sdk_client.as_ref(), Duration::from_secs(5))
+        .await;
 
     let sent = xmsg.sent_payloads.lock().unwrap();
     assert!(
@@ -532,7 +537,7 @@ async fn test_sdk_dm_escalation_on_explicit_command() {
             .unwrap(),
     );
 
-    register_event_handlers(
+    let tracker = register_event_handlers(
         sdk_client.inner(),
         config.clone(),
         sdk_client.clone(),
@@ -545,7 +550,9 @@ async fn test_sdk_dm_escalation_on_explicit_command() {
         .sync_once(SyncSettings::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tracker
+        .drain_or_notify(sdk_client.as_ref(), Duration::from_secs(5))
+        .await;
 }
 
 #[tokio::test]
@@ -631,7 +638,7 @@ async fn test_sdk_answer_timeout_escalation() {
             .unwrap(),
     );
 
-    register_event_handlers(
+    let tracker = register_event_handlers(
         sdk_client.inner(),
         config.clone(),
         sdk_client.clone(),
@@ -644,7 +651,9 @@ async fn test_sdk_answer_timeout_escalation() {
         .sync_once(SyncSettings::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tracker
+        .drain_or_notify(sdk_client.as_ref(), Duration::from_secs(5))
+        .await;
 
     // Simulate timeout sweep (M13 answer_timeout_secs sweep)
     let swept = matrix_xmsg::bot::sweep_answer_timeouts(
@@ -780,7 +789,7 @@ async fn test_p2_edits_ignored() {
             .await
             .unwrap(),
     );
-    register_event_handlers(
+    let tracker = register_event_handlers(
         client.inner(),
         config.clone(),
         client.clone(),
@@ -793,7 +802,9 @@ async fn test_p2_edits_ignored() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tracker
+        .drain_or_notify(client.as_ref(), Duration::from_secs(5))
+        .await;
     let n = xmsg.sent_payloads.lock().unwrap().len();
     assert_eq!(n, 0, "FAIL-IF >0: edit treated as new question");
 }
@@ -848,7 +859,7 @@ async fn test_p2_control_plain_mention_dispatches() {
             .await
             .unwrap(),
     );
-    register_event_handlers(
+    let tracker = register_event_handlers(
         client.inner(),
         config.clone(),
         client.clone(),
@@ -861,7 +872,9 @@ async fn test_p2_control_plain_mention_dispatches() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tracker
+        .drain_or_notify(client.as_ref(), Duration::from_secs(5))
+        .await;
     let n = xmsg.sent_payloads.lock().unwrap().len();
     assert_eq!(
         n, 1,
@@ -993,7 +1006,7 @@ async fn test_p4_reply_body_is_threaded_and_mentions_asker() {
             .await
             .unwrap(),
     );
-    register_event_handlers(
+    let tracker = register_event_handlers(
         client.inner(),
         config.clone(),
         client.clone(),
@@ -1006,7 +1019,9 @@ async fn test_p4_reply_body_is_threaded_and_mentions_asker() {
         .sync_once(SyncSettings::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tracker
+        .drain_or_notify(client.as_ref(), Duration::from_secs(5))
+        .await;
 
     // Simulate inbox delivery (M13 inbox loop reply path)
     let delivery = matrix_xmsg::xmsg::SvcDelivery {
@@ -1212,7 +1227,7 @@ async fn test_dm_room_reused_across_multiple_escalations() {
             .unwrap(),
     );
 
-    register_event_handlers(
+    let tracker = register_event_handlers(
         sdk_client.inner(),
         config.clone(),
         sdk_client.clone(),
@@ -1226,7 +1241,9 @@ async fn test_dm_room_reused_across_multiple_escalations() {
         .sync_once(SyncSettings::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tracker
+        .drain_or_notify(sdk_client.as_ref(), Duration::from_secs(5))
+        .await;
 
     // Sync 2
     sdk_client
@@ -1234,7 +1251,9 @@ async fn test_dm_room_reused_across_multiple_escalations() {
         .sync_once(SyncSettings::default().token("batch_token_dm_1"))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tracker
+        .drain_or_notify(sdk_client.as_ref(), Duration::from_secs(5))
+        .await;
 }
 
 #[tokio::test]
@@ -1405,7 +1424,13 @@ async fn test_n1_shutdown_grace_period_expired_posts_notice() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    for _ in 0..200 {
+        if xmsg.entered.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(xmsg.entered.load(Ordering::SeqCst), 1);
 
     // Grace period is only 50ms, so it expires while expert is still waiting (2000ms)
     tracker
@@ -1796,7 +1821,19 @@ async fn test_n9_run_daemon_loop_resumes_from_persisted_sync_token() {
         matrix_xmsg::bot::run_daemon_loop(&client_inner, store_clone, shutdown_rx).await
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..200 {
+        let cur = sdk
+            .inner()
+            .state_store()
+            .get_kv_data(matrix_sdk::store::StateStoreDataKey::SyncToken)
+            .await
+            .unwrap()
+            .and_then(|v| v.into_sync_token());
+        if cur.as_deref() == Some("next_token_43") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let _ = shutdown_tx.send(());
 
     let loop_res = loop_handle.await.unwrap();
@@ -2438,7 +2475,7 @@ async fn test_p_a_n4_tolerance_resumed_sync() {
         .unwrap();
     let xmsg = Arc::new(TestXmsgMock::with_reply("answer"));
 
-    let _tracker = matrix_xmsg::bot::register_event_handlers_with_startup_ts(
+    let tracker = matrix_xmsg::bot::register_event_handlers_with_startup_ts(
         sdk.inner(),
         config.clone(),
         sdk.clone(),
@@ -2451,7 +2488,9 @@ async fn test_p_a_n4_tolerance_resumed_sync() {
         .sync_once(SyncSettings::default().token("resumed_tok"))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tracker
+        .drain_or_notify(sdk.as_ref(), Duration::from_secs(5))
+        .await;
 
     // P-a / N4 Oracle: exactly 1 dispatch (ev_within within 10s skew dispatched; ev_outside dropped)
     assert_eq!(

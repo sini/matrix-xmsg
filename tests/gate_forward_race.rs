@@ -313,7 +313,11 @@ async fn an_instant_reply_to_a_relay_is_posted_once() {
 
 /// `MockMatrixClient` whose owner DM takes `DM_DELAY`.
 #[derive(Default)]
-struct SlowDm(MockMatrixClient);
+struct SlowDm {
+    inner: MockMatrixClient,
+    in_dm: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+}
 
 const DM_DELAY: Duration = Duration::from_secs(3);
 
@@ -326,20 +330,22 @@ impl MatrixClient for SlowDm {
         body: &str,
         mention_user: Option<&str>,
     ) -> Result<String, AppError> {
-        self.0
+        self.inner
             .send_notice(room_id, thread_root_id, body, mention_user)
             .await
     }
     async fn send_dm(&self, user_id: &str, body: &str) -> Result<String, AppError> {
+        self.in_dm.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.entered.notify_waiters();
         tokio::time::sleep(DM_DELAY).await;
-        self.0.send_dm(user_id, body).await
+        self.inner.send_dm(user_id, body).await
     }
     async fn fetch_history(
         &self,
         room_id: &str,
         limit: usize,
     ) -> Result<Vec<matrix_xmsg::context::EventMessage>, AppError> {
-        self.0.fetch_history(room_id, limit).await
+        self.inner.fetch_history(room_id, limit).await
     }
     async fn send_reaction(
         &self,
@@ -347,7 +353,7 @@ impl MatrixClient for SlowDm {
         event_id: &str,
         key: &str,
     ) -> Result<String, AppError> {
-        self.0.send_reaction(room_id, event_id, key).await
+        self.inner.send_reaction(room_id, event_id, key).await
     }
     async fn redact_event(
         &self,
@@ -355,11 +361,11 @@ impl MatrixClient for SlowDm {
         event_id: &str,
         reason: Option<&str>,
     ) -> Result<(), AppError> {
-        self.0.redact_event(room_id, event_id, reason).await
+        self.inner.redact_event(room_id, event_id, reason).await
     }
 }
 
-/// An xmsg whose relay to the solicited session fails.
+/// An xmsg whose relay to the solicited session fails after 350ms (exceeding the old 300ms sleep).
 struct SessionGone;
 
 #[async_trait]
@@ -368,6 +374,7 @@ impl XmsgClient for SessionGone {
         Err(AppError::Xmsg("unexpected send".to_string()))
     }
     async fn reply_message(&self, _: &str, _: &str) -> Result<SendResponse, AppError> {
+        tokio::time::sleep(Duration::from_millis(350)).await;
         Err(AppError::Xmsg("session gone".to_string()))
     }
 }
@@ -383,6 +390,7 @@ async fn a_failed_relay_dms_the_owner_without_the_gate() {
         .unwrap();
     let config = config();
     let matrix = Arc::new(SlowDm::default());
+    let entered = matrix.entered.notified();
     let (s, m, c) = (store.clone(), matrix.clone(), config.clone());
     let relay = tokio::spawn(async move {
         handle_incoming_event_with_guard(
@@ -397,9 +405,15 @@ async fn a_failed_relay_dms_the_owner_without_the_gate() {
         )
         .await
     });
-    // The relay is in its DM by now.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!relay.is_finished(), "the relay did not reach its DM");
+    // Wait until the relay actually enters SlowDm::send_dm.
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("timed out waiting for SlowDm::send_dm entry");
+    assert!(
+        matrix.in_dm.load(std::sync::atomic::Ordering::SeqCst),
+        "the relay must be inside send_dm"
+    );
+    assert!(!relay.is_finished(), "the relay did not stay in its DM");
 
     let mut other = SvcDelivery::new(
         "01OTHERREPLY0001",
@@ -428,5 +442,9 @@ async fn a_failed_relay_dms_the_owner_without_the_gate() {
         "the delivery waited {stalled:?} on the owner DM"
     );
     assert_eq!(relay.await.unwrap().expect("relay"), BotOutcome::Forwarded);
-    assert_eq!(matrix.0.sent_dms.lock().unwrap().len(), 1, "one owner DM");
+    assert_eq!(
+        matrix.inner.sent_dms.lock().unwrap().len(),
+        1,
+        "one owner DM"
+    );
 }

@@ -258,8 +258,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             assert_eq!(raw_ev["type"].as_str(), Some("m.room.encrypted"));
 
-            // Wait briefly for genie's key backup upload task to upload the room key to Synapse
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Poll Synapse's server-side key backup until @genie's room key for `room_id` is uploaded
+            let genie_token = std::env::var("GENIE_TOKEN")?;
+            let backup_deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut key_backed_up = false;
+            while std::time::Instant::now() < backup_deadline {
+                if let Ok(resp) = http
+                    .get(format!("{homeserver_url}/_matrix/client/v3/room_keys/keys"))
+                    .bearer_auth(&genie_token)
+                    .send()
+                    .await
+                {
+                    if resp.status().is_success() {
+                        if let Ok(bytes) = resp.bytes().await {
+                            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                if val["rooms"][room_id.as_str()]["sessions"]
+                                    .as_object()
+                                    .is_some_and(|s| !s.is_empty())
+                                {
+                                    key_backed_up = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                key_backed_up,
+                "Timed out waiting for @genie room key to appear in Synapse key backup for room {room_id}"
+            );
             println!("PRE_LOSS_EVENT_ID={sent_ev_id}");
             println!("ROUNDTRIP_1_PASS");
         }

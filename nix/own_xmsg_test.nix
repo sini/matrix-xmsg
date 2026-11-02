@@ -394,7 +394,7 @@ pkgs.testers.nixosTest {
           Type = "simple";
           User = "matrix-xmsg";
           Group = "matrix-xmsg";
-          ExecStartPre = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do [ -S /run/matrix-xmsg-xmsg/xmsg/register.sock ] && exit 0; sleep 0.1; done; exit 1'";
+          ExecStartPre = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do ${pkgs.python3}/bin/python3 -c \"import socket; s=socket.socket(socket.AF_UNIX); s.connect(\\\"/run/matrix-xmsg-xmsg/xmsg/register.sock\\\"); s.close()\" 2>/dev/null && exit 0; sleep 0.1; done; exit 1'";
           ExecStart = "${mockGuard}/bin/mock-guard";
           ExecStartPost = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do [ -f /run/matrix-xmsg-xmsg/genie-guard.ready ] && exit 0; sleep 0.1; done; exit 1'";
           Restart = "on-failure";
@@ -412,7 +412,7 @@ pkgs.testers.nixosTest {
           Type = "simple";
           User = "matrix-xmsg";
           Group = "matrix-xmsg";
-          ExecStartPre = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do [ -S /run/matrix-xmsg-xmsg/xmsg/register.sock ] && exit 0; sleep 0.1; done; exit 1'";
+          ExecStartPre = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do ${pkgs.python3}/bin/python3 -c \"import socket; s=socket.socket(socket.AF_UNIX); s.connect(\\\"/run/matrix-xmsg-xmsg/xmsg/register.sock\\\"); s.close()\" 2>/dev/null && exit 0; sleep 0.1; done; exit 1'";
           ExecStart = "${mockExpert}/bin/mock-expert";
           ExecStartPost = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do [ -f /run/matrix-xmsg-xmsg/claude.ready ] && exit 0; sleep 0.1; done; exit 1'";
           Restart = "on-failure";
@@ -472,13 +472,23 @@ pkgs.testers.nixosTest {
     };
 
   testScript = ''
+    def wait_for_xmsg_bus_ready(prev_pid="0"):
+        machine.wait_until_succeeds(
+            f"pid=$(systemctl show -p MainPID --value matrix-xmsg-xmsg.service) && "
+            f"[ -n \"$pid\" ] && [ \"$pid\" -gt 0 ] && [ \"$pid\" != \"{prev_pid}\" ] && "
+            f"[ \"$(readlink /proc/$pid/ns/mnt)\" != \"$(readlink /proc/1/ns/mnt)\" ] && "
+            f"case \"$(readlink /proc/$pid/exe)\" in */xmsg) true ;; *) false ;; esac && "
+            f"${pkgs.python3}/bin/python3 -c 'import socket; "
+            f"[ (s:=socket.socket(socket.AF_UNIX), s.connect(f\"/run/matrix-xmsg-xmsg/xmsg/{n}.sock\"), s.close()) for n in (\"register\",\"agent\",\"http\") ]'",
+            timeout=30,
+        )
+
     start_all()
 
     machine.wait_for_unit("mock-matrix.service")
     machine.wait_for_open_port(8008)
     machine.wait_for_unit("matrix-xmsg-xmsg.service")
-    machine.wait_for_file("/run/matrix-xmsg-xmsg/xmsg/register.sock")
-    machine.wait_for_file("/run/matrix-xmsg-xmsg/xmsg/agent.sock")
+    wait_for_xmsg_bus_ready()
     machine.wait_for_unit("mock-guard.service")
     machine.wait_for_unit("mock-expert.service")
     machine.wait_for_unit("matrix-xmsg.service")
@@ -543,36 +553,46 @@ pkgs.testers.nixosTest {
     inject_matrix_events([make_mention("$ev_m18_01", "@bot:test.local m18 ping", ts_ms=1700000101000)])
     machine.wait_for_file("/tmp/m18_delivery_in_flight", timeout=25)
 
-    # Restart the real xmsg daemon under the running bot while the delivery is in-flight and unacked
-    machine.succeed("systemctl restart matrix-xmsg-xmsg.service")
+    # Restart the real xmsg daemon under the running bot while the delivery is in-flight and unacked.
+    # Unlink old socket files between stop and start so readiness checks observe the new server binding.
+    machine.succeed("systemctl stop matrix-xmsg-xmsg.service && rm -f /run/matrix-xmsg-xmsg/xmsg/register.sock /run/matrix-xmsg-xmsg/xmsg/agent.sock /run/matrix-xmsg-xmsg/xmsg/http.sock && systemctl start matrix-xmsg-xmsg.service")
     machine.wait_until_succeeds(
         "journalctl -u matrix-xmsg.service | grep -F 'xmsg registration connection lost'",
         timeout=25,
     )
     machine.succeed("touch /tmp/m18_xmsg_restarted")
 
-    machine.wait_until_succeeds(
-        f"new_pid=$(systemctl show -p MainPID --value matrix-xmsg-xmsg.service); [ -n \"$new_pid\" ] && [ \"$new_pid\" != \"0\" ] && [ \"$new_pid\" != \"{xmsg_pid_before}\" ]",
-        timeout=25,
-    )
-    machine.wait_for_file("/run/matrix-xmsg-xmsg/xmsg/register.sock", timeout=25)
-    machine.wait_for_file("/run/matrix-xmsg-xmsg/xmsg/agent.sock", timeout=25)
+    wait_for_xmsg_bus_ready(xmsg_pid_before)
 
     bot_pid_after = machine.succeed("systemctl show -p MainPID --value matrix-xmsg.service").strip()
     assert bot_pid_after == bot_pid_before, f"Expected matrix-xmsg.service to stay running across xmsg restart ({bot_pid_before} vs {bot_pid_after})"
 
-    # Bot must re-register at least a second time
+    # Bot, mock-guard, and mock-expert must all re-register on the new xmsg instance
     machine.wait_until_succeeds(
         "test $(journalctl -u matrix-xmsg.service | grep -cF 'Registered on xmsg as matrix-xmsg@matrix-xmsg.machine') -ge 2",
         timeout=25,
     )
+    machine.wait_until_succeeds(
+        "test $(journalctl -u mock-guard.service | grep -cF '[mock-guard] registered on xmsg:') -ge 2",
+        timeout=25,
+    )
+    machine.wait_until_succeeds(
+        "test $(journalctl -u mock-expert.service | grep -cF '[mock-expert] registered on xmsg:') -ge 2",
+        timeout=25,
+    )
 
-    # The unacked delivery from before the drop must be redelivered and posted to Matrix
+    # The unacked delivery from before the drop must be redelivered, posted to Matrix, and acked in xmsg.db
     machine.wait_until_succeeds(
         "grep -F 'm18 reply across xmsg restart' /tmp/matrix_replies.jsonl",
         timeout=25,
     )
-    machine.succeed("sleep 1")
+    machine.wait_until_succeeds(
+        "${pkgs.python3}/bin/python3 -c 'import sqlite3, sys; "
+        "c = sqlite3.connect(\"/var/lib/matrix-xmsg/xmsg/xmsg.db\"); "
+        "unacked = c.execute(\"SELECT count(*) FROM messages WHERE recipient_address LIKE \\\"matrix-xmsg%\\\" AND outcome != \\\"delivered\\\"\").fetchone()[0]; "
+        "sys.exit(0 if unacked == 0 else 1)'",
+        timeout=25,
+    )
     m18_post_count = int(machine.succeed("grep -cF 'm18 reply across xmsg restart' /tmp/matrix_replies.jsonl").strip())
     assert m18_post_count == 1, f"Expected m18 redelivered reply to be posted exactly once, got {m18_post_count}"
 

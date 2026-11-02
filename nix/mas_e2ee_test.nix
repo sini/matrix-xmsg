@@ -263,6 +263,27 @@ pkgs.testers.nixosTest {
   testScript = ''
     import re
 
+    def wait_for_mock_xmsg_bus():
+        machine.wait_until_succeeds(
+            "${pkgs.python3}/bin/python3 -c 'import os, socket, stat; "
+            "socks = [\"/run/xmsg-mock/register.sock\", \"/run/xmsg-mock/agent.sock\"]; "
+            "assert all((os.stat(p).st_mode & 0o777) == 0o666 for p in socks); "
+            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(p), s.close()) for p in socks ]'",
+            timeout=30,
+        )
+
+    def wait_for_matrix_xmsg_ready():
+        machine.wait_until_succeeds(
+            "pid=$(systemctl show -p MainPID --value matrix-xmsg.service) && "
+            "[ -n \"$pid\" ] && [ \"$pid\" -gt 0 ] && "
+            "[ \"$(readlink /proc/$pid/ns/mnt)\" != \"$(readlink /proc/1/ns/mnt)\" ] && "
+            "case \"$(readlink /proc/$pid/exe)\" in */matrix-xmsg) true ;; *) false ;; esac && "
+            "test -r /run/credentials/matrix-xmsg.service/store-passphrase && "
+            "journalctl -u matrix-xmsg.service _PID=\"$pid\" | grep -qF 'Starting Matrix event sync loop' && "
+            "journalctl -u matrix-xmsg.service _PID=\"$pid\" | grep -qF 'Registered on xmsg as'",
+            timeout=30,
+        )
+
     start_all()
 
     machine.wait_for_unit("postgresql.target")
@@ -271,7 +292,7 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("mock-xmsg-bus.service")
     machine.wait_for_open_port(8080)
     machine.wait_for_open_port(8448)
-    machine.wait_for_file("/run/xmsg-mock/agent.sock")
+    wait_for_mock_xmsg_bus()
 
     machine.wait_until_succeeds("curl --fail -s https://${synapseDomain}:8448/_matrix/client/versions")
     machine.wait_until_succeeds("curl --fail -s https://${masDomain}:8080/.well-known/openid-configuration")
@@ -330,7 +351,7 @@ pkgs.testers.nixosTest {
 
     # 5. Start matrix-xmsg.service (which triggers matrix-xmsg-e2ee-setup.service first via Wants=/Before=)
     machine.succeed("systemctl start matrix-xmsg.service")
-    machine.wait_for_unit("matrix-xmsg.service")
+    wait_for_matrix_xmsg_ready()
 
     # 6. Verify P3 on live systemd units:
     #    - matrix-xmsg-e2ee-setup.service ran and exited 0, creating /var/lib/matrix-xmsg/matrix-sdk-crypto.sqlite3
@@ -359,6 +380,7 @@ pkgs.testers.nixosTest {
         f"ALICE_TOKEN={alice_token} "
         f"ALICE_DEVICE=ALICE_DEV "
         f"GENIE_MXID=@genie:${synapseDomain} "
+        f"GENIE_TOKEN={genie_token_1} "
         f"ROOM_ID='{room_id}' "
         f"STORE_BASE_DIR=/tmp/mas-e2ee-probe "
         f"mas-e2ee-probe verify-roundtrip-1"
@@ -373,7 +395,7 @@ pkgs.testers.nixosTest {
     #    systemctl restart matrix-xmsg.service skips matrix-xmsg-e2ee-setup.service (ConditionResult=no),
     #    never mounts recovery-key under /run/credentials, and matrix-xmsg.service comes up and decrypts.
     machine.succeed("systemctl restart matrix-xmsg.service")
-    machine.wait_for_unit("matrix-xmsg.service")
+    wait_for_matrix_xmsg_ready()
     setup_cond_restart = machine.succeed("systemctl show -p ConditionResult --value matrix-xmsg-e2ee-setup.service").strip()
     assert setup_cond_restart == "no", f"M36.1 Cell 1 failed: expected ConditionResult=no on restart when crypto store exists, got {setup_cond_restart}"
     setup_start_ts_2 = int(machine.succeed("systemctl show -p ExecMainStartTimestampMonotonic --value matrix-xmsg-e2ee-setup.service").strip())
@@ -461,7 +483,7 @@ pkgs.testers.nixosTest {
         f"systemctl daemon-reload && "
         f"systemctl start matrix-xmsg.service"
     )
-    machine.wait_for_unit("matrix-xmsg.service")
+    wait_for_matrix_xmsg_ready()
     setup_cond_reset = machine.succeed("systemctl show -p ConditionResult --value matrix-xmsg-e2ee-setup.service").strip()
     assert setup_cond_reset == "yes", f"M36.1 Cell 2 failed: expected ConditionResult=yes with resetCryptoStore and empty store, got {setup_cond_reset}"
     setup_start_ts_3 = int(machine.succeed("systemctl show -p ExecMainStartTimestampMonotonic --value matrix-xmsg-e2ee-setup.service").strip())
