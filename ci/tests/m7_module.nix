@@ -326,6 +326,36 @@ in
           xdgRuntimeDir = xmsgSvc.environment.XDG_RUNTIME_DIR;
           requiredBy = xmsgSvc.requiredBy;
           wantedBy = xmsgSvc.wantedBy;
+          hardening = {
+            inherit (xmsgSvc.serviceConfig)
+              AmbientCapabilities
+              CapabilityBoundingSet
+              DevicePolicy
+              LockPersonality
+              MemoryDenyWriteExecute
+              NoNewPrivileges
+              PrivateDevices
+              PrivateTmp
+              PrivateUsers
+              ProtectClock
+              ProtectControlGroups
+              ProtectHome
+              ProtectHostname
+              ProtectKernelLogs
+              ProtectKernelModules
+              ProtectKernelTunables
+              ProtectSystem
+              RemoveIPC
+              RestrictAddressFamilies
+              RestrictNamespaces
+              RestrictRealtime
+              RestrictSUIDSGID
+              SystemCallArchitectures
+              SystemCallFilter
+              UMask
+              ;
+          };
+          hasProtectProc = xmsgSvc.serviceConfig ? ProtectProc;
         };
         expected = {
           dynamicUser = false;
@@ -343,6 +373,42 @@ in
             "matrix-xmsg.service"
             "multi-user.target"
           ];
+          hardening = {
+            AmbientCapabilities = "";
+            CapabilityBoundingSet = "";
+            DevicePolicy = "closed";
+            LockPersonality = true;
+            MemoryDenyWriteExecute = true;
+            NoNewPrivileges = true;
+            PrivateDevices = true;
+            PrivateTmp = true;
+            PrivateUsers = false;
+            ProtectClock = true;
+            ProtectControlGroups = true;
+            ProtectHome = true;
+            ProtectHostname = true;
+            ProtectKernelLogs = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectSystem = "strict";
+            RemoveIPC = true;
+            RestrictAddressFamilies = [
+              "AF_INET"
+              "AF_INET6"
+              "AF_UNIX"
+            ];
+            RestrictNamespaces = true;
+            RestrictRealtime = true;
+            RestrictSUIDSGID = true;
+            SystemCallArchitectures = "native";
+            SystemCallFilter = [
+              "@system-service"
+              "~@privileged"
+              "~@resources"
+            ];
+            UMask = "0027";
+          };
+          hasProtectProc = false;
         };
       };
 

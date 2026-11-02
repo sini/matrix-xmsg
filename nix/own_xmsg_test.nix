@@ -680,5 +680,19 @@ pkgs.testers.nixosTest {
         "grep -F 'xb1_f3_passed_after_spoof_refused' /tmp/matrix_replies.jsonl",
         timeout=25,
     )
+
+    # -------------------------------------------------------------------------
+    # 11. XH2 — systemd-analyze security exposure check on matrix-xmsg-xmsg.service
+    #     Compare unhardened User=matrix-xmsg baseline (mock-guard.service) vs
+    #     tightened matrix-xmsg-xmsg.service and matrix-xmsg.service.
+    # -------------------------------------------------------------------------
+    unhardened_line = machine.succeed("systemd-analyze security --no-pager mock-guard.service | tail -n 1").strip()
+    xmsg_line = machine.succeed("systemd-analyze security --no-pager matrix-xmsg-xmsg.service | tail -n 1").strip()
+    bot_line = machine.succeed("systemd-analyze security --no-pager matrix-xmsg.service | tail -n 1").strip()
+    print(f"[XH2 exposure] unhardened baseline (mock-guard.service): {unhardened_line}")
+    print(f"[XH2 exposure] tightened matrix-xmsg-xmsg.service: {xmsg_line}")
+    print(f"[XH2 exposure] matrix-xmsg.service: {bot_line}")
+    xmsg_score = float(xmsg_line.split(":")[1].strip().split()[0])
+    assert xmsg_score <= 2.5, f"expected matrix-xmsg-xmsg.service exposure <= 2.5, got {xmsg_score} ({xmsg_line})"
   '';
 }

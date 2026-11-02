@@ -416,6 +416,43 @@ in
           ExecStart = "${lib.getExe xmsgCfg.package} ${lib.escapeShellArgs xmsgArgs}";
           Restart = "on-failure";
           RestartSec = "2s";
+
+          # Hardening (mirroring matrix-xmsg.service, minus PrivateUsers and
+          # ProtectProc="invisible" because xmsg serve inspects peer PIDs across
+          # the node and shares user namespace with its local clients).
+          AmbientCapabilities = "";
+          CapabilityBoundingSet = "";
+          DevicePolicy = "closed";
+          LockPersonality = true;
+          MemoryDenyWriteExecute = true;
+          NoNewPrivileges = true;
+          PrivateDevices = true;
+          PrivateTmp = true;
+          PrivateUsers = false;
+          ProtectClock = true;
+          ProtectControlGroups = true;
+          ProtectHome = true;
+          ProtectHostname = true;
+          ProtectKernelLogs = true;
+          ProtectKernelModules = true;
+          ProtectKernelTunables = true;
+          ProtectSystem = "strict";
+          RemoveIPC = true;
+          RestrictAddressFamilies = [
+            "AF_INET"
+            "AF_INET6"
+            "AF_UNIX"
+          ];
+          RestrictNamespaces = true;
+          RestrictRealtime = true;
+          RestrictSUIDSGID = true;
+          SystemCallArchitectures = "native";
+          SystemCallFilter = [
+            "@system-service"
+            "~@privileged"
+            "~@resources"
+          ];
+          UMask = "0027";
         };
       };
     };
