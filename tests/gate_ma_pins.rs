@@ -3,8 +3,8 @@
 //! keys its guard requests by a message ID no other test issues.
 
 use matrix_xmsg::xmsg::{
-    register_svc, route_guard_reply, GuardClient, GuardContent, GuardEnvelope, SvcInbox,
-    UnixGuardClient,
+    register_svc, route_guard_reply, GuardClient, GuardContent, GuardEnvelope, SvcDelivery,
+    SvcInbox, UnixGuardClient,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -106,8 +106,26 @@ async fn a_verdict_reaches_only_the_check_it_answers() {
     while counter.load(Ordering::SeqCst) < N {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    fn guard_delivery(in_reply_to: &str, text: &str) -> SvcDelivery {
+        SvcDelivery {
+            in_reply_to: Some(in_reply_to.to_string()),
+            ..SvcDelivery::new(
+                "01MAPINSVERDICT",
+                "genie-guard@sini.test",
+                text,
+                "",
+                Some(json!({ "service": "genie-guard", "node": "sini.test" })),
+            )
+        }
+    }
+
     assert!(
-        !route_guard_reply("01MAPINS5STRAY", r#"{"verdict":"allow"}"#).await,
+        !route_guard_reply(
+            "01MAPINS5STRAY",
+            &guard_delivery("01MAPINS5STRAY", r#"{"verdict":"allow"}"#),
+            "genie-guard",
+        )
+        .await,
         "a reply to no guard request was taken as a verdict"
     );
 
@@ -122,7 +140,8 @@ async fn a_verdict_reaches_only_the_check_it_answers() {
             "cleaned_text": ""
         })
         .to_string();
-        while !route_guard_reply(&id, &verdict).await {
+        let del = guard_delivery(&id, &verdict);
+        while !route_guard_reply(&id, &del, "genie-guard").await {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -149,8 +168,18 @@ async fn a_timed_out_check_evicts_its_entry() {
         .await
         .expect_err("no verdict must time out");
     assert!(err.to_string().contains("timed out"), "{err}");
+    let late_del = SvcDelivery {
+        in_reply_to: Some("01MAPINS1LATE".to_string()),
+        ..SvcDelivery::new(
+            "01MAPINS1VERDICT",
+            "genie-guard@sini.test",
+            r#"{"verdict":"allow"}"#,
+            "",
+            Some(json!({ "service": "genie-guard", "node": "sini.test" })),
+        )
+    };
     assert!(
-        !route_guard_reply("01MAPINS1LATE", r#"{"verdict":"allow"}"#).await,
+        !route_guard_reply("01MAPINS1LATE", &late_del, "genie-guard").await,
         "the timed-out check's entry is still pending"
     );
 }

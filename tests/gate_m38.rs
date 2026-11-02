@@ -453,7 +453,7 @@ async fn oracle_2_unacked_head_delivery_deadlocks_awaiting_second_delivery_witho
                     if let Ok(Some(d)) = res {
                         if d.message_id != "01M38CTX_REQ_02" {
                             if let Some(ref reply_to) = d.in_reply_to {
-                                if route_guard_reply(reply_to, &d.text).await {
+                                if route_guard_reply(reply_to, &d, "genie-guard").await {
                                     let _ = second_poller.ack(&d.message_id).await;
                                     break;
                                 }

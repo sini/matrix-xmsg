@@ -1015,12 +1015,11 @@ pub async fn handle_incoming_event_with_guard(
             }
         };
 
-        let relay_session = session_id.clone().or_else(|| {
-            store
-                .get_forward_session(&solicited.request_message_id)
-                .ok()
-                .flatten()
-        });
+        let relay_session = store
+            .get_forward_session(&solicited.request_message_id)
+            .ok()
+            .flatten()
+            .or(session_id.clone());
 
         // Advance cursor
         store.set_thread_cursor(
@@ -1808,7 +1807,11 @@ fn caller_matches_bound(delivery: &SvcDelivery, bound: &str) -> bool {
     }
     if delivery.origin.is_none() {
         let caller_from = crate::xmsg::sender_address(delivery.from_name.trim());
-        return !caller_from.is_empty() && caller_from == bound_addr;
+        if bound_addr.contains('@') {
+            return !caller_from.is_empty() && caller_from == bound_addr;
+        }
+        let caller_id = crate::xmsg::sender_id(delivery.from_name.trim());
+        return !caller_id.is_empty() && (caller_id == bound_addr || caller_from == bound_addr);
     }
     false
 }
@@ -1834,13 +1837,7 @@ fn is_caller_bound_to_forward(
         return Ok(caller_matches_bound(delivery, fs));
     }
 
-    if let Some(ref orig) = delivery.origin {
-        let label = orig.get("label").and_then(|v| v.as_str());
-        let id = orig.get("id").and_then(|v| v.as_str());
-        let target_ref = cursor.as_ref().and_then(|c| c.target_ref.as_deref());
-        if label.is_some() && label == target_ref && id == Some("session-1") {
-            return Ok(true);
-        }
+    if delivery.origin.is_some() {
         return Ok(false);
     }
     Ok(!delivery.from_name.trim().is_empty())
@@ -2925,7 +2922,21 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
     };
 
     let next_call_json = if slice.end_offset < slice.total_bytes {
-        let mut next_ctx = ctx_obj.clone();
+        const ALLOWED_CONTEXT_KEYS: &[&str] =
+            &["scope", "limit", "before", "sender", "event", "thread"];
+        let mut next_ctx = serde_json::Map::new();
+        for &key in ALLOWED_CONTEXT_KEYS {
+            if let Some(val) = ctx_obj.get(key) {
+                if let Some(s) = val.as_str() {
+                    next_ctx.insert(
+                        key.to_string(),
+                        serde_json::Value::String(crate::context::sanitize_context_field(s)),
+                    );
+                } else {
+                    next_ctx.insert(key.to_string(), val.clone());
+                }
+            }
+        }
         next_ctx.insert(
             "offset".to_string(),
             serde_json::Value::Number(serde_json::Number::from(slice.end_offset)),
@@ -2993,7 +3004,7 @@ pub async fn handle_inbox_delivery_with_guard<I: SvcInbox + ?Sized>(
     // A pushed reply to a guard request is that request's verdict (AM-3): the guard check
     // waiting on it consumes it, and it never reaches the expert path below.
     if let Some(ref in_reply_to) = delivery.in_reply_to {
-        if route_guard_reply(in_reply_to, &delivery.text).await {
+        if route_guard_reply(in_reply_to, delivery, &config.guard_ref).await {
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::GuardVerdictRouted);
         }
@@ -3107,6 +3118,18 @@ pub async fn handle_inbox_delivery_with_guard<I: SvcInbox + ?Sized>(
             return Ok(BotOutcome::IgnoredUnknownMessage);
         }
     };
+
+    if !is_caller_bound_to_forward(delivery, &forward, store)? {
+        tracing::warn!(
+            "Delivery {} from unbound origin {:?} (from_name={}) refused for forward {}, acking and ignoring",
+            delivery.message_id,
+            delivery.origin,
+            delivery.from_name,
+            orig_id
+        );
+        inbox.ack(&delivery.message_id).await?;
+        return Ok(BotOutcome::IgnoredUnknownMessage);
+    }
 
     let (text_to_format, envelope_is_approval, envelope_is_escalate): (String, bool, bool) =
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(delivery.text.trim()) {
@@ -3465,7 +3488,7 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                             .as_deref()
                             .or_else(|| parse_in_reply_to_id(&delivery.envelope));
                         if let Some(in_reply_to) = reply_to_candidate {
-                            if route_guard_reply(in_reply_to, &delivery.text).await {
+                            if route_guard_reply(in_reply_to, &delivery, &config.guard_ref).await {
                                 if let Err(e) = inbox.ack(&delivery.message_id).await {
                                     tracing::warn!(
                                         "Failed to ack guard verdict {}: {e}",
@@ -4149,6 +4172,11 @@ async fn process_queued_sync_event(
     } else {
         false
     };
+    let is_solicited_thread = if let Some(ref root) = incoming.thread_root_id {
+        store.get_solicited_thread(root).ok().flatten().is_some()
+    } else {
+        false
+    };
     if !is_thread_escalate
         && !is_thread_deeper
         && !is_thread_trust
@@ -4156,6 +4184,7 @@ async fn process_queued_sync_event(
         && !is_mentioned
         && !is_reply_to_bot
         && !is_engaged_thread
+        && !is_solicited_thread
     {
         return;
     }
@@ -4181,6 +4210,7 @@ async fn process_queued_sync_event(
             is_trusted
                 || is_top_level
                 || is_promoted_thread
+                || is_solicited_thread
                 || incoming.replaces_event_id.is_some()
                 || incoming
                     .thread_root_id

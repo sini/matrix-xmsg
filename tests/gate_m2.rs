@@ -60,7 +60,10 @@ impl XmsgClient for TestXmsgMock {
         let mut list = self.sent_payloads.lock().unwrap();
         list.push((expert_ref.to_string(), from.to_string(), text.to_string()));
         let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(format!("01MOCKMSG{id_num:06}").into())
+        Ok(SendResponse::new(
+            format!("01MOCKMSG{id_num:06}"),
+            Some(expert_ref.to_string()),
+        ))
     }
 }
 

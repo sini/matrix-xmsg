@@ -207,6 +207,9 @@ fn record_forward(store: &Store, fwd_id: &str, room_id: &str, root_id: &str) {
             reply_count: 0,
         })
         .unwrap();
+    store
+        .set_forward_session(fwd_id, Some("author-id-1@sini.cortex"))
+        .unwrap();
 }
 
 // =============================================================================

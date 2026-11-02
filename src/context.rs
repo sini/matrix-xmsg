@@ -94,11 +94,28 @@ pub fn compute_sender_tier(
     }
 }
 
-/// Escapes XML block tags (<request>, </request>, <context, </context>) inside user message content
-/// to prevent XML sandbox breakouts into the outer envelope structure.
-pub fn escape_xml_blocks(text: &str) -> String {
+/// Collapses control characters and Unicode line separators (U+2028, U+2029, U+0085) to spaces
+/// and escapes XML block tags (<request>, </request>, <context, </context>) in a single pass.
+pub fn sanitize_context_field(text: &str) -> String {
+    let collapsed: String = text
+        .chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' || c == '\u{0085}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
     let re = Regex::new(r"(?i)<(/?(?:request|context))").expect("valid regex");
-    re.replace_all(text, r"<\$1").to_string()
+    re.replace_all(&collapsed, r"<\$1").to_string()
+}
+
+/// Escapes XML block tags (<request>, </request>, <context, </context>) and collapses line
+/// separators inside user message content to prevent XML sandbox breakouts into the outer
+/// envelope structure.
+pub fn escape_xml_blocks(text: &str) -> String {
+    sanitize_context_field(text)
 }
 
 /// Formats millisecond timestamp as [HH:MM] in UTC.
@@ -133,32 +150,21 @@ pub fn format_context_line_with_screening(
 ) -> String {
     if msg.is_undecryptable() {
         return serde_json::to_string(&UndecryptablePlaceholderLine {
-            event_id: msg.event_id.clone(),
-            sender: msg.sender_mxid.clone(),
+            event_id: sanitize_context_field(&msg.event_id),
+            sender: sanitize_context_field(&msg.sender_mxid),
             ts: format_iso_timestamp(msg.timestamp_ms),
-            thread_root: msg.thread_root_id.clone(),
+            thread_root: msg.thread_root_id.as_deref().map(sanitize_context_field),
             undecryptable: true,
         })
         .unwrap_or_default();
     }
-    let sender_name = map_sender_mxid(&msg.sender_mxid);
+    let sender_name = sanitize_context_field(&map_sender_mxid(&msg.sender_mxid));
+    let sender_id = sanitize_context_field(&msg.sender_mxid);
     let trust_tag = compute_sender_tier(&msg.sender_mxid, trusted_mxids, owner_mxid);
-    // F5 & N5: Collapse newlines, Unicode separators (U+2028, U+2029, U+0085), and control chars
-    let collapsed_body: String = msg
-        .body
-        .chars()
-        .map(|c| {
-            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' || c == '\u{0085}' {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    let escaped_text = escape_xml_blocks(&collapsed_body);
+    let escaped_text = sanitize_context_field(&msg.body);
     serde_json::to_string(&RelayedLine {
         sender: sender_name,
-        sender_id: msg.sender_mxid.clone(),
+        sender_id,
         tier: trust_tag.to_string(),
         addressed: None,
         rewritten,
@@ -749,9 +755,12 @@ fn render_selected_envelope_with_withholding(
     fail_open_warning: bool,
     history_withheld: bool,
 ) -> String {
-    let mapped_sender = map_sender_mxid(&trigger.sender_mxid);
+    let mapped_sender = sanitize_context_field(&map_sender_mxid(&trigger.sender_mxid));
+    let trigger_sender_id = sanitize_context_field(&trigger.sender_mxid);
     let trigger_tier = compute_sender_tier(&trigger.sender_mxid, trusted_mxids, owner_mxid);
-    let escaped_trigger_body = escape_xml_blocks(&trigger.body);
+    let escaped_trigger_body = sanitize_context_field(&trigger.body);
+    let safe_room = sanitize_context_field(room_id_or_alias);
+    let safe_thread = sanitize_context_field(thread_root_id);
 
     let screened_opt = if unscreened { Some(false) } else { None };
     let unscreened_note = if fail_open_warning {
@@ -784,7 +793,7 @@ fn render_selected_envelope_with_withholding(
 
     let request_line = serde_json::to_string(&RelayedLine {
         sender: mapped_sender.clone(),
-        sender_id: trigger.sender_mxid.clone(),
+        sender_id: trigger_sender_id,
         tier: trigger_tier.to_string(),
         addressed: Some(addressed),
         rewritten: if rewritten { Some(true) } else { None },
@@ -869,7 +878,7 @@ fn render_selected_envelope_with_withholding(
     };
 
     format!(
-        "[matrix] room={room_id_or_alias} thread={thread_root_id} user={mapped_sender} ({trigger_tier})\n\n\
+        "[matrix] room={safe_room} thread={safe_thread} user={mapped_sender} ({trigger_tier})\n\n\
         {request_open_tag}\n\
         {request_line}\n\
         </request>\n\n\
@@ -1012,8 +1021,11 @@ pub fn format_paged_resync_lines(
         "\n[end of thread]".to_string()
     };
 
+    let safe_room = sanitize_context_field(room_id_or_alias);
+    let safe_thread = sanitize_context_field(thread_root_id);
+
     format!(
-        "[matrix] room={room_id_or_alias} thread={thread_root_id}\n\n\
+        "[matrix] room={safe_room} thread={safe_thread}\n\n\
         <context kind=\"thread\" role=\"thread\" context=\"bootstrap\"{truncated_attr}{screened_attr} note=\"{note}\">\n\
         {thread_body}\n\
         </context>{footer}"
@@ -1070,8 +1082,11 @@ pub fn format_paged_context_lines(
         String::new()
     };
 
+    let safe_room = sanitize_context_field(room_id_or_alias);
+    let safe_thread = sanitize_context_field(thread_root_id);
+
     format!(
-        "[matrix] room={room_id_or_alias} thread={thread_root_id}\n\n\
+        "[matrix] room={safe_room} thread={safe_thread}\n\n\
         <context kind=\"{kind}\" role=\"{role}\" context=\"bootstrap\"{truncated_attr}{screened_attr} note=\"{note}\">\n\
         {body}\n\
         </context>{footer}"
@@ -1152,8 +1167,11 @@ pub fn assemble_resync_lines(
         </context>"
     );
 
+    let safe_room = sanitize_context_field(room_id_or_alias);
+    let safe_thread = sanitize_context_field(thread_root_id);
+
     format!(
-        "[matrix] room={room_id_or_alias} thread={thread_root_id}{trunc_header}\n\n\
+        "[matrix] room={safe_room} thread={safe_thread}{trunc_header}\n\n\
         {block}"
     )
 }

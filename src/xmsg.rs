@@ -931,28 +931,125 @@ impl GuardClient for MockGuardClient {
     }
 }
 
+struct GuardPendingEntry {
+    guard_ref: String,
+    resolved_address: Option<String>,
+    tx: tokio::sync::oneshot::Sender<String>,
+}
+
 /// Guard requests awaiting their verdict, keyed by the guard request's message ID (AM-3, plan
 /// §6 D6). The verdict arrives pushed into the bot's service inbox, and the inbox loop hands it
 /// here by its `inReplyTo` (`route_guard_reply`); it never reaches the expert path.
 ///
 /// One process-wide map. A check that times out evicts its entry: a verdict arriving after that
 /// matches no entry and no forward, so the inbox loop ignores it and never posts it.
-type GuardPending = tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>;
+type GuardPending = tokio::sync::Mutex<HashMap<String, GuardPendingEntry>>;
 
 fn guard_pending() -> &'static GuardPending {
     static PENDING: OnceLock<GuardPending> = OnceLock::new();
     PENDING.get_or_init(Default::default)
 }
 
-/// Hands a pushed reply to the guard check waiting on `in_reply_to`. Returns `true` when
-/// `in_reply_to` is a guard request this process sent: the delivery is a verdict, consumed here.
-pub async fn route_guard_reply(in_reply_to: &str, text: &str) -> bool {
-    match guard_pending().lock().await.remove(in_reply_to) {
-        Some(tx) => {
-            let _ = tx.send(text.to_string());
-            true
+fn delivery_origin_session_id(delivery: &SvcDelivery) -> Option<String> {
+    if let Some(ref orig) = delivery.origin {
+        if let Some(id) = orig
+            .get("service")
+            .or_else(|| orig.get("id"))
+            .and_then(|v| v.as_str())
+        {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() {
+                if let Some(sub) = orig
+                    .get("sub")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(format!("{trimmed}~{sub}"));
+                }
+                return Some(trimmed.to_string());
+            }
         }
-        None => false,
+    }
+    None
+}
+
+fn delivery_origin_author_key(delivery: &SvcDelivery) -> Option<String> {
+    if let Some(id) = delivery_origin_session_id(delivery) {
+        if let Some(node) = delivery
+            .origin
+            .as_ref()
+            .and_then(|o| o.get("node"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            return Some(format!("{id}@{node}"));
+        }
+        return Some(id);
+    }
+    None
+}
+
+fn delivery_matches_ref(delivery: &SvcDelivery, expected_ref: &str) -> bool {
+    let bound_addr = sender_address(expected_ref.trim());
+    if bound_addr.is_empty() {
+        return false;
+    }
+    if let Some(caller_key) = delivery_origin_author_key(delivery) {
+        if bound_addr.contains('@') {
+            return caller_key == bound_addr;
+        }
+        if let Some(caller_id) = delivery_origin_session_id(delivery) {
+            return caller_id == bound_addr || caller_key == bound_addr;
+        }
+        return false;
+    }
+    if delivery.origin.is_none() {
+        let caller_from = sender_address(delivery.from_name.trim());
+        let caller_id = sender_id(delivery.from_name.trim());
+        if bound_addr.contains('@') {
+            return !caller_from.is_empty() && caller_from == bound_addr;
+        }
+        return !caller_from.is_empty() && (caller_from == bound_addr || caller_id == bound_addr);
+    }
+    false
+}
+
+/// Hands a pushed reply to the guard check waiting on `in_reply_to`, verifying first that
+/// `delivery.origin` matches `guard_ref` (and the resolved guard address when known) before
+/// removing or resolving the pending channel.
+pub async fn route_guard_reply(in_reply_to: &str, delivery: &SvcDelivery, guard_ref: &str) -> bool {
+    let mut pending = guard_pending().lock().await;
+    let Some(entry) = pending.get(in_reply_to) else {
+        return false;
+    };
+    let expected_ref = if !guard_ref.trim().is_empty() {
+        guard_ref
+    } else {
+        entry.guard_ref.as_str()
+    };
+    let matches_ref = delivery_matches_ref(delivery, expected_ref);
+    let matches_resolved = entry
+        .resolved_address
+        .as_deref()
+        .is_none_or(|addr| delivery_matches_ref(delivery, addr));
+    if !matches_ref || !matches_resolved {
+        tracing::warn!(
+            "Guard reply {} for request {} refused from unauthorized origin {:?} (from_name={}, expected={})",
+            delivery.message_id,
+            in_reply_to,
+            delivery.origin,
+            delivery.from_name,
+            expected_ref
+        );
+        return false;
+    }
+    if let Some(entry) = pending.remove(in_reply_to) {
+        let _ = entry.tx.send(delivery.text.clone());
+        true
+    } else {
+        false
     }
 }
 
@@ -1092,7 +1189,14 @@ impl GuardClient for UnixGuardClient {
                 .and_then(|r| r)
                 .inspect_err(|e| tracing::error!("Guard route {guard_ref} refused: {e}"))?;
             let (tx, rx) = tokio::sync::oneshot::channel();
-            pending.insert(sent.message_id.clone(), tx);
+            pending.insert(
+                sent.message_id.clone(),
+                GuardPendingEntry {
+                    guard_ref: guard_ref.to_string(),
+                    resolved_address: sent.session_id.clone(),
+                    tx,
+                },
+            );
             (sent.message_id, rx)
         };
 
