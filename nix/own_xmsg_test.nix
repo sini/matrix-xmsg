@@ -394,7 +394,19 @@ pkgs.testers.nixosTest {
           Type = "simple";
           User = "matrix-xmsg";
           Group = "matrix-xmsg";
-          ExecStartPre = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do ${pkgs.python3}/bin/python3 -c \"import socket; s=socket.socket(socket.AF_UNIX); s.connect(\\\"/run/matrix-xmsg-xmsg/xmsg/register.sock\\\"); s.close()\" 2>/dev/null && exit 0; sleep 0.1; done; exit 1'";
+          ExecStartPre = "${pkgs.writeScript "wait-for-register-sock" ''
+            #!${pkgs.python3}/bin/python3
+            import socket, sys, time
+            for _ in range(50):
+                try:
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.connect("/run/matrix-xmsg-xmsg/xmsg/register.sock")
+                    s.close()
+                    sys.exit(0)
+                except OSError:
+                    time.sleep(0.1)
+            sys.exit(1)
+          ''}";
           ExecStart = "${mockGuard}/bin/mock-guard";
           ExecStartPost = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do [ -f /run/matrix-xmsg-xmsg/genie-guard.ready ] && exit 0; sleep 0.1; done; exit 1'";
           Restart = "on-failure";
@@ -412,7 +424,19 @@ pkgs.testers.nixosTest {
           Type = "simple";
           User = "matrix-xmsg";
           Group = "matrix-xmsg";
-          ExecStartPre = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do ${pkgs.python3}/bin/python3 -c \"import socket; s=socket.socket(socket.AF_UNIX); s.connect(\\\"/run/matrix-xmsg-xmsg/xmsg/register.sock\\\"); s.close()\" 2>/dev/null && exit 0; sleep 0.1; done; exit 1'";
+          ExecStartPre = "${pkgs.writeScript "wait-for-register-sock" ''
+            #!${pkgs.python3}/bin/python3
+            import socket, sys, time
+            for _ in range(50):
+                try:
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.connect("/run/matrix-xmsg-xmsg/xmsg/register.sock")
+                    s.close()
+                    sys.exit(0)
+                except OSError:
+                    time.sleep(0.1)
+            sys.exit(1)
+          ''}";
           ExecStart = "${mockExpert}/bin/mock-expert";
           ExecStartPost = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 50); do [ -f /run/matrix-xmsg-xmsg/claude.ready ] && exit 0; sleep 0.1; done; exit 1'";
           Restart = "on-failure";
