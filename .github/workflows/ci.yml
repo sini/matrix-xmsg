@@ -15,11 +15,14 @@ env:
     mdformat-plugins
     root-surface
     treefmt-tree-root
+    xmsg-pins
   PACKAGE_CHECKS: >-
     image
     package
+    shared-client
   INTEGRATION_CHECKS: >-
     integration
+    integration-legacy
     peers-check
   VM_CHECKS: >-
     hm-user-service

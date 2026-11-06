@@ -708,7 +708,8 @@
         "gen-harness": "gen-harness",
         "home-manager": "home-manager",
         "nixpkgs": "nixpkgs_6",
-        "xmsg": "xmsg"
+        "xmsg": "xmsg",
+        "xmsg-legacy": "xmsg-legacy"
       }
     },
     "treefmt-nix": {
@@ -755,6 +756,30 @@
       }
     },
     "xmsg": {
+      "inputs": {
+        "crane": [
+          "crane"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793944941,
+        "narHash": "sha256-H0lQxXVjSGOhWniZEtvq2mEtAdl3NjJQMp24Bb0w3pc=",
+        "owner": "sini",
+        "repo": "xmsg",
+        "rev": "0d9ee145f7875aa4b930b4efd41615bdcfd1f806",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sini",
+        "repo": "xmsg",
+        "rev": "0d9ee145f7875aa4b930b4efd41615bdcfd1f806",
+        "type": "github"
+      }
+    },
+    "xmsg-legacy": {
       "inputs": {
         "crane": [
           "crane"
