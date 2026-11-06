@@ -49,5 +49,5 @@ have independent negative controls.
 `scripts/shared_client_mutants.py` exercises seven single-site source changes.
 Each case requires a passing baseline and a failure in the named test after the
 edit. Compilation failures and timeouts do not count as mutant kills. Mutation
-results are green locally and in the Nix sandbox (seven of seven in each). The
-final complete CI run remains pending.
+results are green locally and in the Nix sandbox (seven of seven in each). Run
+the complete CI suite before landing.
