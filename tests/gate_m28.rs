@@ -84,16 +84,20 @@ impl XmsgClient for MockXmsg {
         ))
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let idx = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(SendResponse::new(
-            format!("01M28REPLY{idx:06}"),
-            Some("sess:reply".to_string()),
-        ))
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let idx = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(SendResponse::new(
+                format!("01M28REPLY{idx:06}"),
+                Some("sess:reply".to_string()),
+            ))
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -463,3 +467,7 @@ fn test_oracle4_missing_xmsg_socket_and_xdg_runtime_dir_fails_naming_both() {
         "Error must name both `xmsg_socket` and `XDG_RUNTIME_DIR`, got: {err}"
     );
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

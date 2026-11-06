@@ -101,30 +101,36 @@ impl XmsgClient for RecordingXmsg {
             .pop_front()
             .unwrap_or_else(|| Some(format!("{to}@sini.bitstream")));
         Ok(SendResponse {
+            outcome: None,
             message_id: id,
             session_id,
         })
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        let mut c = self.counter.lock().unwrap();
-        *c += 1;
-        let id = format!("01M30REP{:06}", *c);
-        drop(c);
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let session_id = self
-            .sessions
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| Some("reply@sini.bitstream".to_string()));
-        Ok(SendResponse {
-            message_id: id,
-            session_id,
-        })
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            let mut c = self.counter.lock().unwrap();
+            *c += 1;
+            let id = format!("01M30REP{:06}", *c);
+            drop(c);
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let session_id = self
+                .sessions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Some("reply@sini.bitstream".to_string()));
+            Ok(SendResponse {
+                outcome: None,
+                message_id: id,
+                session_id,
+            })
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -986,3 +992,7 @@ async fn oracle_3_parameterized_on_off_forward_fidelity_and_zero_guard_calls() {
         );
     }
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

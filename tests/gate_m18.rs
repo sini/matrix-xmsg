@@ -92,7 +92,12 @@ impl MockXmsgSockets {
         mock
     }
 
-    pub async fn queue_delivery(&self, delivery: Value) {
+    pub async fn queue_delivery(&self, mut delivery: Value) {
+        delivery
+            .as_object_mut()
+            .unwrap()
+            .entry("origin")
+            .or_insert_with(|| serde_json::json!({"service":"claude", "node":"sini.test"}));
         self.inbox.push_json_frame(&delivery);
     }
 
@@ -270,7 +275,6 @@ async fn oracle_1_mock_server_drops_connection_and_bot_reregisters() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockXmsgSockets::start(tmp.path()).await;
     let config = Arc::new(test_config(tmp.path()));
-    let xmsg = create_xmsg_client(&config);
     let matrix = Arc::new(MockMatrixClient::default());
     let store = Arc::new(Store::new_in_memory().unwrap());
 
@@ -290,8 +294,12 @@ async fn oracle_1_mock_server_drops_connection_and_bot_reregisters() {
         })
         .unwrap();
 
-    let inbox = ReconnectingSvcInbox::new(config.xmsg_register_socket(), "matrix-xmsg")
-        .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+    let inbox = ReconnectingSvcInbox::new(transport_fixture::options(
+        config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+    let xmsg = create_xmsg_client(&inbox);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
@@ -446,7 +454,6 @@ async fn oracle_2_unacked_delivery_before_drop_is_redelivered_and_posted_once() 
     let tmp = tempfile::tempdir().unwrap();
     let server = Arc::new(MockXmsgSockets::start(tmp.path()).await);
     let config = Arc::new(test_config(tmp.path()));
-    let xmsg = create_xmsg_client(&config);
     let matrix = Arc::new(DroppingMatrixClient {
         inner: MockMatrixClient::default(),
         server_to_drop: server.clone(),
@@ -471,8 +478,12 @@ async fn oracle_2_unacked_delivery_before_drop_is_redelivered_and_posted_once() 
         })
         .unwrap();
 
-    let inbox = ReconnectingSvcInbox::new(config.xmsg_register_socket(), "matrix-xmsg")
-        .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+    let inbox = ReconnectingSvcInbox::new(transport_fixture::options(
+        config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+    let xmsg = create_xmsg_client(&inbox);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
@@ -564,7 +575,6 @@ async fn oracle_3_bot_keeps_running_while_server_is_down() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockXmsgSockets::start(tmp.path()).await;
     let config = Arc::new(test_config(tmp.path()));
-    let xmsg = create_xmsg_client(&config);
     let matrix = Arc::new(MockMatrixClient::default());
     let store = Arc::new(Store::new_in_memory().unwrap());
 
@@ -584,8 +594,12 @@ async fn oracle_3_bot_keeps_running_while_server_is_down() {
         })
         .unwrap();
 
-    let inbox = ReconnectingSvcInbox::new(config.xmsg_register_socket(), "matrix-xmsg")
-        .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+    let inbox = ReconnectingSvcInbox::new(transport_fixture::options(
+        config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+    let xmsg = create_xmsg_client(&inbox);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
@@ -661,3 +675,6 @@ async fn oracle_3_bot_keeps_running_while_server_is_down() {
     let _ = shutdown_tx.send(());
     let _ = loop_handle.await;
 }
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

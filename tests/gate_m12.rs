@@ -34,11 +34,15 @@ impl XmsgClient for TestXmsgMock {
         Ok(format!("01MOCKMSG{id_num:06}").into())
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        let mut list = self.reply_payloads.lock().unwrap();
-        list.push((message_id.to_string(), text.to_string()));
-        let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(format!("01MOCKREPLY{id_num:06}").into())
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            let mut list = self.reply_payloads.lock().unwrap();
+            list.push((message_id.to_string(), text.to_string()));
+            let id_num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(format!("01MOCKREPLY{id_num:06}").into())
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -675,3 +679,7 @@ fn oracle_is_approval_delivery_rejects_plain_text_and_requires_structured_marker
         r#"{"approval": true}"#
     ));
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

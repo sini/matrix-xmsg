@@ -136,16 +136,20 @@ impl XmsgClient for LateAccept {
     ) -> Result<SendResponse, AppError> {
         self.send(text, Some(key)).await
     }
-    async fn reply_message(&self, _: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.send(text, None).await
+    async fn reply_message(&self, _: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async { self.send(text, None).await }
+            .await
+            .map(replies::pushed)
     }
     async fn reply_message_keyed(
         &self,
         _: &str,
         text: &str,
         key: &str,
-    ) -> Result<SendResponse, AppError> {
-        self.send(text, Some(key)).await
+    ) -> Result<ReplyOutcome, AppError> {
+        async { self.send(text, Some(key)).await }
+            .await
+            .map(replies::pushed)
     }
 }
 
@@ -448,35 +452,50 @@ async fn agent_sock_answering(
 // either frame => RED; read the empty address as a session => RED.
 #[tokio::test]
 async fn keyed_frames_carry_the_key_and_read_pending() {
-    use matrix_xmsg::xmsg::UnixXmsgClient;
     let tmp = tempfile::tempdir().unwrap();
     let frames = agent_sock_answering(
         tmp.path(),
         serde_json::json!({
             "status": "ok", "message_id": "01FIRST", "address": "", "outcome": "pending",
-            "reply": {"seq": 0, "pushOutcome": "pending", "pushedMessageId": "01FIRSTREPLY"},
+            "reply": {"seq": 0, "messageId":"01REQ", "createdAt":1, "replierSessionId":"matrix-xmsg", "text":"hi", "pushOutcome": "pending", "pushedMessageId": "01FIRSTREPLY"},
         }),
     )
     .await;
-    let client = UnixXmsgClient::new(tmp.path().join("agent.sock"));
+    let registration = transport_fixture::register_for_agent(tmp.path().join("agent.sock")).await;
+    let client = registration.client();
 
     let sent = client
         .send_message_keyed("claude", "matrix_alice", "hi", "k-send")
         .await
         .unwrap();
-    assert_eq!(sent, SendResponse::new("01FIRST", None));
+    assert_eq!(sent.message_id, "01FIRST");
+    assert_eq!(sent.session_id, None);
+    assert_eq!(sent.outcome.as_deref(), Some("pending"));
     let replied = client
         .reply_message_keyed("01REQ", "hi", "k-reply")
         .await
         .unwrap();
-    assert_eq!(replied.message_id, "01FIRSTREPLY");
+    match replied {
+        ReplyOutcome::Pushed { response, record } => {
+            assert_eq!(response.message_id, "01FIRSTREPLY");
+            assert_eq!(record.push_outcome.as_deref(), Some("pending"));
+        }
+        ReplyOutcome::Stored { .. } => panic!("pending receipt carries its reserved identity"),
+    }
 
     let frames = frames.lock().unwrap().clone();
     assert_eq!(
         frames,
         vec![
-            serde_json::json!({"action": "send", "to": "claude", "text": "hi", "idempotency_key": "k-send"}),
-            serde_json::json!({"action": "reply", "message_id": "01REQ", "text": "hi", "idempotency_key": "k-reply"}),
+            serde_json::json!({"action": "send", "schema_version":2, "to": "claude", "text": "hi", "idempotency_key": "k-send"}),
+            serde_json::json!({"action": "reply", "schema_version":2, "message_id": "01REQ", "text": "hi", "idempotency_key": "k-reply"}),
         ]
     );
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

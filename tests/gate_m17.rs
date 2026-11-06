@@ -47,22 +47,28 @@ impl XmsgClient for MockResyncXmsgClient {
         let num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let sess = self.session_id.lock().unwrap().clone();
         Ok(SendResponse {
+            outcome: None,
             message_id: format!("01M17FWD{num:06}"),
             session_id: sess,
         })
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.sent_replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let sess = self.session_id.lock().unwrap().clone();
-        Ok(SendResponse {
-            message_id: format!("01M17REP{num:06}"),
-            session_id: sess,
-        })
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.sent_replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let sess = self.session_id.lock().unwrap().clone();
+            Ok(SendResponse {
+                outcome: None,
+                message_id: format!("01M17REP{num:06}"),
+                session_id: sess,
+            })
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -747,3 +753,7 @@ async fn test_resync_unknown_forward_message_responds_unknown() {
         vec!["01RESYNC_UNK".to_string()]
     );
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

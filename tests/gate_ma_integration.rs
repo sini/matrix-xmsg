@@ -440,6 +440,7 @@ struct Bot {
     config: Arc<Config>,
     store: Arc<Store>,
     matrix: Arc<MockMatrixClient>,
+    xmsg: Arc<dyn matrix_xmsg::xmsg::XmsgClient>,
     shutdown: tokio::sync::broadcast::Sender<()>,
     _db: TempDir,
 }
@@ -451,21 +452,26 @@ impl Bot {
         let store = Arc::new(Store::new(&config.db_path).unwrap());
         let matrix = Arc::new(MockMatrixClient::default());
         let (shutdown, rx) = tokio::sync::broadcast::channel(1);
-        let inbox = ReconnectingSvcInbox::new(config.xmsg_register_socket(), "matrix-xmsg")
-            .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+        let inbox = ReconnectingSvcInbox::new(transport_fixture::options(
+            config.xmsg_register_socket(),
+            "matrix-xmsg",
+        ))
+        .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+        let xmsg = create_xmsg_client(&inbox);
         let dyn_matrix: Arc<dyn MatrixClient> = matrix.clone();
         tokio::spawn(matrix_xmsg::bot::run_inbox_loop(
             inbox,
             config.clone(),
             dyn_matrix,
             store.clone(),
-            create_xmsg_client(&config),
+            xmsg.clone(),
             rx,
         ));
         let bot = Bot {
             config,
             store,
             matrix,
+            xmsg,
             shutdown,
             _db: db,
         };
@@ -579,8 +585,8 @@ async fn oracle_1_a_verdict_is_not_an_answer() {
         body: "untrusted thread line".to_string(),
         thread_root_id: Some(root.clone()),
     }];
-    let guard_client = UnixGuardClient::new(node.sock("agent.sock"), bot.config.guard_timeout_secs);
-    let xmsg = create_xmsg_client(&bot.config);
+    let guard_client = UnixGuardClient::new(bot.xmsg.as_ref(), bot.config.guard_timeout_secs);
+    let xmsg = bot.xmsg.clone();
     let outcome = handle_incoming_event_with_guard(
         &line,
         &untrusted_ctx,
@@ -768,10 +774,13 @@ async fn oracle_3_m16_rebootstraps_on_a_new_resolved_id() {
     config.screen_mentions = false;
     let store = Store::new(&config.db_path).unwrap();
     let matrix = MockMatrixClient::default();
-    let xmsg = create_xmsg_client(&config);
-    let registration = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
-        .await
-        .expect("register");
+    let registration = register_svc(transport_fixture::options(
+        &config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .await
+    .expect("register");
+    let xmsg = create_xmsg_client(&registration);
     let node_name = registration.node().expect("node");
     let x = SilentInstance::start();
     node.instance_file(x.sleeper.id(), ID_X, "expert", &x.sock);
@@ -888,7 +897,7 @@ async fn oracle_4_m24_reply_then_redact_by_returned_message_id() {
     expert.ready().await;
     node.instance_file(expert.pid(), ID_EXPERT, "expert", &expert_inbox);
 
-    let xmsg = create_xmsg_client(&bot.config);
+    let xmsg = bot.xmsg.clone();
     let outcome = handle_incoming_event(
         &mention("$ask_m24", None, "@genie show config", 3_000_000),
         &[],
@@ -1110,3 +1119,6 @@ mod child {
         }
     }
 }
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

@@ -35,15 +35,19 @@ impl XmsgClient for MockXmsgClient {
         ))
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        Ok(SendResponse::new(
-            "01MOCKREPLY00001",
-            Some("session-1".to_string()),
-        ))
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            Ok(SendResponse::new(
+                "01MOCKREPLY00001",
+                Some("session-1".to_string()),
+            ))
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -379,3 +383,7 @@ fn oracle_4_backlog_suppression_on_tokenless_sync_named_r5() {
         "test_r5_backlog_suppression_primary_token_guard"
     );
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

@@ -192,8 +192,10 @@ impl XmsgClient for InstantExpert {
         &self,
         _message_id: &str,
         _text: &str,
-    ) -> Result<SendResponse, AppError> {
-        self.answer_at_once("01RACERELAY00001".to_string()).await
+    ) -> Result<ReplyOutcome, AppError> {
+        async { self.answer_at_once("01RACERELAY00001".to_string()).await }
+            .await
+            .map(replies::pushed)
     }
 }
 
@@ -373,9 +375,13 @@ impl XmsgClient for SessionGone {
     async fn send_message(&self, _: &str, _: &str, _: &str) -> Result<SendResponse, AppError> {
         Err(AppError::Xmsg("unexpected send".to_string()))
     }
-    async fn reply_message(&self, _: &str, _: &str) -> Result<SendResponse, AppError> {
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        Err(AppError::Xmsg("session gone".to_string()))
+    async fn reply_message(&self, _: &str, _: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            Err(AppError::Xmsg("session gone".to_string()))
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -448,3 +454,7 @@ async fn a_failed_relay_dms_the_owner_without_the_gate() {
         "one owner DM"
     );
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

@@ -58,13 +58,17 @@ impl XmsgClient for RecordingXmsgClient {
         ))
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(SendResponse::new(format!("01M24BOTREPLY{n:04}"), None))
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(SendResponse::new(format!("01M24BOTREPLY{n:04}"), None))
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -1555,3 +1559,7 @@ async fn oracle_6d_requested_by_forwarded_to_different_agent_or_other_node_or_ed
     .unwrap();
     assert_eq!(out_other_svc, BotOutcome::RedactRefused);
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

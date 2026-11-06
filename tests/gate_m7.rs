@@ -4,7 +4,7 @@ use matrix_xmsg::bot::{
 use matrix_xmsg::config::{Admission, Config};
 use matrix_xmsg::matrix::MockMatrixClient;
 use matrix_xmsg::store::Store;
-use matrix_xmsg::xmsg::{create_xmsg_client, register_svc, MockSvcInbox, SvcInbox, UnixXmsgClient};
+use matrix_xmsg::xmsg::{create_xmsg_client, register_svc, MockSvcInbox, SvcInbox};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,6 +58,8 @@ impl MockXmsgSockets {
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
                                                     "message_id": "01M7MSGTEST0000000000000000",
+                                                    "address": "",
+                                                    "outcome": "pending",
                                                 });
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;
@@ -130,7 +132,12 @@ impl MockXmsgSockets {
         }
     }
 
-    pub async fn queue_delivery(&self, delivery: Value) {
+    pub async fn queue_delivery(&self, mut delivery: Value) {
+        delivery
+            .as_object_mut()
+            .unwrap()
+            .entry("origin")
+            .or_insert_with(|| serde_json::json!({"service":"claude", "node":"sini.test"}));
         self.inbox.push_json_frame(&delivery);
     }
 
@@ -208,7 +215,10 @@ async fn oracle_1_send_reaches_socket_stub() {
     let mut config = test_config();
     config.xmsg_socket = tmp.path().to_path_buf();
 
-    let client = create_xmsg_client(&config);
+    let xmsg_registration = register_svc(matrix_xmsg::xmsg::client_options(&config, "matrix-xmsg"))
+        .await
+        .unwrap();
+    let client = create_xmsg_client(&xmsg_registration);
     let resp = client
         .send_message("claude", "matrix_alice", "hello unix expert")
         .await
@@ -225,8 +235,8 @@ async fn oracle_1_send_reaches_socket_stub() {
     let req = &sends[0];
     assert_eq!(
         req,
-        &serde_json::json!({ "action": "send", "to": "claude", "text": "hello unix expert" }),
-        "the send frame is exactly {{action, to, text}}"
+        &serde_json::json!({ "action": "send", "schema_version":2, "to": "claude", "text": "hello unix expert" }),
+        "the restricted send frame names its schema and target"
     );
 }
 
@@ -243,7 +253,13 @@ async fn oracle_2_reply_delivered_via_svc_inbox_and_bot_posts_reply() {
     let mut config = test_config();
     config.xmsg_socket = tmp.path().to_path_buf();
 
-    let xmsg = create_xmsg_client(&config);
+    let mut inbox = register_svc(transport_fixture::options(
+        &config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .await
+    .expect("register_svc must succeed");
+    let xmsg = create_xmsg_client(&inbox);
     let matrix = MockMatrixClient::default();
     let store = Store::new_in_memory().unwrap();
 
@@ -280,9 +296,6 @@ async fn oracle_2_reply_delivered_via_svc_inbox_and_bot_posts_reply() {
         .await;
 
     // Connect to register.sock as svc:matrix-xmsg
-    let mut inbox = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
-        .await
-        .expect("register_svc must succeed");
 
     let delivery = inbox
         .poll(1)
@@ -512,10 +525,7 @@ fn oracle_4_unix_socket_paths_configured() {
         config.xmsg_agent_socket(),
         PathBuf::from("/run/user/1000/xmsg/agent.sock")
     );
-
-    let client = UnixXmsgClient::new(config.xmsg_agent_socket());
-    assert_eq!(
-        client.agent_sock_path(),
-        Path::new("/run/user/1000/xmsg/agent.sock")
-    );
 }
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

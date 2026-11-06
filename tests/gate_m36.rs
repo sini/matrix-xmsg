@@ -797,28 +797,34 @@ impl XmsgClient for RecordingXmsg {
             .pop_front()
             .unwrap_or_else(|| Some(format!("{to}@sini.bitstream")));
         Ok(SendResponse {
+            outcome: None,
             message_id: id,
             session_id,
         })
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        let id_num = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let id = format!("01M36REP{id_num:06}");
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let session_id = self
-            .sessions
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| Some("reply@sini.bitstream".to_string()));
-        Ok(SendResponse {
-            message_id: id,
-            session_id,
-        })
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            let id_num = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let id = format!("01M36REP{id_num:06}");
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let session_id = self
+                .sessions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Some("reply@sini.bitstream".to_string()));
+            Ok(SendResponse {
+                outcome: None,
+                message_id: id,
+                session_id,
+            })
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -2017,3 +2023,7 @@ async fn m36_cell_no_plaintext_fallback_in_encrypted_room() {
         "Zero events may be sent to an encrypted room when encryption is unavailable!"
     );
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

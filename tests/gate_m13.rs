@@ -68,6 +68,8 @@ impl MockXmsgSockets {
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
                                                     "message_id": msg_id,
+                                                    "address": "",
+                                                    "outcome": "pending",
                                                 });
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;
@@ -141,7 +143,12 @@ impl MockXmsgSockets {
         }
     }
 
-    pub async fn queue_delivery(&self, delivery: Value) {
+    pub async fn queue_delivery(&self, mut delivery: Value) {
+        delivery
+            .as_object_mut()
+            .unwrap()
+            .entry("origin")
+            .or_insert_with(|| serde_json::json!({"service":"claude", "node":"sini.test"}));
         self.inbox.push_json_frame(&delivery);
     }
 
@@ -287,7 +294,13 @@ async fn oracle_1_two_replies_to_one_forward_yield_two_posts_in_order() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockXmsgSockets::start(tmp.path()).await;
     let config = test_config(tmp.path());
-    let xmsg = create_xmsg_client(&config);
+    let mut inbox = register_svc(transport_fixture::options(
+        &config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .await
+    .expect("register_svc must succeed");
+    let xmsg = create_xmsg_client(&inbox);
     let matrix = MockMatrixClient::default();
     let store = Store::new_in_memory().unwrap();
 
@@ -313,10 +326,6 @@ async fn oracle_1_two_replies_to_one_forward_yield_two_posts_in_order() {
     let sends = server.recorded_sends.lock().await.clone();
     assert_eq!(sends.len(), 1);
     let fwd_msg_id = "01M13MSG0000000000000001";
-
-    let mut inbox = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
-        .await
-        .expect("register_svc must succeed");
 
     // Reply 1
     let delivery1 = serde_json::json!({
@@ -383,7 +392,13 @@ async fn oracle_2_reply_arriving_past_former_deadline_is_posted() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockXmsgSockets::start(tmp.path()).await;
     let config = test_config(tmp.path());
-    let xmsg = create_xmsg_client(&config);
+    let mut inbox = register_svc(transport_fixture::options(
+        &config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .await
+    .expect("register_svc must succeed");
+    let xmsg = create_xmsg_client(&inbox);
     let matrix = MockMatrixClient::default();
     let store = Store::new_in_memory().unwrap();
 
@@ -406,9 +421,6 @@ async fn oracle_2_reply_arriving_past_former_deadline_is_posted() {
         .expect("handle_incoming_event must succeed");
 
     let fwd_msg_id = "01M13MSG0000000000000001";
-    let mut inbox = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
-        .await
-        .expect("register_svc must succeed");
 
     // Clock advanced past 1 hour: t = 1000 + 4000 = 5000s
     let late_time_secs = 5000;
@@ -460,7 +472,13 @@ async fn oracle_3_reply_post_failure_not_acked_and_posted_on_redelivery() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockXmsgSockets::start(tmp.path()).await;
     let config = test_config(tmp.path());
-    let xmsg = create_xmsg_client(&config);
+    let mut inbox = register_svc(transport_fixture::options(
+        &config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .await
+    .expect("register_svc must succeed");
+    let xmsg = create_xmsg_client(&inbox);
     let matrix = FailingMatrixClient::new();
     let store = Store::new_in_memory().unwrap();
 
@@ -483,9 +501,6 @@ async fn oracle_3_reply_post_failure_not_acked_and_posted_on_redelivery() {
         .expect("handle_incoming_event must succeed");
 
     let fwd_msg_id = "01M13MSG0000000000000001";
-    let mut inbox = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
-        .await
-        .expect("register_svc must succeed");
 
     let delivery_json = serde_json::json!({
         "status": "ok",
@@ -516,9 +531,12 @@ async fn oracle_3_reply_post_failure_not_acked_and_posted_on_redelivery() {
     // Attempt 2: Re-delivery on reconnect succeeds (without re-queuing: the unacked delivery
     // remains in MockSvcInbox's queue and is redelivered on reconnect as in real xmsg at cca3de7)
     matrix.fail_notice.store(false, Ordering::SeqCst);
-    let mut inbox = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
-        .await
-        .expect("register_svc reconnect must succeed");
+    let mut inbox = register_svc(transport_fixture::options(
+        &config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .await
+    .expect("register_svc reconnect must succeed");
     let d2 = inbox.poll(1).await.unwrap().unwrap();
     let res2 = handle_inbox_delivery(&d2, &config, &matrix, &store, &mut inbox, 1002).await;
     assert_eq!(
@@ -550,7 +568,10 @@ async fn oracle_4_sends_use_to_and_carry_no_push_replies() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockXmsgSockets::start(tmp.path()).await;
     let config = test_config(tmp.path());
-    let xmsg = create_xmsg_client(&config);
+    let xmsg_registration = register_svc(matrix_xmsg::xmsg::client_options(&config, "matrix-xmsg"))
+        .await
+        .unwrap();
+    let xmsg = create_xmsg_client(&xmsg_registration);
     let matrix = MockMatrixClient::default();
     let store = Store::new_in_memory().unwrap();
 
@@ -602,7 +623,10 @@ async fn oracle_5_owner_dm_fires_once_at_timeout_and_survives_restart() {
     config.db_path = db_path.clone();
     config.answer_timeout_secs = 10;
 
-    let xmsg = create_xmsg_client(&config);
+    let xmsg_registration = register_svc(matrix_xmsg::xmsg::client_options(&config, "matrix-xmsg"))
+        .await
+        .unwrap();
+    let xmsg = create_xmsg_client(&xmsg_registration);
     let matrix = MockMatrixClient::default();
     let store = Store::new(&db_path).unwrap();
 
@@ -675,7 +699,13 @@ async fn oracle_6_silent_decline_swaps_eye_for_salute_and_posts_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockXmsgSockets::start(tmp.path()).await;
     let config = test_config(tmp.path());
-    let xmsg = create_xmsg_client(&config);
+    let mut inbox = register_svc(transport_fixture::options(
+        &config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .await
+    .expect("register_svc must succeed");
+    let xmsg = create_xmsg_client(&inbox);
     let matrix = MockMatrixClient::default();
     let store = Store::new_in_memory().unwrap();
 
@@ -705,9 +735,6 @@ async fn oracle_6_silent_decline_swaps_eye_for_salute_and_posts_nothing() {
     }
 
     let fwd_msg_id = "01M13MSG0000000000000001";
-    let mut inbox = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
-        .await
-        .expect("register_svc must succeed");
 
     // Expert replies with {"silent": true}
     server
@@ -762,7 +789,13 @@ async fn oracle_7_reply_attributed_to_either_delta_or_bootstrap_message_id() {
     let tmp = tempfile::tempdir().unwrap();
     let server = MockXmsgSockets::start(tmp.path()).await;
     let config = test_config(tmp.path());
-    let xmsg = create_xmsg_client(&config);
+    let mut inbox = register_svc(transport_fixture::options(
+        &config.xmsg_register_socket(),
+        "matrix-xmsg",
+    ))
+    .await
+    .expect("register_svc must succeed");
+    let xmsg = create_xmsg_client(&inbox);
     let matrix = MockMatrixClient::default();
     let store = Store::new_in_memory().unwrap();
 
@@ -799,10 +832,6 @@ async fn oracle_7_reply_attributed_to_either_delta_or_bootstrap_message_id() {
     handle_incoming_event(&ev2, &[], &config, &matrix, xmsg.as_ref(), &store)
         .await
         .unwrap();
-
-    let mut inbox = register_svc(&config.xmsg_register_socket(), "matrix-xmsg")
-        .await
-        .expect("register_svc must succeed");
 
     // Reply referencing first forward's message ID (01M13MSG0000000000000001)
     server
@@ -847,3 +876,6 @@ async fn oracle_7_reply_attributed_to_either_delta_or_bootstrap_message_id() {
         .body
         .contains("Answer referencing second message id"));
 }
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

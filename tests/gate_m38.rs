@@ -56,14 +56,18 @@ impl XmsgClient for MockXmsgClient {
         Ok(SendResponse::new(format!("01M38MSG{id:06}"), sess))
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let sess = self.session_id.lock().unwrap().clone();
-        Ok(SendResponse::new(format!("01M38REPLY{id:06}"), sess))
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let sess = self.session_id.lock().unwrap().clone();
+            Ok(SendResponse::new(format!("01M38REPLY{id:06}"), sess))
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -1121,3 +1125,7 @@ async fn oracle_5_seventeen_concurrent_context_requests_complete_via_verdict_fas
         );
     }
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

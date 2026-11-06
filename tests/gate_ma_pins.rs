@@ -72,16 +72,21 @@ async fn register_refuses_an_ok_frame_without_node() {
     let (no_node, _) = mock_socket(&dir, "a.sock", |_| {
         Some(json!({ "status": "ok", "address": "matrix-xmsg@sini.test" }))
     });
-    let err = match register_svc(&no_node, "matrix-xmsg").await {
+    let err = match register_svc(transport_fixture::options(&no_node, "matrix-xmsg")).await {
         Ok(_) => panic!("an ok frame without node must be refused"),
         Err(e) => e,
     };
-    assert!(err.to_string().contains("names no node"), "{err}");
+    assert!(matches!(
+        err,
+        matrix_xmsg::error::AppError::XmsgTransport(xmsg::client::ClientError::Protocol)
+    ));
 
     let (with_node, _) = mock_socket(&dir, "b.sock", |_| {
         Some(json!({ "status": "ok", "address": "matrix-xmsg@sini.test", "node": "sini.test" }))
     });
-    let inbox = register_svc(&with_node, "matrix-xmsg").await.unwrap();
+    let inbox = register_svc(transport_fixture::options(&with_node, "matrix-xmsg"))
+        .await
+        .unwrap();
     assert_eq!(inbox.node().as_deref(), Some("sini.test"));
 }
 
@@ -94,10 +99,16 @@ async fn a_verdict_reaches_only_the_check_it_answers() {
     let dir = tempfile::tempdir().unwrap();
     let (sock, counter) = mock_socket(&dir, "agent.sock", |n| guard_ok(format!("01MAPINS5{n:04}")));
 
+    let registration = transport_fixture::register_for_agent(&sock).await;
+    let guard_xmsg = registration.client();
     let checks: Vec<_> = (0..N)
         .map(|_| {
-            let client = UnixGuardClient::new(sock.clone(), 20);
-            tokio::spawn(async move { client.check_guard("genie-guard", &envelope()).await })
+            let xmsg = guard_xmsg.clone();
+            tokio::spawn(async move {
+                UnixGuardClient::new(xmsg.as_ref(), 20)
+                    .check_guard("genie-guard", &envelope())
+                    .await
+            })
         })
         .collect();
 
@@ -162,7 +173,9 @@ async fn a_timed_out_check_evicts_its_entry() {
     let (sock, _) = mock_socket(&dir, "agent.sock", |_| {
         guard_ok("01MAPINS1LATE".to_string())
     });
-    let client = UnixGuardClient::new(sock, 1);
+    let registration = transport_fixture::register_for_agent(&sock).await;
+    let guard_xmsg = registration.client();
+    let client = UnixGuardClient::new(guard_xmsg.as_ref(), 1);
     let err = client
         .check_guard("genie-guard", &envelope())
         .await
@@ -191,7 +204,9 @@ async fn a_timed_out_check_evicts_its_entry() {
 async fn a_stalled_guard_send_is_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let (sock, _) = mock_socket(&dir, "agent.sock", |_| None);
-    let mut client = UnixGuardClient::new(sock, 20);
+    let registration = transport_fixture::register_for_agent(&sock).await;
+    let guard_xmsg = registration.client();
+    let mut client = UnixGuardClient::new(guard_xmsg.as_ref(), 20);
     client.send_timeout = Duration::from_millis(300);
     let res = tokio::time::timeout(
         Duration::from_secs(30),
@@ -202,3 +217,6 @@ async fn a_stalled_guard_send_is_bounded() {
     let err = res.expect_err("a stalled send must fail");
     assert!(err.to_string().contains("Guard send"), "{err}");
 }
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

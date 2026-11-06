@@ -54,14 +54,18 @@ impl XmsgClient for MockXmsgClient {
         Ok(SendResponse::new(format!("01M39MSG{id:06}"), sess))
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let sess = self.session_id.lock().unwrap().clone();
-        Ok(SendResponse::new(format!("01M39REPLY{id:06}"), sess))
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let sess = self.session_id.lock().unwrap().clone();
+            Ok(SendResponse::new(format!("01M39REPLY{id:06}"), sess))
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -1596,3 +1600,7 @@ async fn o10_subsequent_trusted_mentions_skip_fetch_event_and_preserve_escalatio
         "O10: existing thread_askers row must remain unchanged"
     );
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

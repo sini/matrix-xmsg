@@ -51,6 +51,7 @@ impl XmsgClient for MockSessionClient {
         let num = self.send_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let sess = self.default_session_id.lock().unwrap().clone();
         Ok(SendResponse {
+            outcome: None,
             message_id: format!("01M16MSG{num:06}"),
             session_id: sess,
         })
@@ -196,6 +197,7 @@ async fn oracle_2_session_change_triggers_immediate_bootstrap() {
 
     // Initial forward lands on sess_alpha
     xmsg.queue_response(Ok(SendResponse {
+        outcome: None,
         message_id: "01M16MSG000001".to_string(),
         session_id: Some("sess_alpha".to_string()),
     }));
@@ -211,11 +213,13 @@ async fn oracle_2_session_change_triggers_immediate_bootstrap() {
     // Next forward arrives at t=1050 (within live window).
     // The initial delta lands on a restarted session: sess_beta!
     xmsg.queue_response(Ok(SendResponse {
+        outcome: None,
         message_id: "01M16MSG000002".to_string(),
         session_id: Some("sess_beta".to_string()),
     }));
     // The immediate bootstrap also lands on sess_beta:
     xmsg.queue_response(Ok(SendResponse {
+        outcome: None,
         message_id: "01M16MSG000003".to_string(),
         session_id: Some("sess_beta".to_string()),
     }));
@@ -366,6 +370,7 @@ async fn oracle_4_failed_rebootstrap_leaves_cursor_session_unchanged() {
     // Next forward at t=1050:
     // Initial delta send succeeds on new session sess_new:
     xmsg.queue_response(Ok(SendResponse {
+        outcome: None,
         message_id: "01M16MSG000001".to_string(),
         session_id: Some("sess_new".to_string()),
     }));
@@ -390,11 +395,13 @@ async fn oracle_4_failed_rebootstrap_leaves_cursor_session_unchanged() {
     // Next forward at t=1060 (tries again):
     // Initial delta send returns sess_new:
     xmsg.queue_response(Ok(SendResponse {
+        outcome: None,
         message_id: "01M16MSG000002".to_string(),
         session_id: Some("sess_new".to_string()),
     }));
     // Re-bootstrap send SUCCEEDS this time:
     xmsg.queue_response(Ok(SendResponse {
+        outcome: None,
         message_id: "01M16MSG000003".to_string(),
         session_id: Some("sess_new".to_string()),
     }));
@@ -433,6 +440,7 @@ async fn oracle_5_session_change_rebootstrap_carries_supersedes_delta_message_id
 
     // Initial forward lands on sess_initial
     xmsg.queue_response(Ok(SendResponse {
+        outcome: None,
         message_id: "01M16DELTA000001".to_string(),
         session_id: Some("sess_initial".to_string()),
     }));
@@ -445,11 +453,13 @@ async fn oracle_5_session_change_rebootstrap_carries_supersedes_delta_message_id
     // Second forward lands on sess_changed
     let delta_msg_id = "01M16DELTA000002";
     xmsg.queue_response(Ok(SendResponse {
+        outcome: None,
         message_id: delta_msg_id.to_string(),
         session_id: Some("sess_changed".to_string()),
     }));
     // Re-bootstrap succeeds
     xmsg.queue_response(Ok(SendResponse {
+        outcome: None,
         message_id: "01M16BOOT000003".to_string(),
         session_id: Some("sess_changed".to_string()),
     }));

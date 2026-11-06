@@ -44,19 +44,23 @@ impl XmsgClient for MockXmsgClient {
         ))
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        if self.fail_push.load(Ordering::SeqCst) {
-            return Err(AppError::Xmsg("push_failed: dead session".to_string()));
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            if self.fail_push.load(Ordering::SeqCst) {
+                return Err(AppError::Xmsg("push_failed: dead session".to_string()));
+            }
+            let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(SendResponse::new(
+                format!("01MOCKREPLY{id:06}"),
+                Some("session-1".to_string()),
+            ))
         }
-        let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(SendResponse::new(
-            format!("01MOCKREPLY{id:06}"),
-            Some("session-1".to_string()),
-        ))
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -913,12 +917,19 @@ async fn oracle_9_real_unix_guard_client_integration() {
         .unwrap()
     }
 
+    let registration = transport_fixture::register_for_agent(&agent_sock_path).await;
+    let guard_xmsg = registration.client();
+
     // 1. Reject
     {
-        let client = UnixGuardClient::new(agent_sock_path.clone(), 5);
         let check = tokio::spawn({
             let envelope = envelope.clone();
-            async move { client.check_guard("genie-guard", &envelope).await }
+            let xmsg = guard_xmsg.clone();
+            async move {
+                UnixGuardClient::new(xmsg.as_ref(), 5)
+                    .check_guard("genie-guard", &envelope)
+                    .await
+            }
         });
         let id = format!("01M15GUARD{:04}", 0);
         while counter.load(Ordering::SeqCst) < 1 {
@@ -947,10 +958,14 @@ async fn oracle_9_real_unix_guard_client_integration() {
 
     // 2. Error verdict
     {
-        let client = UnixGuardClient::new(agent_sock_path.clone(), 5);
         let check = tokio::spawn({
             let envelope = envelope.clone();
-            async move { client.check_guard("genie-guard", &envelope).await }
+            let xmsg = guard_xmsg.clone();
+            async move {
+                UnixGuardClient::new(xmsg.as_ref(), 5)
+                    .check_guard("genie-guard", &envelope)
+                    .await
+            }
         });
         while counter.load(Ordering::SeqCst) < 2 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -968,7 +983,7 @@ async fn oracle_9_real_unix_guard_client_integration() {
 
     // 3. No verdict: timeout
     {
-        let client = UnixGuardClient::new(agent_sock_path.clone(), 1);
+        let client = UnixGuardClient::new(guard_xmsg.as_ref(), 1);
         let res = client.check_guard("genie-guard", &envelope).await;
         assert!(res.is_err(), "guard timeout must return Err");
     }
@@ -976,7 +991,7 @@ async fn oracle_9_real_unix_guard_client_integration() {
     // 4. Two guards in view: `ambiguous` fails loudly
     {
         ambiguous.store(true, Ordering::SeqCst);
-        let client = UnixGuardClient::new(agent_sock_path.clone(), 5);
+        let client = UnixGuardClient::new(guard_xmsg.as_ref(), 5);
         let err = client
             .check_guard("genie-guard", &envelope)
             .await
@@ -986,3 +1001,10 @@ async fn oracle_9_real_unix_guard_client_integration() {
 
     agent_task.abort();
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

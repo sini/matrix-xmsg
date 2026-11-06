@@ -573,12 +573,6 @@ impl UnixXmsgClient {
         }
     }
 
-    pub fn new(agent: AgentClient) -> Self {
-        Self {
-            agent: Mutex::new(Some(agent)),
-        }
-    }
-
     fn agent(&self) -> Result<AgentClient, AppError> {
         self.agent
             .lock()

@@ -38,12 +38,16 @@ impl XmsgClient for MockXmsg {
         &self,
         _message_id: &str,
         _text: &str,
-    ) -> Result<SendResponse, AppError> {
-        let idx = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(SendResponse::new(
-            format!("01M29REPLY{idx:06}"),
-            Some("sess:reply".to_string()),
-        ))
+    ) -> Result<ReplyOutcome, AppError> {
+        async {
+            let idx = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(SendResponse::new(
+                format!("01M29REPLY{idx:06}"),
+                Some("sess:reply".to_string()),
+            ))
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -142,3 +146,7 @@ async fn oracle_5_default_answer_timeout_600s_boundary_and_mutant() {
     );
     assert_eq!(mutant_matrix.sent_dms.lock().unwrap().len(), 1);
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;

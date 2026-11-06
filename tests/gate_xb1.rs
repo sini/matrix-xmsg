@@ -79,14 +79,18 @@ impl XmsgClient for MockXmsg {
         Ok(SendResponse::new(format!("01XB1FWD{id:06}"), sess))
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let sess = self.session_id.lock().unwrap().clone();
-        Ok(SendResponse::new(format!("01XB1REP{id:06}"), sess))
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let sess = self.session_id.lock().unwrap().clone();
+            Ok(SendResponse::new(format!("01XB1REP{id:06}"), sess))
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -743,7 +747,9 @@ async fn xb1_f3_route_guard_reply_checks_delivery_origin_matches_guard_ref() {
         }
     });
 
-    let guard_client = UnixGuardClient::new(agent_sock_path, 5);
+    let registration = transport_fixture::register_for_agent(&agent_sock_path).await;
+    let guard_xmsg = registration.client();
+    let guard_client = UnixGuardClient::new(guard_xmsg.as_ref(), 5);
     let envelope = GuardEnvelope {
         source: "matrix:!support:example.org".to_string(),
         history: vec![],
@@ -912,3 +918,10 @@ async fn xb1_f4_process_queued_sync_event_admits_public_followup_in_solicited_th
         "Unsolicited public bystander in non-solicited thread must be refused, got sends: {sends:?}"
     );
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

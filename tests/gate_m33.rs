@@ -51,22 +51,28 @@ impl XmsgClient for MockXmsg {
         let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         let session_id = self.session_id.lock().unwrap().clone();
         Ok(SendResponse {
+            outcome: None,
             message_id: format!("01M33FWD{id:06}"),
             session_id,
         })
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let session_id = self.session_id.lock().unwrap().clone();
-        Ok(SendResponse {
-            message_id: format!("01M33REP{id:06}"),
-            session_id,
-        })
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let session_id = self.session_id.lock().unwrap().clone();
+            Ok(SendResponse {
+                outcome: None,
+                message_id: format!("01M33REP{id:06}"),
+                session_id,
+            })
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -1860,15 +1866,19 @@ mod real_xmsg_oracle_f {
         );
 
         let (shutdown, rx) = tokio::sync::broadcast::channel(1);
-        let inbox = ReconnectingSvcInbox::new(config.xmsg_register_socket(), "matrix-xmsg")
-            .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+        let inbox = ReconnectingSvcInbox::new(transport_fixture::options(
+            config.xmsg_register_socket(),
+            "matrix-xmsg",
+        ))
+        .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
+        let xmsg_client = create_xmsg_client(&inbox);
         let dyn_matrix: Arc<dyn MatrixClient> = matrix.clone();
         tokio::spawn(matrix_xmsg::bot::run_inbox_loop(
             inbox,
             config.clone(),
             dyn_matrix,
             store.clone(),
-            create_xmsg_client(&config),
+            xmsg_client.clone(),
             rx,
         ));
         eventually("the bot to register on real xmsg", 20, || {
@@ -1892,7 +1902,6 @@ mod real_xmsg_oracle_f {
         other.ready().await;
         node.instance_file(other.pid(), ID_OTHER, "claude", &other_inbox);
 
-        let xmsg_client = create_xmsg_client(&config);
         let ev1 = IncomingMatrixEvent {
             room_id: ROOM.to_string(),
             event_id: "$trig_f".to_string(),
@@ -2006,3 +2015,10 @@ mod real_xmsg_oracle_f {
         let _ = shutdown.send(());
     }
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

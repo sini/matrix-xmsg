@@ -88,16 +88,20 @@ impl XmsgClient for RecordingXmsg {
         ))
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.replies
-            .lock()
-            .unwrap()
-            .push((message_id.to_string(), text.to_string()));
-        let idx = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(SendResponse::new(
-            format!("01M34REPLY{idx:06}"),
-            Some("reply@sini.bitstream".to_string()),
-        ))
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        async {
+            self.replies
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            let idx = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(SendResponse::new(
+                format!("01M34REPLY{idx:06}"),
+                Some("reply@sini.bitstream".to_string()),
+            ))
+        }
+        .await
+        .map(replies::pushed)
     }
 }
 
@@ -872,3 +876,7 @@ fn oracle_e_nixos_and_hm_modules_render_room_routes_identically() {
         "r3-trusted@bitstream"
     );
 }
+
+#[path = "common/replies.rs"]
+mod replies;
+use matrix_xmsg::xmsg::ReplyOutcome;
