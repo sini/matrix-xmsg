@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = [
@@ -21,10 +22,12 @@ CASES = [
 def run(root, target, test):
     env = {**os.environ, "CARGO_TARGET_DIR": str(ROOT / "target")}
     profile = env.get("CARGO_PROFILE", "dev")
-    subprocess.run(["cargo", "clean", "--locked", "--offline", "-p", "matrix-xmsg", "--profile", profile], cwd=root, env=env, check=True, capture_output=True, timeout=120)
+    started = time.monotonic()
+    print(f"building {target}::{test} ({profile})", flush=True)
     build = subprocess.run(["cargo", "test", "--locked", "--offline", "--profile", profile, "-j", "4", "--test", target, "--no-run", "--message-format=json"], cwd=root, env=env, capture_output=True, text=True, timeout=1200)
     assert build.returncode == 0, ("compilation failed; not a mutant kill", build.stdout[-10000:], build.stderr[-10000:])
     executable = []
+    rebuilt = False
     for line in build.stdout.splitlines():
         try:
             item = json.loads(line)
@@ -32,31 +35,55 @@ def run(root, target, test):
             continue
         if item.get("reason") == "compiler-artifact" and item.get("target", {}).get("name") == target and item.get("profile", {}).get("test") and item.get("executable"):
             executable.append(item["executable"])
+            rebuilt = not item.get("fresh", True)
+        assert not (item.get("reason") == "compiler-artifact" and item.get("target", {}).get("kind") == ["bin"]), "unexpected application binary build"
     assert len(executable) == 1 and Path(executable[0]).is_file(), ("missing intended executable", target)
+    assert rebuilt, "intended test artifact was stale; not a valid mutant drive"
+    print(f"built intended test in {time.monotonic() - started:.1f}s", flush=True)
     return subprocess.run([executable[0], test, "--exact", "--test-threads=1"], cwd=root, env=env, capture_output=True, text=True, timeout=45)
 
 
 def main():
     evidence = ROOT / "target/shared-client-mutants"
     evidence.mkdir(parents=True, exist_ok=True)
-    for name, filename, old, new, target, test in CASES:
-        with tempfile.TemporaryDirectory(prefix="matrix-client-mutant-") as directory:
-            root = Path(directory)
-            for source in ("Cargo.toml", "Cargo.lock"):
-                shutil.copyfile(ROOT / source, root / source)
-            for source in ("src", "tests", "scripts"):
-                shutil.copytree(ROOT / source, root / source, copy_function=shutil.copyfile)
-            green = run(root, target, test)
-            assert green.returncode == 0 and "1 passed; 0 failed; 0 ignored" in green.stdout, (name, "invalid baseline", green.stdout, green.stderr)
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="matrix-client-mutant-") as directory:
+        root = Path(directory)
+        for source in ("Cargo.toml", "Cargo.lock"):
+            shutil.copyfile(ROOT / source, root / source)
+        for source in ("src", "tests", "scripts"):
+            shutil.copytree(ROOT / source, root / source, copy_function=shutil.copyfile)
+        # These in-process tests exercise the library, never CARGO_BIN_EXE binaries.
+        manifest = root / "Cargo.toml"
+        lines = []
+        in_bin = False
+        for line in manifest.read_text().splitlines(keepends=True):
+            if line.startswith("["):
+                in_bin = line.strip() == "[[bin]]"
+            if not in_bin:
+                lines.append(line)
+                if line.strip() == "[package]":
+                    lines.append("autobins = false\n")
+        manifest.write_text("".join(lines))
+        for name, filename, old, new, target, test in CASES:
             file = root / filename
             body = file.read_text()
             assert body.count(old) == 1, (name, body.count(old))
-            file.write_text(body.replace(old, new, 1))
-            red = run(root, target, test)
-            assert red.returncode == 101 and f"test {test} ... FAILED" in red.stdout, (name, "survived or wrong red", red.stdout, red.stderr)
-            (evidence / f"{name}.log").write_text(red.stdout + red.stderr)
-            print(f"{name}: GREEN baseline, RED intended test", flush=True)
-    print(f"{len(CASES)}/{len(CASES)} Matrix adapter mutants killed", flush=True)
+            # New mtimes force Cargo to rebuild restored and mutated source alike.
+            file.touch()
+            green = run(root, target, test)
+            assert green.returncode == 0 and "1 passed; 0 failed; 0 ignored" in green.stdout, (name, "invalid baseline", green.stdout, green.stderr)
+            try:
+                file.write_text(body.replace(old, new, 1))
+                file.touch()
+                red = run(root, target, test)
+                assert red.returncode == 101 and f"test {test} ... FAILED" in red.stdout, (name, "survived or wrong red", red.stdout, red.stderr)
+                (evidence / f"{name}.log").write_text(red.stdout + red.stderr)
+                print(f"{name}: GREEN baseline, RED intended test", flush=True)
+            finally:
+                file.write_text(body)
+                file.touch()
+    print(f"{len(CASES)}/{len(CASES)} Matrix adapter mutants killed in {time.monotonic() - started:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
