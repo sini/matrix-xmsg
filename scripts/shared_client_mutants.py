@@ -13,7 +13,7 @@ CASES = [
     ("request-id-substitution", "src/xmsg.rs", "fn from_record(record: ReplyRecord) -> Self {", "fn from_record(record: ReplyRecord) -> Self { let mut record = record; if record.pushed_message_id.is_none() { record.pushed_message_id = Some(record.message_id.clone()); }", "shared_transport", "stored_reply_preserves_its_record_without_inventing_a_pushed_id"),
     ("stored-association", "src/bot.rs", "record.pushed_message_id.filter(|id| !id.is_empty())", "None", "gate_idem_retry", "a_reply_to_a_stored_relay_routes_to_its_matrix_thread"),
     ("outcome", "src/xmsg.rs", "outcome: Some(receipt.outcome),", "outcome: None,", "gate_idem_retry", "keyed_frames_carry_the_key_and_read_pending"),
-    ("reconnect-facade", "src/xmsg.rs", "*client.agent.lock().unwrap() = Some(service.agent_client());", "let mut slot = client.agent.lock().unwrap(); if slot.is_none() { *slot = Some(service.agent_client()); }", "shared_transport", "reconnect_rebinds_the_existing_outbound_facade"),
+    ("reconnect-facade", "src/xmsg.rs", "*client.agent.lock().unwrap() = Some(service.agent_client());", "{ let mut slot = client.agent.lock().unwrap(); if slot.is_none() { *slot = Some(service.agent_client()); } }", "shared_transport", "reconnect_rebinds_the_existing_outbound_facade"),
     ("stored-classification", "src/xmsg.rs", 'if record.push_outcome.as_deref() != Some("stored")', "if true", "shared_transport", "stored_reply_preserves_its_record_without_inventing_a_pushed_id"),
 ]
 
@@ -23,7 +23,7 @@ def run(root, target, test):
     profile = env.get("CARGO_PROFILE", "dev")
     subprocess.run(["cargo", "clean", "--locked", "--offline", "-p", "matrix-xmsg", "--profile", profile], cwd=root, env=env, check=True, capture_output=True, timeout=120)
     build = subprocess.run(["cargo", "test", "--locked", "--offline", "--profile", profile, "-j", "4", "--test", target, "--no-run", "--message-format=json"], cwd=root, env=env, capture_output=True, text=True, timeout=1200)
-    assert build.returncode == 0, ("compilation failed; not a mutant kill", build.stderr[-10000:])
+    assert build.returncode == 0, ("compilation failed; not a mutant kill", build.stdout[-10000:], build.stderr[-10000:])
     executable = []
     for line in build.stdout.splitlines():
         try:
