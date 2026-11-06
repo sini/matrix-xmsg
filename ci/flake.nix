@@ -108,7 +108,29 @@
                   buildPhase = "runHook preBuild; runHook postBuild";
                   checkPhase = ''
                     runHook preCheck
-                    cargoWithProfile test --locked --test gate_ma_integration --test gate_m33 -- --include-ignored
+                    assertIntegrationRun() {
+                      if ! test "$(grep -Ec '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;' "$1")" -eq 2; then
+                        echo "integration targets must both run with no skipped cases" >&2
+                        return 1
+                      fi
+                      for oracle in \
+                        oracle_1_a_verdict_is_not_an_answer \
+                        oracle_2_origin_by_node \
+                        oracle_3_m16_rebootstraps_on_a_new_resolved_id \
+                        oracle_4_m24_reply_then_redact_by_returned_message_id \
+                        oracle_f_real_xmsg_context_reply_and_session_binding; do
+                        if ! test "$(grep -Fc "xmsg-compat-complete:$oracle" "$1")" -eq 1; then
+                          echo "missing or repeated integration completion: $oracle" >&2
+                          return 1
+                        fi
+                      done
+                    }
+                    if ! cargoWithProfile test --locked --test gate_ma_integration --test gate_m33 -- --include-ignored --nocapture > integration.log 2>&1; then
+                      cat integration.log
+                      exit 1
+                    fi
+                    cat integration.log
+                    assertIntegrationRun integration.log
                     set +e
                     XMSG_BIN="${
                       if inputName == "xmsg" then binaryFor "xmsg-legacy" xmsg-legacy else binaryFor "xmsg" xmsg
@@ -118,6 +140,25 @@
                     set -e
                     test "$wrong_rc" -eq 101
                     grep -F 'test pinned_binary_revision_is_verified ... FAILED' wrong-revision.log
+                    cp tests/gate_ma_integration.rs gate_ma_integration.original
+                    substituteInPlace tests/gate_ma_integration.rs --replace-fail \
+                      'async fn oracle_1_a_verdict_is_not_an_answer() {' \
+                      'async fn oracle_1_a_verdict_is_not_an_answer() { return;'
+                    cargo clean --locked --offline -p matrix-xmsg --profile "$CARGO_PROFILE"
+                    if ! cargoWithProfile test --locked --test gate_ma_integration --test gate_m33 -- --include-ignored --nocapture > skipped.log 2>&1; then
+                      cat skipped.log
+                      echo "a compilation/test failure is not a killed completion mutant" >&2
+                      exit 1
+                    fi
+                    cat skipped.log
+                    if assertIntegrationRun skipped.log > skipped-guard.log 2>&1; then
+                      echo "early-return completion mutant survived" >&2
+                      exit 1
+                    fi
+                    cat skipped-guard.log
+                    grep -F 'missing or repeated integration completion: oracle_1_a_verdict_is_not_an_answer' skipped-guard.log
+                    cp gate_ma_integration.original tests/gate_ma_integration.rs
+                    echo "single-site test early return makes the completion guard RED"
                     runHook postCheck
                   '';
                   installPhase = ''runHook preInstall; mkdir -p "$out"; runHook postInstall'';

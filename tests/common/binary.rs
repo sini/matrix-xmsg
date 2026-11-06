@@ -32,3 +32,7 @@ pub fn xmsg_bin(required: &str) -> Option<PathBuf> {
     }
     Some(binary)
 }
+
+pub fn completed(oracle: &str) {
+    println!("xmsg-compat-complete:{oracle}");
+}

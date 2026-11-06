@@ -43,7 +43,9 @@ ignored in the native command and must run in CI with `MA_XMSG_REQUIRED=1`.
 The CI integration arms use the current shared-client daemon revision and the
 previous Matrix baseline `cca3de77fbe95ea1ad90ab8ba7a83eb741fc9cb9`.
 Their binaries are built from revision-named, hash-checked sources, embed their
-revision, and must reject the other arm's binary. Manifest and lockfile pin checks
+revision, and must reject the other arm's binary. Each arm checks test counts and
+all five real-case completion markers, then rejects a single-site early-return
+source mutant even though its Rust test harness still reports success. Manifest and lockfile pin checks
 have independent negative controls.
 
 `scripts/shared_client_mutants.py` exercises seven single-site source changes.

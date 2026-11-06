@@ -2001,6 +2001,7 @@ mod real_xmsg_oracle_f {
         );
 
         let _ = shutdown.send(());
+        super::binary_provenance::completed("oracle_f_real_xmsg_context_reply_and_session_binding");
     }
 }
 

@@ -641,6 +641,7 @@ async fn oracle_1_a_verdict_is_not_an_answer() {
         !notices.iter().any(|n| n.contains("VERDICT-REASON")),
         "a verdict is never posted: {notices:?}"
     );
+    binary_provenance::completed("oracle_1_a_verdict_is_not_an_answer");
 }
 
 // =============================================================================
@@ -741,6 +742,7 @@ async fn oracle_2_origin_by_node() {
         "nothing from another node is posted: {:?}",
         bot.notices()
     );
+    binary_provenance::completed("oracle_2_origin_by_node");
 }
 
 // =============================================================================
@@ -843,6 +845,7 @@ async fn oracle_3_m16_rebootstraps_on_a_new_resolved_id() {
         Some(format!("{ID_Y}@{node_name}").as_str())
     );
     drop(registration);
+    binary_provenance::completed("oracle_3_m16_rebootstraps_on_a_new_resolved_id");
 }
 
 // =============================================================================
@@ -939,6 +942,7 @@ async fn oracle_4_m24_reply_then_redact_by_returned_message_id() {
         "author_principal must be <instance-id>@<node>: {}",
         rec.author_principal
     );
+    binary_provenance::completed("oracle_4_m24_reply_then_redact_by_returned_message_id");
 }
 
 // -----------------------------------------------------------------------------
