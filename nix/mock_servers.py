@@ -437,6 +437,7 @@ class AgentHandler(socketserver.StreamRequestHandler):
                     "action": "deliver",
                     "messageId": f"01TESTGUARD{n:05d}",
                     "fromName": f"genie-guard@{NODE}",
+                    "origin": {"service": "genie-guard", "node": NODE},
                     "text": json.dumps({
                         "verdict": "allow",
                         "reason": "clean",
@@ -459,6 +460,7 @@ class AgentHandler(socketserver.StreamRequestHandler):
                     "action": "deliver",
                     "messageId": f"01TESTREPLY{n:05d}",
                     "fromName": f"expert · mock-claude-session@{NODE}",
+                    "origin": {"id": "mock-claude-session", "node": NODE, "label": "expert"},
                     "text": reply_text,
                     "envelope": "",
                     "inReplyTo": message_id,
@@ -515,7 +517,7 @@ def run_unix_server(name, handler):
     if os.path.exists(sock):
         os.remove(sock)
     server = ThreadedUnixServer(sock, handler)
-    os.chmod(sock, 0o666)
+    os.chmod(sock, 0o600)
     server.serve_forever()
 
 
@@ -538,7 +540,7 @@ if __name__ == "__main__":
         print("Mock Matrix server listening on 127.0.0.1:8008 (Matrix only)")
     else:
         os.makedirs(SOCK_DIR, exist_ok=True)
-        os.chmod(SOCK_DIR, 0o755)
+        os.chmod(SOCK_DIR, 0o700)
         t2 = threading.Thread(target=run_unix_server, args=("register.sock", RegisterHandler), daemon=True)
         t3 = threading.Thread(target=run_unix_server, args=("agent.sock", AgentHandler), daemon=True)
         t2.start()

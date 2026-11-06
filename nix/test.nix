@@ -15,7 +15,7 @@ pkgs.testers.nixosTest {
       ];
 
       # The mock xmsg's socket directory, present before either service starts (BindPaths).
-      systemd.tmpfiles.rules = [ "d /run/xmsg-mock 0755 root root -" ];
+      systemd.tmpfiles.rules = [ "d /run/xmsg-mock 0700 matrix-xmsg matrix-xmsg -" ];
 
       # Mock server service
       systemd.services.mock-servers = {
@@ -23,6 +23,8 @@ pkgs.testers.nixosTest {
         wantedBy = [ "multi-user.target" ];
         before = [ "matrix-xmsg.service" ];
         serviceConfig = {
+          User = "matrix-xmsg";
+          Group = "matrix-xmsg";
           ExecStart = "${pkgs.python3}/bin/python3 ${./mock_servers.py}";
           Restart = "always";
         };
@@ -75,9 +77,11 @@ pkgs.testers.nixosTest {
         machine.wait_for_unit("mock-servers.service")
         machine.wait_for_open_port(8008)
         machine.wait_until_succeeds(
-            "${pkgs.python3}/bin/python3 -c 'import os, socket; "
+            "${pkgs.python3}/bin/python3 -c 'import os, pwd, socket; "
             "socks = [\"/run/xmsg-mock/register.sock\", \"/run/xmsg-mock/agent.sock\"]; "
-            "assert all((os.stat(p).st_mode & 0o777) == 0o666 for p in socks); "
+            "assert os.stat(\"/run/xmsg-mock\").st_uid == pwd.getpwnam(\"matrix-xmsg\").pw_uid; "
+            "assert (os.stat(\"/run/xmsg-mock\").st_mode & 0o777) == 0o700; "
+            "assert all((os.stat(p).st_mode & 0o777) == 0o600 for p in socks); "
             "[ (s:=socket.socket(socket.AF_UNIX), s.connect(p), s.close()) for p in socks ]'",
             timeout=30,
         )
@@ -103,9 +107,11 @@ pkgs.testers.nixosTest {
         machine.wait_for_unit("mock-servers.service")
         machine.wait_for_open_port(8008)
         machine.wait_until_succeeds(
-            "${pkgs.python3}/bin/python3 -c 'import os, socket; "
+            "${pkgs.python3}/bin/python3 -c 'import os, pwd, socket; "
             "socks = [\"/run/xmsg-mock/register.sock\", \"/run/xmsg-mock/agent.sock\"]; "
-            "assert all((os.stat(p).st_mode & 0o777) == 0o666 for p in socks); "
+            "assert os.stat(\"/run/xmsg-mock\").st_uid == pwd.getpwnam(\"matrix-xmsg\").pw_uid; "
+            "assert (os.stat(\"/run/xmsg-mock\").st_mode & 0o777) == 0o700; "
+            "assert all((os.stat(p).st_mode & 0o777) == 0o600 for p in socks); "
             "[ (s:=socket.socket(socket.AF_UNIX), s.connect(p), s.close()) for p in socks ]'",
             timeout=30,
         )
@@ -152,9 +158,11 @@ pkgs.testers.nixosTest {
         machine.wait_for_unit("mock-servers.service")
         machine.wait_for_open_port(8008)
         machine.wait_until_succeeds(
-            "${pkgs.python3}/bin/python3 -c 'import os, socket; "
+            "${pkgs.python3}/bin/python3 -c 'import os, pwd, socket; "
             "socks = [\"/run/xmsg-mock/register.sock\", \"/run/xmsg-mock/agent.sock\"]; "
-            "assert all((os.stat(p).st_mode & 0o777) == 0o666 for p in socks); "
+            "assert os.stat(\"/run/xmsg-mock\").st_uid == pwd.getpwnam(\"matrix-xmsg\").pw_uid; "
+            "assert (os.stat(\"/run/xmsg-mock\").st_mode & 0o777) == 0o700; "
+            "assert all((os.stat(p).st_mode & 0o777) == 0o600 for p in socks); "
             "[ (s:=socket.socket(socket.AF_UNIX), s.connect(p), s.close()) for p in socks ]'",
             timeout=30,
         )
