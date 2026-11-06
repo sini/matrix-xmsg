@@ -43,9 +43,9 @@ def main():
         with tempfile.TemporaryDirectory(prefix="matrix-client-mutant-") as directory:
             root = Path(directory)
             for source in ("Cargo.toml", "Cargo.lock"):
-                shutil.copy2(ROOT / source, root / source)
+                shutil.copyfile(ROOT / source, root / source)
             for source in ("src", "tests", "scripts"):
-                shutil.copytree(ROOT / source, root / source)
+                shutil.copytree(ROOT / source, root / source, copy_function=shutil.copyfile)
             green = run(root, target, test)
             assert green.returncode == 0 and "1 passed; 0 failed; 0 ignored" in green.stdout, (name, "invalid baseline", green.stdout, green.stderr)
             file = root / filename

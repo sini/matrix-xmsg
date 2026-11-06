@@ -46,7 +46,7 @@ def main():
             root = Path(temporary)
             (root / "ci").mkdir()
             for source in files:
-                shutil.copy2(args.root / source, root / source)
+                shutil.copyfile(args.root / source, root / source)
             target = root / filename
             text = target.read_text()
             assert revision in text, (filename, "missing live positive control")
