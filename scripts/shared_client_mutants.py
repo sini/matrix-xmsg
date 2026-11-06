@@ -8,6 +8,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+FRESH_ERROR = "intended test artifact was stale; not a valid mutant drive"
 CASES = [
     ("idempotency-key", "src/xmsg.rs", "self.agent()?.send(to, text, key)", "self.agent()?.send(to, text, None)", "shared_transport", "accepted_transport_and_cursor_trace_matches_legacy_golden"),
     ("display-name", "src/xmsg.rs", "from_name: delivery.from_name().into(),", "from_name: String::new(),", "shared_transport", "accepted_transport_and_cursor_trace_matches_legacy_golden"),
@@ -38,15 +39,27 @@ def run(root, target, test):
             rebuilt = not item.get("fresh", True)
         assert not (item.get("reason") == "compiler-artifact" and item.get("target", {}).get("kind") == ["bin"]), "unexpected application binary build"
     assert len(executable) == 1 and Path(executable[0]).is_file(), ("missing intended executable", target)
-    assert rebuilt, "intended test artifact was stale; not a valid mutant drive"
+    assert rebuilt, FRESH_ERROR
     print(f"built intended test in {time.monotonic() - started:.1f}s", flush=True)
     return subprocess.run([executable[0], test, "--exact", "--test-threads=1"], cwd=root, env=env, capture_output=True, text=True, timeout=45)
 
+
+
+def verify_cached_refusal(root, target, test):
+    try:
+        run(root, target, test)
+    except AssertionError as error:
+        if str(error) != FRESH_ERROR:
+            raise
+        print("cached-artifact self-test: expected refusal verified", flush=True)
+    else:
+        raise AssertionError("cached artifact was accepted by the runner")
 
 def main():
     evidence = ROOT / "target/shared-client-mutants"
     evidence.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    self_tested = False
     with tempfile.TemporaryDirectory(prefix="matrix-client-mutant-") as directory:
         root = Path(directory)
         for source in ("Cargo.toml", "Cargo.lock"):
@@ -73,6 +86,9 @@ def main():
             file.touch()
             green = run(root, target, test)
             assert green.returncode == 0 and "1 passed; 0 failed; 0 ignored" in green.stdout, (name, "invalid baseline", green.stdout, green.stderr)
+            if not self_tested:
+                verify_cached_refusal(root, target, test)
+                self_tested = True
             try:
                 file.write_text(body.replace(old, new, 1))
                 file.touch()
@@ -83,6 +99,7 @@ def main():
             finally:
                 file.write_text(body)
                 file.touch()
+    assert self_tested, "cached-artifact self-test was not exercised"
     print(f"{len(CASES)}/{len(CASES)} Matrix adapter mutants killed in {time.monotonic() - started:.1f}s", flush=True)
 
 
