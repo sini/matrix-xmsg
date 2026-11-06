@@ -10,7 +10,7 @@
     # The library and current daemon share one immutable revision. Keep the previous
     # daemon as an explicit compatibility arm, not as a second client implementation.
     xmsg = {
-      url = "github:sini/xmsg/0d9ee145f7875aa4b930b4efd41615bdcfd1f806";
+      url = "github:sini/xmsg/87bd5cc28ae8632d7ca4283e03b6b0ec839fd9c0";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.crane.follows = "crane";
     };

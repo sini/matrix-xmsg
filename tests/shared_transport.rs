@@ -343,3 +343,53 @@ async fn reconnect_rebinds_the_existing_outbound_facade() {
     service_task.abort();
     let _ = service_task.await;
 }
+
+#[test]
+fn config_load_validates_configured_service_name() {
+    use matrix_xmsg::config::Config;
+    use matrix_xmsg::error::AppError;
+
+    let base_toml = r#"
+        homeserver_url = "https://matrix.example.org"
+        bot_mxid = "@genie:example.org"
+        access_token_file = "/tmp/token"
+        rooms = ["!room:example.org"]
+        trusted_mxids = []
+        owner_mxid = "@owner:example.org"
+        guard_ref = "genie-guard"
+    "#;
+
+    let default_cfg = Config::from_toml_str_with_env(base_toml, Some("/run/user/1001")).unwrap();
+    assert_eq!(default_cfg.service_name, "matrix-xmsg");
+    assert_eq!(
+        matrix_xmsg::xmsg::client_options(&default_cfg, &default_cfg.service_name).service,
+        "matrix-xmsg"
+    );
+
+    let explicit_valid = format!("{base_toml}\nservice_name = \"matrix-xmsg\"\n");
+    let valid_cfg =
+        Config::from_toml_str_with_env(&explicit_valid, Some("/run/user/1001")).unwrap();
+    assert_eq!(valid_cfg.service_name, "matrix-xmsg");
+
+    let long_name = "a".repeat(36);
+    for invalid in [
+        "a/b",
+        "0123abcd-0123-4abc-8def-0123456789ab/child",
+        "with space",
+        "naïve",
+        long_name.as_str(),
+        "xmsg",
+    ] {
+        let toml_str = format!(
+            "{base_toml}\nservice_name = {}\n",
+            serde_json::to_string(invalid).unwrap()
+        );
+        let err = Config::from_toml_str_with_env(&toml_str, Some("/run/user/1001")).expect_err(
+            &format!("invalid service name `{invalid}` must be refused at config load"),
+        );
+        assert!(
+            matches!(err, AppError::Config(ref msg) if msg.contains("invalid service name")),
+            "expected AppError::Config for `{invalid}`, got {err:?}"
+        );
+    }
+}

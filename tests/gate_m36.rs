@@ -905,6 +905,7 @@ fn make_config(homeserver_url: &str, state_dir: &std::path::Path) -> Config {
         guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
         store_passphrase_file: Some(state_dir.join("store-passphrase")),
+        service_name: "matrix-xmsg".to_string(),
         undecryptable_wait_secs: 1,
         history_n: 30,
         history_byte_cap: 12288,

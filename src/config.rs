@@ -39,6 +39,10 @@ fn default_xmsg_socket() -> PathBuf {
     PathBuf::new()
 }
 
+fn default_service_name() -> String {
+    "matrix-xmsg".to_string()
+}
+
 fn default_expert_ref() -> String {
     "claude".to_string()
 }
@@ -213,6 +217,9 @@ pub struct Config {
     #[serde(default = "default_xmsg_socket")]
     pub xmsg_socket: PathBuf,
 
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+
     #[serde(default = "default_expert_ref")]
     pub expert_ref: String,
 
@@ -300,6 +307,10 @@ pub struct Config {
 
 impl Config {
     pub fn validate(&self) -> Result<(), AppError> {
+        ::xmsg::client::validate_service_name(&self.service_name).map_err(|_| {
+            AppError::Config(format!("invalid service name `{}`", self.service_name))
+        })?;
+
         if let Some(ref refs) = self.expert_refs {
             if refs.public.trim().is_empty() || refs.trusted.trim().is_empty() {
                 return Err(AppError::Config(

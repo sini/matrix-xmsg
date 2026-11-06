@@ -18,7 +18,7 @@ name = "matrix_xmsg"
 path = "src/lib.rs"
 
 [dependencies]
-xmsg = { git = "https://github.com/sini/xmsg", rev = "0d9ee145f7875aa4b930b4efd41615bdcfd1f806", default-features = false, features = ["client"] }
+xmsg = { git = "https://github.com/sini/xmsg", rev = "87bd5cc28ae8632d7ca4283e03b6b0ec839fd9c0", default-features = false, features = ["client"] }
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "fs", "signal"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

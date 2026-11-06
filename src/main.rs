@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let svc_inbox = matrix_xmsg::xmsg::ReconnectingSvcInbox::new(
-        matrix_xmsg::xmsg::client_options(&config, "matrix-xmsg"),
+        matrix_xmsg::xmsg::client_options(&config, &config.service_name),
     );
 
     let xmsg_client = matrix_xmsg::xmsg::create_xmsg_client(&svc_inbox);

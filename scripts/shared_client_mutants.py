@@ -17,6 +17,7 @@ CASES = [
     ("outcome", "src/xmsg.rs", "outcome: Some(receipt.outcome),", "outcome: None,", "gate_idem_retry", "keyed_frames_carry_the_key_and_read_pending"),
     ("reconnect-facade", "src/xmsg.rs", "*client.agent.lock().unwrap() = Some(service.agent_client());", "{ let mut slot = client.agent.lock().unwrap(); if slot.is_none() { *slot = Some(service.agent_client()); } }", "shared_transport", "reconnect_rebinds_the_existing_outbound_facade"),
     ("stored-classification", "src/xmsg.rs", 'if record.push_outcome.as_deref() != Some("stored")', "if true", "shared_transport", "stored_reply_preserves_its_record_without_inventing_a_pushed_id"),
+    ("service-name-validation", "src/config.rs", "::xmsg::client::validate_service_name(&self.service_name)", "Ok::<(), ::xmsg::client::ClientError>(())", "shared_transport", "config_load_validates_configured_service_name"),
 ]
 
 

@@ -1,7 +1,7 @@
 # Shared xmsg client migration
 
 Matrix uses `xmsg::client` from revision
-`0d9ee145f7875aa4b930b4efd41615bdcfd1f806`, with default features disabled.
+`87bd5cc28ae8632d7ca4283e03b6b0ec839fd9c0`, with default features disabled.
 Registration, inbound polling, expert sends and guard sends share one registered
 service identity. Reconnection replaces the outbound handle held by that service.
 Matrix retains its guard, sender binding, retry, thread and cursor policies.
@@ -48,8 +48,8 @@ all five real-case completion markers, then rejects a single-site early-return
 source mutant even though its Rust test harness still reports success. Manifest and lockfile pin checks
 have independent negative controls.
 
-`scripts/shared_client_mutants.py` exercises seven single-site source changes.
+`scripts/shared_client_mutants.py` exercises eight single-site source changes.
 Each case requires a passing baseline and a failure in the named test after the
 edit. Compilation failures and timeouts do not count as mutant kills. Mutation
-results are green locally and in the Nix sandbox (seven of seven in each). Run
+results are green locally and in the Nix sandbox (eight of eight in each). Run
 the complete CI suite before landing.

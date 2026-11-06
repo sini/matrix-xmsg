@@ -265,7 +265,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while std::time::Instant::now() < backup_deadline {
                 let mut version_opt: Option<String> = None;
                 if let Ok(v_resp) = http
-                    .get(format!("{homeserver_url}/_matrix/client/v3/room_keys/version"))
+                    .get(format!(
+                        "{homeserver_url}/_matrix/client/v3/room_keys/version"
+                    ))
                     .bearer_auth(&genie_token)
                     .send()
                     .await
