@@ -15,7 +15,8 @@ schema version 2. Registration frames do not carry that field.
 The shared client rejects oversized frames, expired operations, malformed origins,
 invalid socket ownership and inconsistent daemon identities. Matrix accepts the
 UID-verified handshake node without a configured node pin. It never invents an
-address when the daemon omits one.
+address when the daemon omits one. The daemon must run under the same OS user,
+and its socket directory must be owned by that user with mode 0700.
 
 ## Reply outcomes
 
@@ -26,6 +27,14 @@ later response returns to the originating Matrix thread. An accepted reply witho
 that ID creates no association. `ReplyRecord.message_id` identifies the original
 request and is never substituted for a new reply ID. Removing that substitution
 is a deliberate correction to the previous fallback behavior.
+
+Another deliberate parity exception is disconnected sending: after registration
+is refused, Matrix does not open agent.sock. The Home Manager negative check
+requires the daemon refusal, the typed client refusal, and a connect syscall trace
+with registration attempts and zero agent.sock attempts. The trace wraps the
+unchanged Matrix executable and uses the shared configuration generator.
+Client errors expose the shared transport's bounded refusal code; detailed daemon
+diagnostics remain in the daemon log.
 
 ## Validation
 
@@ -40,4 +49,5 @@ have independent negative controls.
 `scripts/shared_client_mutants.py` exercises seven single-site source changes.
 Each case requires a passing baseline and a failure in the named test after the
 edit. Compilation failures and timeouts do not count as mutant kills. Mutation
-results and full CI remain pending until their runs complete.
+results are green locally and in the Nix sandbox (seven of seven in each). The
+final complete CI run remains pending.

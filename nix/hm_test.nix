@@ -45,6 +45,21 @@ pkgs.testers.nixosTest {
         imports = [
           xmsg.homeManagerModules.xmsg
           matrix-xmsg.homeManagerModules.default
+          (
+            { config, ... }:
+            let
+              cfg = config.services.matrix-xmsg;
+              configToml = (import ./options.nix).mkConfigToml { inherit lib pkgs; } cfg (
+                toString cfg.accessTokenFile
+              );
+            in
+            {
+              config = lib.mkIf (mode == "mutant-no-svcexe") {
+                systemd.user.services.matrix-xmsg.Service.ExecStart =
+                  lib.mkForce "${pkgs.strace}/bin/strace -f -e trace=connect -o /home/alice/xmsg-connect.trace ${lib.getExe cfg.package} --config ${configToml}";
+              };
+            }
+          )
         ];
 
         home = {
@@ -99,18 +114,30 @@ pkgs.testers.nixosTest {
             timeout=30,
         )
         machine.wait_until_succeeds(
-            "journalctl _SYSTEMD_USER_UNIT=matrix-xmsg.service | grep -F \"Svc registration failed: bad request: no trusted executable configured for service 'matrix-xmsg'\"",
+            "journalctl _SYSTEMD_USER_UNIT=matrix-xmsg.service | grep -F \"xmsg refused request: error\"",
             timeout=30,
         )
 
-        # Real xmsg also denies matrix-xmsg on agent.sock because its PID is not an active session
+        # The shared client refuses outbound work while registration is disconnected
         machine.wait_until_succeeds(
-            "journalctl _SYSTEMD_USER_UNIT=matrix-xmsg.service | grep -F 'does not descend from an active agent session'",
+            "journalctl _SYSTEMD_USER_UNIT=matrix-xmsg.service | grep -F 'service is disconnected'",
             timeout=30,
         )
 
         journal = machine.succeed("journalctl _SYSTEMD_USER_UNIT=matrix-xmsg.service")
         assert "Registered on xmsg as" not in journal, f"Expected registration to be refused, got: {journal}"
+
+        machine.succeed(
+            "${pkgs.strace}/bin/strace -e trace=connect -o /tmp/agent-connect-control.trace "
+            "${pkgs.python3}/bin/python3 -c 'import socket; "
+            "s=socket.socket(socket.AF_UNIX); s.connect(\"/run/user/1000/xmsg/agent.sock\")'"
+        )
+        control = machine.succeed("cat /tmp/agent-connect-control.trace")
+        assert "agent.sock" in control, f"Agent connection trace control was not live: {control}"
+
+        trace = machine.succeed("cat /home/alice/xmsg-connect.trace")
+        assert "register.sock" in trace, f"Expected a traced registration attempt: {trace}"
+        assert "agent.sock" not in trace, f"Unregistered service attempted agent.sock: {trace}"
       ''
     else
       ''
@@ -138,7 +165,7 @@ pkgs.testers.nixosTest {
 
         # Real xmsg admits matrix-xmsg's PID on agent.sock as a registered live session
         machine.wait_until_succeeds(
-            "journalctl _SYSTEMD_USER_UNIT=matrix-xmsg.service | grep -F \"no live recipient matches 'claude'\"",
+            "journalctl _SYSTEMD_USER_UNIT=matrix-xmsg.service | grep -F \"xmsg refused request: not_found\"",
             timeout=30,
         )
       '';

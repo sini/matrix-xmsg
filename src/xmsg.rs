@@ -378,7 +378,9 @@ impl SvcInbox for ReconnectingSvcInbox {
         if self.current.is_none() {
             match register_with_client(self.options.clone(), self.client.clone()).await {
                 Ok(inbox) => {
-                    tracing::info!(address = ?inbox.address(), "Registered on xmsg");
+                    if let Some(address) = inbox.address() {
+                        tracing::info!("Registered on xmsg as {address}");
+                    }
                     self.current = Some(inbox);
                     self.current_backoff = self.min_backoff;
                 }
