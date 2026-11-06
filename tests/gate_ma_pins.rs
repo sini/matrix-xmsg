@@ -34,6 +34,7 @@ fn mock_socket(
     name: &str,
     answer: fn(usize) -> Option<Value>,
 ) -> (PathBuf, Arc<AtomicUsize>) {
+    transport_fixture::secure_directory(dir.path());
     let sock = dir.path().join(name);
     let listener = UnixListener::bind(&sock).unwrap();
     let counter = Arc::new(AtomicUsize::new(0));

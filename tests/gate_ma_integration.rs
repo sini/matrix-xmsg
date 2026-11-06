@@ -51,17 +51,7 @@ const ID_Y: &str = "b1b1b1b1-0000-4000-8000-0000000000b1";
 
 /// `$XMSG_BIN`, or `None` to skip. Under the integration check a missing binary panics.
 fn xmsg_bin() -> Option<PathBuf> {
-    match std::env::var_os("XMSG_BIN") {
-        Some(p) => Some(PathBuf::from(p)),
-        None => {
-            assert!(
-                std::env::var_os(REQUIRED).is_none(),
-                "XMSG_BIN is unset but {REQUIRED} is set: this run must exercise a real xmsg"
-            );
-            eprintln!("XMSG_BIN unset: skipping (set it, or run the ci/ integration check)");
-            None
-        }
-    }
+    binary_provenance::xmsg_bin(REQUIRED)
 }
 
 /// The body of every child this binary starts. In the parent under `MA_XMSG_REQUIRED`, it fails
@@ -1122,3 +1112,13 @@ mod child {
 
 #[path = "common/transport.rs"]
 mod transport_fixture;
+
+#[path = "common/binary.rs"]
+mod binary_provenance;
+
+#[test]
+fn pinned_binary_revision_is_verified() {
+    if std::env::var_os(REQUIRED).is_some() {
+        xmsg_bin().expect("mandatory pinned binary");
+    }
+}

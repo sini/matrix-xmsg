@@ -25,6 +25,7 @@ pub struct MockXmsgClient {
     pub replies: Arc<Mutex<Vec<(String, String)>>>,       // (message_id, text)
     pub session_id: Mutex<Option<String>>,
     pub counter: AtomicUsize,
+    pub guard_transport: Option<Arc<dyn XmsgClient>>,
 }
 
 impl Default for MockXmsgClient {
@@ -34,6 +35,7 @@ impl Default for MockXmsgClient {
             replies: Arc::new(Mutex::new(Vec::new())),
             session_id: Mutex::new(Some("session-m38@sini.test".to_string())),
             counter: AtomicUsize::new(0),
+            guard_transport: None,
         }
     }
 }
@@ -46,6 +48,14 @@ impl XmsgClient for MockXmsgClient {
         from: &str,
         text: &str,
     ) -> Result<SendResponse, AppError> {
+        if expert_ref == "genie-guard" {
+            return self
+                .guard_transport
+                .as_ref()
+                .expect("guard fixture transport")
+                .send_message(expert_ref, from, text)
+                .await;
+        }
         self.sends.lock().unwrap().push((
             expert_ref.to_string(),
             from.to_string(),
@@ -173,6 +183,8 @@ async fn oracle_1_context_request_requiring_inbox_guard_verdict_completes() {
                             let resp = json!({
                                 "status": "ok",
                                 "message_id": guard_req_id,
+                                "address": "genie-guard@sini.test",
+                                "outcome": "queued",
                             });
                             let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                             let _ = w.flush().await;
@@ -217,7 +229,11 @@ async fn oracle_1_context_request_requiring_inbox_guard_verdict_completes() {
     );
 
     let store = Arc::new(Store::new_in_memory().unwrap());
-    let xmsg = Arc::new(MockXmsgClient::default());
+    let registration = transport_fixture::register_for_agent(&agent_sock_path).await;
+    let xmsg = Arc::new(MockXmsgClient {
+        guard_transport: Some(registration.client()),
+        ..Default::default()
+    });
 
     // Seed a forwarded mention so 01M38MSG000001 is a known forward in session-m38
     let trigger = make_event(
@@ -355,6 +371,8 @@ async fn oracle_2_unacked_head_delivery_deadlocks_awaiting_second_delivery_witho
                             let resp = json!({
                                 "status": "ok",
                                 "message_id": guard_req_id,
+                                "address": "genie-guard@sini.test",
+                                "outcome": "queued",
                             });
                             let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                             let _ = w.flush().await;
@@ -398,7 +416,11 @@ async fn oracle_2_unacked_head_delivery_deadlocks_awaiting_second_delivery_witho
     );
 
     let store = Arc::new(Store::new_in_memory().unwrap());
-    let xmsg = Arc::new(MockXmsgClient::default());
+    let registration = transport_fixture::register_for_agent(&agent_sock_path).await;
+    let xmsg = Arc::new(MockXmsgClient {
+        guard_transport: Some(registration.client()),
+        ..Default::default()
+    });
 
     let trigger = make_event(
         "$trig_2",
@@ -1001,6 +1023,8 @@ async fn oracle_5_seventeen_concurrent_context_requests_complete_via_verdict_fas
                             let resp = json!({
                                 "status": "ok",
                                 "message_id": guard_req_id,
+                                "address": "genie-guard@sini.test",
+                                "outcome": "queued",
                             });
                             let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                             let _ = w.flush().await;
@@ -1046,7 +1070,11 @@ async fn oracle_5_seventeen_concurrent_context_requests_complete_via_verdict_fas
     );
 
     let store = Arc::new(Store::new_in_memory().unwrap());
-    let xmsg = Arc::new(MockXmsgClient::default());
+    let registration = transport_fixture::register_for_agent(&agent_sock).await;
+    let xmsg = Arc::new(MockXmsgClient {
+        guard_transport: Some(registration.client()),
+        ..Default::default()
+    });
     let mock_guard = MockGuardClient::new();
 
     const N_REQUESTS: usize = 17;
@@ -1129,3 +1157,6 @@ async fn oracle_5_seventeen_concurrent_context_requests_complete_via_verdict_fas
 #[path = "common/replies.rs"]
 mod replies;
 use matrix_xmsg::xmsg::ReplyOutcome;
+
+#[path = "common/transport.rs"]
+mod transport_fixture;

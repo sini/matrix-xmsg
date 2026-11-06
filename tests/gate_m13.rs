@@ -26,6 +26,7 @@ pub struct MockXmsgSockets {
 
 impl MockXmsgSockets {
     pub async fn start(dir: &Path) -> Self {
+        transport_fixture::secure_directory(dir);
         let register_sock_path = dir.join("register.sock");
         let agent_sock_path = dir.join("agent.sock");
         let _ = std::fs::remove_file(&register_sock_path);
@@ -68,8 +69,8 @@ impl MockXmsgSockets {
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
                                                     "message_id": msg_id,
-                                                    "address": "",
-                                                    "outcome": "pending",
+                                                    "address": "claude@sini.test",
+                                                    "outcome": "queued",
                                                 });
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;
@@ -816,6 +817,11 @@ async fn oracle_7_reply_attributed_to_either_delta_or_bootstrap_message_id() {
         .await
         .unwrap();
 
+    // Model a cursor bound to the previous expert instance, forcing a real rebootstrap.
+    store
+        .set_thread_cursor("$root_m13", "$ev_init", 1000, Some("previous@sini.test"))
+        .unwrap();
+
     let ev2 = IncomingMatrixEvent {
         room_id: "!support:example.org".to_string(),
         event_id: "$ev_second".to_string(),
@@ -833,7 +839,9 @@ async fn oracle_7_reply_attributed_to_either_delta_or_bootstrap_message_id() {
         .await
         .unwrap();
 
-    // Reply referencing first forward's message ID (01M13MSG0000000000000001)
+    assert_eq!(server.recorded_sends.lock().await.len(), 3);
+
+    // Reply referencing the second forward's delta message ID.
     server
         .queue_delivery(serde_json::json!({
             "status": "ok",
@@ -841,7 +849,7 @@ async fn oracle_7_reply_attributed_to_either_delta_or_bootstrap_message_id() {
             "messageId": "01M13REP_A",
             "fromName": "claude",
             "text": "Answer referencing first message id",
-            "envelope": "[xmsg] reply to message_id=01M13MSG0000000000000001 — message_id=01M13REP_A\nAnswer referencing first message id"
+            "envelope": "[xmsg] reply to message_id=01M13MSG0000000000000002 — message_id=01M13REP_A\nAnswer referencing first message id"
         }))
         .await;
 
@@ -849,7 +857,7 @@ async fn oracle_7_reply_attributed_to_either_delta_or_bootstrap_message_id() {
     let res_a = handle_inbox_delivery(&d_a, &config, &matrix, &store, &mut inbox, 1060).await;
     assert_eq!(res_a.unwrap(), BotOutcome::Replied);
 
-    // Reply referencing second forward's message ID (01M13MSG0000000000000002)
+    // Reply referencing that forward's separate rebootstrap message ID.
     server
         .queue_delivery(serde_json::json!({
             "status": "ok",
@@ -857,7 +865,7 @@ async fn oracle_7_reply_attributed_to_either_delta_or_bootstrap_message_id() {
             "messageId": "01M13REP_B",
             "fromName": "claude",
             "text": "Answer referencing second message id",
-            "envelope": "[xmsg] reply to message_id=01M13MSG0000000000000002 — message_id=01M13REP_B\nAnswer referencing second message id"
+            "envelope": "[xmsg] reply to message_id=01M13MSG0000000000000003 — message_id=01M13REP_B\nAnswer referencing second message id"
         }))
         .await;
 

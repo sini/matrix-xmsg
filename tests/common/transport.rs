@@ -19,6 +19,7 @@ pub fn options(register: impl AsRef<Path>, service: &str) -> ClientOptions {
 
 /// A live registration for tests whose external boundary is just agent.sock.
 pub async fn register_for_agent(agent: impl AsRef<Path>) -> SvcSocketInbox {
+    secure_directory(agent.as_ref().parent().unwrap());
     let register = agent.as_ref().with_file_name("fixture-register.sock");
     let listener = tokio::net::UnixListener::bind(&register).unwrap();
     tokio::spawn(async move {
@@ -39,4 +40,9 @@ pub async fn register_for_agent(agent: impl AsRef<Path>) -> SvcSocketInbox {
     let mut config = options(register, "matrix-xmsg");
     config.agent_socket = agent.as_ref().into();
     register_svc(config).await.unwrap()
+}
+
+pub fn secure_directory(directory: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
 }

@@ -2274,6 +2274,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+ "xmsg",
 ]
 
 [[package]]
@@ -4758,6 +4759,18 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.21",
  "time",
+]
+
+[[package]]
+name = "xmsg"
+version = "0.1.0"
+source = "git+https://github.com/sini/xmsg?rev=0d9ee145f7875aa4b930b4efd41615bdcfd1f806#0d9ee145f7875aa4b930b4efd41615bdcfd1f806"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

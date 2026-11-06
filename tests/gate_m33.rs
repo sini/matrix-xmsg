@@ -1576,19 +1576,7 @@ mod real_xmsg_oracle_f {
     const ID_OTHER: &str = "b2b2b2b2-0000-4000-8000-0000000000b2";
 
     fn xmsg_bin() -> Option<PathBuf> {
-        match std::env::var_os("XMSG_BIN") {
-            Some(p) => Some(PathBuf::from(p)),
-            None => {
-                assert!(
-                    std::env::var_os(REQUIRED).is_none(),
-                    "XMSG_BIN is unset but {REQUIRED} is set: this run must exercise a real xmsg"
-                );
-                eprintln!(
-                    "XMSG_BIN unset: skipping oracle_f (set XMSG_BIN and pass --include-ignored)"
-                );
-                None
-            }
-        }
+        super::binary_provenance::xmsg_bin(REQUIRED)
     }
 
     #[test]
@@ -2022,3 +2010,6 @@ use matrix_xmsg::xmsg::ReplyOutcome;
 
 #[path = "common/transport.rs"]
 mod transport_fixture;
+
+#[path = "common/binary.rs"]
+mod binary_provenance;

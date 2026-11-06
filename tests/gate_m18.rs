@@ -26,6 +26,7 @@ pub struct MockXmsgSockets {
 
 impl MockXmsgSockets {
     pub async fn start(dir: &Path) -> Self {
+        transport_fixture::secure_directory(dir);
         let agent_sock_path = dir.join("agent.sock");
         let _ = std::fs::remove_file(&agent_sock_path);
 
@@ -294,6 +295,10 @@ async fn oracle_1_mock_server_drops_connection_and_bot_reregisters() {
         })
         .unwrap();
 
+    store
+        .set_forward_session(orig_msg_id, Some("claude@sini.test"))
+        .unwrap();
+
     let inbox = ReconnectingSvcInbox::new(transport_fixture::options(
         config.xmsg_register_socket(),
         "matrix-xmsg",
@@ -478,6 +483,10 @@ async fn oracle_2_unacked_delivery_before_drop_is_redelivered_and_posted_once() 
         })
         .unwrap();
 
+    store
+        .set_forward_session(orig_msg_id, Some("claude@sini.test"))
+        .unwrap();
+
     let inbox = ReconnectingSvcInbox::new(transport_fixture::options(
         config.xmsg_register_socket(),
         "matrix-xmsg",
@@ -592,6 +601,10 @@ async fn oracle_3_bot_keeps_running_while_server_is_down() {
             timeout_dm_sent: false,
             reply_count: 0,
         })
+        .unwrap();
+
+    store
+        .set_forward_session(orig_msg_id, Some("claude@sini.test"))
         .unwrap();
 
     let inbox = ReconnectingSvcInbox::new(transport_fixture::options(

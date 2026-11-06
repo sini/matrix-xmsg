@@ -670,7 +670,8 @@ async fn xb1_f3_route_guard_reply_checks_delivery_origin_matches_guard_ref() {
                 let resp = json!({
                     "status": "ok",
                     "message_id": guard_req_id,
-                    "address": "genie-guard@sini.test"
+                    "address": "genie-guard@sini.test",
+                    "outcome": "queued"
                 });
                 w.write_all(format!("{resp}\n").as_bytes()).await.unwrap();
                 w.flush().await.unwrap();

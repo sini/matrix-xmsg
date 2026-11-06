@@ -22,6 +22,7 @@ pub struct MockXmsgSockets {
 
 impl MockXmsgSockets {
     pub async fn start(dir: &Path) -> Self {
+        transport_fixture::secure_directory(dir);
         let register_sock_path = dir.join("register.sock");
         let agent_sock_path = dir.join("agent.sock");
         let _ = std::fs::remove_file(&register_sock_path);
@@ -58,8 +59,8 @@ impl MockXmsgSockets {
                                                 let resp = serde_json::json!({
                                                     "status": "ok",
                                                     "message_id": "01M7MSGTEST0000000000000000",
-                                                    "address": "",
-                                                    "outcome": "pending",
+                                                    "address": "claude@sini.test",
+                                                    "outcome": "queued",
                                                 });
                                                 let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
                                                 let _ = w.flush().await;

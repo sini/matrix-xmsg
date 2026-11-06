@@ -10,7 +10,7 @@ use crate::sender_map::map_sender_mxid;
 use crate::store::{BotReplyEventRecord, ForwardedMessageRecord, Store};
 use crate::xmsg::{
     parse_in_reply_to_id, route_guard_reply, GuardClient, GuardContent, GuardEnvelope, GuardLine,
-    ReplyOutcome, SendResponse, SvcDelivery, SvcInbox, XmsgClient,
+    ReplyOutcome, SvcDelivery, SvcInbox, XmsgClient,
 };
 
 /// The bound on each attempt of a send made under `Store::forward_gate`, which holds the inbox.
@@ -1464,7 +1464,10 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
 }
 
 /// The retained resync cursor policy, shared with the transport parity oracle.
-pub fn delivery_cursor_session(delivery: &SvcDelivery, send_resp: &SendResponse) -> Option<String> {
+pub fn delivery_cursor_session(
+    delivery: &SvcDelivery,
+    fallback_session: Option<&str>,
+) -> Option<String> {
     let asker_origin_key = origin_author_key(delivery);
     let asker_session_id = asker_origin_key
         .as_deref()
@@ -1472,7 +1475,7 @@ pub fn delivery_cursor_session(delivery: &SvcDelivery, send_resp: &SendResponse)
             (!delivery.from_name.is_empty())
                 .then(|| crate::xmsg::sender_address(&delivery.from_name))
         })
-        .or(send_resp.session_id.as_deref());
+        .or(fallback_session);
 
     asker_session_id.map(str::to_owned)
 }
@@ -2520,9 +2523,13 @@ async fn handle_resync_request<I: SvcInbox + ?Sized>(
     {
         Some(id) => id.to_string(),
         None => {
-            let _ = xmsg
+            match xmsg
                 .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
-                .await;
+                .await
+            {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::ResyncUnknown);
         }
@@ -2531,18 +2538,26 @@ async fn handle_resync_request<I: SvcInbox + ?Sized>(
     let forward = match store.get_forwarded_message(&orig_id)? {
         Some(f) => f,
         None => {
-            let _ = xmsg
+            match xmsg
                 .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
-                .await;
+                .await
+            {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::ResyncUnknown);
         }
     };
 
     if !is_caller_bound_to_forward(delivery, &forward, store)? {
-        let _ = xmsg
+        match xmsg
             .reply_message(&delivery.message_id, r#"{"resync": "unknown"}"#)
-            .await;
+            .await
+        {
+            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+            Err(_) => {}
+        }
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::ResyncUnknown);
     }
@@ -2648,7 +2663,11 @@ async fn handle_resync_request<I: SvcInbox + ?Sized>(
         .or_else(|| thread_history.last().map(|m| m.event_id.as_str()))
         .unwrap_or(&forward.thread_root_id);
 
-    let asker_session_id = delivery_cursor_session(delivery, &send_resp);
+    let fallback_session = match &send_resp {
+        ReplyOutcome::Pushed { response, .. } => response.session_id.as_deref(),
+        ReplyOutcome::Stored { .. } => None,
+    };
+    let asker_session_id = delivery_cursor_session(delivery, fallback_session);
 
     let existing_target_ref = store
         .get_thread_cursor(&forward.thread_root_id)?
@@ -2686,9 +2705,13 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
     {
         Some(id) => id.to_string(),
         None => {
-            let _ = xmsg
+            match xmsg
                 .reply_message(&delivery.message_id, r#"{"context":"unknown"}"#)
-                .await;
+                .await
+            {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::ContextUnknown);
         }
@@ -2697,9 +2720,13 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
     let forward = match store.get_forwarded_message(&orig_id)? {
         Some(f) => f,
         None => {
-            let _ = xmsg
+            match xmsg
                 .reply_message(&delivery.message_id, r#"{"context":"unknown"}"#)
-                .await;
+                .await
+            {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::ContextUnknown);
         }
@@ -2707,9 +2734,13 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
 
     // §4 rule 3: Session authorization
     if !is_caller_bound_to_forward(delivery, &forward, store)? {
-        let _ = xmsg
+        match xmsg
             .reply_message(&delivery.message_id, r#"{"context":"unknown"}"#)
-            .await;
+            .await
+        {
+            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+            Err(_) => {}
+        }
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::ContextUnknown);
     }

@@ -437,10 +437,10 @@ async fn agent_sock_answering(
             let (r, mut w) = stream.into_split();
             let mut lines = tokio::io::BufReader::new(r).lines();
             if let Ok(Some(line)) = lines.next_line().await {
-                seen.lock()
-                    .unwrap()
-                    .push(serde_json::from_str(&line).unwrap());
-                let _ = w.write_all(format!("{answer}\n").as_bytes()).await;
+                let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let response = &answer[frame["action"].as_str().unwrap()];
+                seen.lock().unwrap().push(frame);
+                let _ = w.write_all(format!("{response}\n").as_bytes()).await;
             }
         }
     });
@@ -456,8 +456,9 @@ async fn keyed_frames_carry_the_key_and_read_pending() {
     let frames = agent_sock_answering(
         tmp.path(),
         serde_json::json!({
-            "status": "ok", "message_id": "01FIRST", "address": "", "outcome": "pending",
-            "reply": {"seq": 0, "messageId":"01REQ", "createdAt":1, "replierSessionId":"matrix-xmsg", "text":"hi", "pushOutcome": "pending", "pushedMessageId": "01FIRSTREPLY"},
+            "send": {"status":"ok", "message_id":"01FIRST", "address":"", "outcome":"pending"},
+            "reply": {"status":"ok", "reply": {"seq":0,"messageId":"01REQ","createdAt":1,
+                "replierSessionId":"matrix-xmsg","text":"hi","pushOutcome":"pending","pushedMessageId":"01FIRSTREPLY"}},
         }),
     )
     .await;
