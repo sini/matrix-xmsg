@@ -168,10 +168,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Failed resolving configured rooms in client state: {e}");
     }
 
-    let register_sock = config.xmsg_register_socket();
-    let svc_inbox = matrix_xmsg::xmsg::ReconnectingSvcInbox::new(register_sock, "matrix-xmsg");
+    let svc_inbox = matrix_xmsg::xmsg::ReconnectingSvcInbox::new(
+        matrix_xmsg::xmsg::client_options(&config, "matrix-xmsg"),
+    );
 
-    let xmsg_client = matrix_xmsg::xmsg::create_xmsg_client(&config);
+    let xmsg_client = matrix_xmsg::xmsg::create_xmsg_client(&svc_inbox);
 
     let tracker = matrix_xmsg::bot::register_event_handlers(
         matrix_client.inner(),

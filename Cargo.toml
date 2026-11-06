@@ -18,6 +18,7 @@ name = "matrix_xmsg"
 path = "src/lib.rs"
 
 [dependencies]
+xmsg = { git = "https://github.com/sini/xmsg", rev = "0d9ee145f7875aa4b930b4efd41615bdcfd1f806", default-features = false, features = ["client"] }
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "fs", "signal"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -27,7 +28,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2.0"
 regex = "1.11"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

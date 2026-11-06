@@ -10,7 +10,7 @@ use crate::sender_map::map_sender_mxid;
 use crate::store::{BotReplyEventRecord, ForwardedMessageRecord, Store};
 use crate::xmsg::{
     parse_in_reply_to_id, route_guard_reply, GuardClient, GuardContent, GuardEnvelope, GuardLine,
-    SvcDelivery, SvcInbox, XmsgClient,
+    ReplyOutcome, SendResponse, SvcDelivery, SvcInbox, XmsgClient,
 };
 
 /// The bound on each attempt of a send made under `Store::forward_gate`, which holds the inbox.
@@ -310,7 +310,7 @@ pub async fn handle_incoming_event(
     xmsg: &dyn XmsgClient,
     store: &Store,
 ) -> Result<BotOutcome, AppError> {
-    let guard = crate::xmsg::create_guard_client(config);
+    let guard = crate::xmsg::create_guard_client(config, xmsg);
     handle_incoming_event_with_guard(
         event,
         room_history,
@@ -333,7 +333,7 @@ pub async fn handle_incoming_event_with_claim(
     store: &Store,
     claimed: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BotOutcome, AppError> {
-    let guard = crate::xmsg::create_guard_client(config);
+    let guard = crate::xmsg::create_guard_client(config, xmsg);
     handle_incoming_event_with_guard(
         event,
         room_history,
@@ -990,7 +990,12 @@ pub async fn handle_incoming_event_with_guard(
         .await;
 
         let (relayed_message_id, session_id) = match send_res {
-            Ok(resp) => (resp.message_id, resp.session_id),
+            Ok(ReplyOutcome::Pushed { response, .. }) => {
+                (Some(response.message_id), response.session_id)
+            }
+            Ok(ReplyOutcome::Stored { record }) => {
+                (record.pushed_message_id.filter(|id| !id.is_empty()), None)
+            }
             Err(e) => {
                 // The synthetic id below answers no send, so no reply waits on its record:
                 // release the gate before the unbounded owner DM.
@@ -1011,7 +1016,7 @@ pub async fn handle_incoming_event_with_guard(
                     let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
                     let _ = store.set_solicited_thread_push_failure_dm_sent(&thread_root);
                 }
-                (format!("dead-session-{}", trigger_msg.event_id), None)
+                (Some(format!("dead-session-{}", trigger_msg.event_id)), None)
             }
         };
 
@@ -1029,30 +1034,36 @@ pub async fn handle_incoming_event_with_guard(
             relay_session.as_deref(),
         )?;
 
-        store.record_thread_message(&thread_root, &relayed_message_id, now_secs)?;
-        let forward_rec = ForwardedMessageRecord {
-            message_id: relayed_message_id.clone(),
-            room_id: event.room_id.clone(),
-            thread_root_id: thread_root.clone(),
-            event_id: reaction_target_id.clone(),
-            sender_mxid: event.sender_mxid.clone(),
-            addressed: is_addressed,
-            sent_at: now_secs,
-            ack_reaction_id: None,
-            timeout_dm_sent: false,
-            reply_count: 0,
-        };
-        store.record_forwarded_message(&forward_rec)?;
-        store.set_forward_session(&relayed_message_id, relay_session.as_deref())?;
+        if let Some(ref relayed_message_id) = relayed_message_id {
+            store.record_thread_message(&thread_root, &relayed_message_id, now_secs)?;
+            let forward_rec = ForwardedMessageRecord {
+                message_id: relayed_message_id.clone(),
+                room_id: event.room_id.clone(),
+                thread_root_id: thread_root.clone(),
+                event_id: reaction_target_id.clone(),
+                sender_mxid: event.sender_mxid.clone(),
+                addressed: is_addressed,
+                sent_at: now_secs,
+                ack_reaction_id: None,
+                timeout_dm_sent: false,
+                reply_count: 0,
+            };
+            store.record_forwarded_message(&forward_rec)?;
+            store.set_forward_session(&relayed_message_id, relay_session.as_deref())?;
+        }
         drop(gate);
 
         if is_addressed {
+            let forwards = relayed_message_id
+                .as_deref()
+                .into_iter()
+                .collect::<Vec<_>>();
             ack_forward(
                 matrix,
                 store,
                 &event.room_id,
                 &reaction_target_id,
-                &[&relayed_message_id],
+                &forwards,
             )
             .await?;
         }
@@ -1288,7 +1299,7 @@ pub async fn handle_inbox_delivery<I: SvcInbox + ?Sized>(
     inbox: &mut I,
     now_secs: i64,
 ) -> Result<BotOutcome, AppError> {
-    let default_xmsg = crate::xmsg::create_xmsg_client(config);
+    let default_xmsg = crate::xmsg::create_xmsg_client(inbox);
     handle_inbox_delivery_with_xmsg(
         delivery,
         config,
@@ -1332,7 +1343,10 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
             "error": "unauthorized origin: open_thread requires a sender on an allowed node"
         })
         .to_string();
-        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+            Err(_) => {}
+        }
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::OpenThreadRefusal);
     }
@@ -1345,7 +1359,10 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
                 "error": "missing 'room' in open_thread request"
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::OpenThreadRefusal);
         }
@@ -1356,7 +1373,10 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
             "error": format!("room '{room}' is not in allowlisted rooms")
         })
         .to_string();
-        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+            Err(_) => {}
+        }
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::OpenThreadRefusal);
     }
@@ -1369,7 +1389,10 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
                 "error": "missing 'text' in open_thread request"
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::OpenThreadRefusal);
         }
@@ -1429,11 +1452,29 @@ async fn handle_open_thread<I: SvcInbox + ?Sized>(
         "permalink": permalink,
     })
     .to_string();
-    xmsg.reply_message(&delivery.message_id, &reply_json)
-        .await?;
+    match xmsg
+        .reply_message(&delivery.message_id, &reply_json)
+        .await?
+    {
+        ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. } => {}
+    }
 
     inbox.ack(&delivery.message_id).await?;
     Ok(BotOutcome::OpenThreadSuccess)
+}
+
+/// The retained resync cursor policy, shared with the transport parity oracle.
+pub fn delivery_cursor_session(delivery: &SvcDelivery, send_resp: &SendResponse) -> Option<String> {
+    let asker_origin_key = origin_author_key(delivery);
+    let asker_session_id = asker_origin_key
+        .as_deref()
+        .or_else(|| {
+            (!delivery.from_name.is_empty())
+                .then(|| crate::xmsg::sender_address(&delivery.from_name))
+        })
+        .or(send_resp.session_id.as_deref());
+
+    asker_session_id.map(str::to_owned)
 }
 
 /// Extracts the bare attested ID or service name (`"<id-or-service>"`) strictly from
@@ -1498,7 +1539,10 @@ async fn handle_redact_request<I: SvcInbox + ?Sized>(
                 "error": "missing or empty 'redact' reply message id"
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::RedactRefused);
         }
@@ -1511,7 +1555,10 @@ async fn handle_redact_request<I: SvcInbox + ?Sized>(
                 "error": format!("unknown reply message id '{target_id}'")
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::RedactRefused);
         }
@@ -1525,7 +1572,10 @@ async fn handle_redact_request<I: SvcInbox + ?Sized>(
                 "error": "invalid or empty 'requested_by' forward message id"
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::RedactRefused);
         };
@@ -1535,7 +1585,10 @@ async fn handle_redact_request<I: SvcInbox + ?Sized>(
                 "error": format!("unknown requested_by forward message id '{req_by_id}'")
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::RedactRefused);
         };
@@ -1548,7 +1601,10 @@ async fn handle_redact_request<I: SvcInbox + ?Sized>(
                 )
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::RedactRefused);
         }
@@ -1564,7 +1620,10 @@ async fn handle_redact_request<I: SvcInbox + ?Sized>(
                 )
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::RedactRefused);
         }
@@ -1577,7 +1636,10 @@ async fn handle_redact_request<I: SvcInbox + ?Sized>(
             )
         })
         .to_string();
-        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+            Err(_) => {}
+        }
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::RedactRefused);
     }
@@ -1592,7 +1654,10 @@ async fn handle_redact_request<I: SvcInbox + ?Sized>(
                 )
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::RedactRefused);
         }
@@ -1626,7 +1691,10 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
             "error": "unauthorized: edit is author-only and does not accept 'requested_by'"
         })
         .to_string();
-        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+            Err(_) => {}
+        }
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::EditRefused);
     }
@@ -1643,7 +1711,10 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
                 "error": "missing or empty 'edit' reply message id"
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::EditRefused);
         }
@@ -1656,7 +1727,10 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
                 "error": format!("unknown reply message id '{target_id}'")
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::EditRefused);
         }
@@ -1673,7 +1747,10 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
             )
         })
         .to_string();
-        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+            Err(_) => {}
+        }
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::EditRefused);
     }
@@ -1688,7 +1765,10 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
                 )
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::EditRefused);
         }
@@ -1705,7 +1785,10 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
             "error": "missing or empty 'answer' in edit request"
         })
         .to_string();
-        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+            Err(_) => {}
+        }
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::EditRefused);
     }
@@ -1717,7 +1800,10 @@ async fn handle_edit_request<I: SvcInbox + ?Sized>(
                 "error": "edit request cannot be silent"
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::EditRefused);
         }
@@ -2475,7 +2561,10 @@ async fn handle_resync_request<I: SvcInbox + ?Sized>(
                 "retry_after": retry_after
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::ResyncThrottled);
         }
@@ -2523,7 +2612,10 @@ async fn handle_resync_request<I: SvcInbox + ?Sized>(
                 let attempts = store.get_guard_retries(&delivery.message_id)?.unwrap_or(0);
                 if attempts >= config.guard_retry_budget {
                     let err_reply = r#"{"error":"screening unavailable; try again later"}"#;
-                    let _ = xmsg.reply_message(&delivery.message_id, err_reply).await;
+                    match xmsg.reply_message(&delivery.message_id, err_reply).await {
+                        Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                        Err(_) => {}
+                    }
                     inbox.ack(&delivery.message_id).await?;
                     let _ = store.clear_guard_retries(&delivery.message_id);
                     let _ = store.clear_inbox_retries(&delivery.message_id);
@@ -2556,14 +2648,7 @@ async fn handle_resync_request<I: SvcInbox + ?Sized>(
         .or_else(|| thread_history.last().map(|m| m.event_id.as_str()))
         .unwrap_or(&forward.thread_root_id);
 
-    let asker_origin_key = origin_author_key(delivery);
-    let asker_session_id = asker_origin_key
-        .as_deref()
-        .or_else(|| {
-            (!delivery.from_name.is_empty())
-                .then(|| crate::xmsg::sender_address(&delivery.from_name))
-        })
-        .or(send_resp.session_id.as_deref());
+    let asker_session_id = delivery_cursor_session(delivery, &send_resp);
 
     let existing_target_ref = store
         .get_thread_cursor(&forward.thread_root_id)?
@@ -2572,7 +2657,7 @@ async fn handle_resync_request<I: SvcInbox + ?Sized>(
         &forward.thread_root_id,
         newest_line_id,
         now_secs,
-        asker_session_id,
+        asker_session_id.as_deref(),
         existing_target_ref.as_deref(),
     )?;
 
@@ -2636,7 +2721,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
             "error": "cross-room context request refused: room parameter is not permitted"
         })
         .to_string();
-        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+        match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+            Err(_) => {}
+        }
         inbox.ack(&delivery.message_id).await?;
         return Ok(BotOutcome::ContextRefused);
     }
@@ -2655,7 +2743,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                 "retry_after": retry_after
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::ContextThrottled);
         }
@@ -2669,7 +2760,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                 "error": "missing 'scope' in context request"
             })
             .to_string();
-            let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+            match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                Err(_) => {}
+            }
             inbox.ack(&delivery.message_id).await?;
             return Ok(BotOutcome::ContextRefused);
         }
@@ -2749,7 +2843,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                             "error": format!("event '{before_id}' not found in room")
                         })
                         .to_string();
-                        let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                        match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                            Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                            Err(_) => {}
+                        }
                         inbox.ack(&delivery.message_id).await?;
                         return Ok(BotOutcome::ContextRefused);
                     };
@@ -2790,7 +2887,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                         "error": "missing 'event' in event context request"
                     })
                     .to_string();
-                    let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                    match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                        Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                        Err(_) => {}
+                    }
                     inbox.ack(&delivery.message_id).await?;
                     return Ok(BotOutcome::ContextRefused);
                 };
@@ -2804,7 +2904,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                         "error": format!("event '{event_id}' not found in room")
                     })
                     .to_string();
-                    let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                    match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                        Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                        Err(_) => {}
+                    }
                     inbox.ack(&delivery.message_id).await?;
                     return Ok(BotOutcome::ContextRefused);
                 };
@@ -2841,7 +2944,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                         "error": "missing 'thread' in thread context request"
                     })
                     .to_string();
-                    let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                    match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                        Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                        Err(_) => {}
+                    }
                     inbox.ack(&delivery.message_id).await?;
                     return Ok(BotOutcome::ContextRefused);
                 };
@@ -2855,7 +2961,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                         "error": format!("thread '{thread_id}' not found in room")
                     })
                     .to_string();
-                    let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                    match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                        Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                        Err(_) => {}
+                    }
                     inbox.ack(&delivery.message_id).await?;
                     return Ok(BotOutcome::ContextRefused);
                 }
@@ -2868,7 +2977,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                     "error": format!("unsupported context scope '{scope}'")
                 })
                 .to_string();
-                let _ = xmsg.reply_message(&delivery.message_id, &reply_json).await;
+                match xmsg.reply_message(&delivery.message_id, &reply_json).await {
+                    Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                    Err(_) => {}
+                }
                 inbox.ack(&delivery.message_id).await?;
                 return Ok(BotOutcome::ContextRefused);
             }
@@ -2911,7 +3023,10 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
                 let attempts = store.get_guard_retries(&delivery.message_id)?.unwrap_or(0);
                 if attempts >= config.guard_retry_budget {
                     let err_reply = r#"{"error":"screening unavailable; try again later"}"#;
-                    let _ = xmsg.reply_message(&delivery.message_id, err_reply).await;
+                    match xmsg.reply_message(&delivery.message_id, err_reply).await {
+                        Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}
+                        Err(_) => {}
+                    }
                     inbox.ack(&delivery.message_id).await?;
                     let _ = store.clear_guard_retries(&delivery.message_id);
                     let _ = store.clear_inbox_retries(&delivery.message_id);
@@ -2961,8 +3076,12 @@ async fn handle_context_request<I: SvcInbox + ?Sized>(
         screened.fail_open_warning,
     );
 
-    xmsg.reply_message(&delivery.message_id, &response_text)
-        .await?;
+    match xmsg
+        .reply_message(&delivery.message_id, &response_text)
+        .await?
+    {
+        ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. } => {}
+    }
     inbox.ack(&delivery.message_id).await?;
     Ok(BotOutcome::ContextAnswered)
 }
@@ -2976,7 +3095,7 @@ pub async fn handle_inbox_delivery_with_xmsg<I: SvcInbox + ?Sized>(
     inbox: &mut I,
     now_secs: i64,
 ) -> Result<BotOutcome, AppError> {
-    let guard = crate::xmsg::create_guard_client(config);
+    let guard = crate::xmsg::create_guard_client(config, xmsg);
     handle_inbox_delivery_with_guard(
         delivery,
         config,
@@ -3609,7 +3728,7 @@ pub async fn run_inbox_loop<I: SvcInbox>(
                                                         "error": format!("{e}")
                                                     })
                                                     .to_string();
-                                                    let _ = xmsg.reply_message(&delivery.message_id, &err_reply).await;
+                                                    match xmsg.reply_message(&delivery.message_id, &err_reply).await { Ok(ReplyOutcome::Pushed { .. } | ReplyOutcome::Stored { .. }) => {}, Err(_) => {} }
                                                     let dm_text = format!(
                                                         "[matrix-xmsg] Delivery {} permanently failed after {} attempts: {e}",
                                                         delivery.message_id,

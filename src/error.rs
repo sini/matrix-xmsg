@@ -11,6 +11,9 @@ pub enum AppError {
     #[error("xmsg client error: {0}")]
     Xmsg(String),
 
+    #[error("{0}")]
+    XmsgTransport(#[from] ::xmsg::client::ClientError),
+
     #[error("Store error: {0}")]
     Store(String),
 

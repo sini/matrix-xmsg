@@ -1,14 +1,16 @@
 use crate::config::Config;
 use crate::error::AppError;
+pub use ::xmsg::client::ReplyRecord;
+use ::xmsg::client::{
+    current_uid, AgentClient, ClientError, ClientOptions, Delivery, RegisteredService,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 /// Parses the replied-to message ID from a delivery envelope or text.
 ///
@@ -131,6 +133,10 @@ pub trait SvcInbox: Send + Sync {
     fn node(&self) -> Option<String> {
         None
     }
+
+    fn xmsg_client(&self) -> Option<Arc<dyn XmsgClient>> {
+        None
+    }
 }
 
 /// Shared test-support `SvcInbox` mock that behaves like real `xmsg` at `cca3de7` (XF6) or later:
@@ -248,223 +254,89 @@ impl SvcInbox for MockSvcInbox {
     }
 }
 
-/// Live socket connection to `register.sock` acting as the service inbox.
+/// The caller's live service registration, using xmsg's shared transport.
 pub struct SvcSocketInbox {
-    lines: tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
-    writer: tokio::net::unix::OwnedWriteHalf,
-    address: String,
-    node: String,
+    service: RegisteredService,
+    client: Arc<UnixXmsgClient>,
 }
 
 impl SvcSocketInbox {
-    /// The registration's address, `<name>@<node>`.
-    pub fn address(&self) -> &str {
-        &self.address
+    pub fn address(&self) -> Option<&str> {
+        self.service.address()
     }
+
+    pub fn client(&self) -> Arc<UnixXmsgClient> {
+        self.client.clone()
+    }
+}
+
+fn delivery_from_transport(delivery: Delivery) -> Result<SvcDelivery, AppError> {
+    Ok(SvcDelivery {
+        message_id: delivery.message_id().into(),
+        from_name: delivery.from_name().into(),
+        text: delivery.text().into(),
+        envelope: delivery.envelope().into(),
+        origin: Some(serde_json::to_value(delivery.origin()).map_err(|_| ClientError::Protocol)?),
+        in_reply_to: delivery.in_reply_to().map(str::to_owned),
+    })
 }
 
 #[async_trait]
 impl SvcInbox for SvcSocketInbox {
     async fn poll(&mut self, wait_secs: u64) -> Result<Option<SvcDelivery>, AppError> {
-        let req = serde_json::json!({
-            "action": "poll",
-            "waitSecs": wait_secs,
-        });
-        let line = format!("{req}\n");
-        self.writer
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| AppError::Xmsg(format!("Failed to write poll request: {e}")))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|e| AppError::Xmsg(format!("Failed to flush poll request: {e}")))?;
-
-        let resp_line = self
-            .lines
-            .next_line()
-            .await
-            .map_err(|e| AppError::Xmsg(format!("Failed to read poll response: {e}")))?
-            .ok_or_else(|| {
-                AppError::Xmsg("Svc socket closed while waiting for poll response".to_string())
-            })?;
-
-        let val: Value = serde_json::from_str(&resp_line).map_err(|e| {
-            AppError::Xmsg(format!(
-                "Invalid JSON in poll response: {e}; raw: {resp_line}"
-            ))
-        })?;
-
-        if let Some(status) = val.get("status").and_then(|s| s.as_str()) {
-            if status == "error" {
-                let detail = val
-                    .get("detail")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("unknown error");
-                return Err(AppError::Xmsg(format!("Poll error: {detail}")));
-            }
-        }
-
-        let action = val.get("action").and_then(|a| a.as_str()).unwrap_or("");
-        match action {
-            "deliver" => {
-                let str_field = |k: &str| val.get(k).and_then(|v| v.as_str()).map(String::from);
-                let message_id = str_field("messageId").ok_or_else(|| {
-                    AppError::Xmsg("Missing messageId in deliver frame".to_string())
-                })?;
-                Ok(Some(SvcDelivery {
-                    message_id,
-                    from_name: str_field("fromName").unwrap_or_default(),
-                    text: str_field("text").unwrap_or_default(),
-                    envelope: str_field("envelope").unwrap_or_default(),
-                    origin: val.get("origin").cloned(),
-                    in_reply_to: str_field("inReplyTo"),
-                }))
-            }
-            "timeout" => Ok(None),
-            _ => Err(AppError::Xmsg(format!(
-                "Unexpected action in poll response: {action}"
-            ))),
-        }
+        self.service
+            .poll(wait_secs)
+            .await?
+            .map(delivery_from_transport)
+            .transpose()
     }
 
     async fn ack(&mut self, message_id: &str) -> Result<(), AppError> {
-        let req = serde_json::json!({
-            "action": "ack",
-            "messageId": message_id,
-        });
-        let line = format!("{req}\n");
-        self.writer
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| AppError::Xmsg(format!("Failed to write ack request: {e}")))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|e| AppError::Xmsg(format!("Failed to flush ack request: {e}")))?;
-
-        let resp_line = self
-            .lines
-            .next_line()
-            .await
-            .map_err(|e| AppError::Xmsg(format!("Failed to read ack response: {e}")))?
-            .ok_or_else(|| {
-                AppError::Xmsg("Svc socket closed while waiting for ack response".to_string())
-            })?;
-
-        let val: Value = serde_json::from_str(&resp_line).map_err(|e| {
-            AppError::Xmsg(format!(
-                "Invalid JSON in ack response: {e}; raw: {resp_line}"
-            ))
-        })?;
-
-        if let Some(status) = val.get("status").and_then(|s| s.as_str()) {
-            if status == "ok" {
-                return Ok(());
-            } else if status == "error" {
-                let detail = val
-                    .get("detail")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("unknown error");
-                return Err(AppError::Xmsg(format!("Ack error: {detail}")));
-            }
-        }
-        Err(AppError::Xmsg(format!(
-            "Unexpected response to ack: {resp_line}"
-        )))
+        self.service.ack(message_id).await.map_err(Into::into)
     }
 
     fn node(&self) -> Option<String> {
-        Some(self.node.clone())
+        self.service.node().map(str::to_owned)
+    }
+
+    fn xmsg_client(&self) -> Option<Arc<dyn XmsgClient>> {
+        Some(self.client.clone())
     }
 }
 
-/// Connects to `register.sock` and registers as the service `<service_name>` (a bare name, A11).
-/// Returns the connected `SvcSocketInbox` on success, holding the address and node name from the
-/// `ok` frame. If registration is refused, or the `ok` frame names no node, returns an error.
-pub async fn register_svc(
-    register_sock_path: &Path,
-    service_name: &str,
-) -> Result<SvcSocketInbox, AppError> {
-    let stream = tokio::net::UnixStream::connect(register_sock_path)
-        .await
-        .map_err(|e| {
-            AppError::Xmsg(format!(
-                "Failed to connect to register socket at {}: {e}",
-                register_sock_path.display()
-            ))
-        })?;
-
-    let (read_half, mut write_half) = stream.into_split();
-    let mut lines = tokio::io::BufReader::new(read_half).lines();
-
-    let reg_req = serde_json::json!({
-        "harness": "svc",
-        "name": service_name,
-        "cwd": "/",
-    });
-    let reg_line = format!("{reg_req}\n");
-    write_half
-        .write_all(reg_line.as_bytes())
-        .await
-        .map_err(|e| AppError::Xmsg(format!("Failed to send registration: {e}")))?;
-    write_half
-        .flush()
-        .await
-        .map_err(|e| AppError::Xmsg(format!("Failed to flush registration: {e}")))?;
-
-    let resp_line = lines
-        .next_line()
-        .await
-        .map_err(|e| AppError::Xmsg(format!("Failed to read registration response: {e}")))?
-        .ok_or_else(|| {
-            AppError::Xmsg("Register socket closed before registration response".to_string())
-        })?;
-
-    let val: Value = serde_json::from_str(&resp_line).map_err(|e| {
-        AppError::Xmsg(format!(
-            "Invalid JSON in registration response: {e}; raw: {resp_line}"
-        ))
-    })?;
-
-    let status = val.get("status").and_then(|s| s.as_str()).unwrap_or("");
-    if status != "ok" {
-        let detail = val
-            .get("detail")
-            .and_then(|d| d.as_str())
-            .unwrap_or("registration rejected");
-        return Err(AppError::Xmsg(format!("Svc registration failed: {detail}")));
+/// Matrix accepts the UID-verified daemon's own node name; it never guesses one.
+/// Callers can override bounds in the returned options before constructing the inbox.
+pub fn client_options(config: &Config, service: &str) -> ClientOptions {
+    ClientOptions {
+        register_socket: config.xmsg_register_socket(),
+        agent_socket: config.xmsg_agent_socket(),
+        max_frame_bytes: 1024 * 1024,
+        operation_timeout: Duration::from_secs(10),
+        service: service.into(),
+        expected_node: None,
+        daemon_uid: current_uid(),
     }
+}
 
-    let node = val
-        .get("node")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            AppError::Xmsg(format!(
-                "Svc registration ok frame names no node: {resp_line}"
-            ))
-        })?
-        .to_string();
-    let address = val
-        .get("address")
-        .and_then(|s| s.as_str())
-        .map_or_else(|| format!("{service_name}@{node}"), String::from);
+async fn register_with_client(
+    options: ClientOptions,
+    client: Arc<UnixXmsgClient>,
+) -> Result<SvcSocketInbox, AppError> {
+    let service = RegisteredService::register(options).await?;
+    *client.agent.lock().unwrap() = Some(service.agent_client());
+    Ok(SvcSocketInbox { service, client })
+}
 
-    Ok(SvcSocketInbox {
-        lines,
-        writer: write_half,
-        address,
-        node,
-    })
+pub async fn register_svc(options: ClientOptions) -> Result<SvcSocketInbox, AppError> {
+    register_with_client(options, Arc::new(UnixXmsgClient::disconnected())).await
 }
 
 /// An auto-reconnecting service inbox that wraps `register_svc`.
 /// When connection is lost or registration fails, reconnects with exponential backoff
 /// (default: start 1s, cap 30s).
 pub struct ReconnectingSvcInbox {
-    register_sock_path: PathBuf,
-    service_name: String,
+    options: ClientOptions,
+    client: Arc<UnixXmsgClient>,
     current: Option<SvcSocketInbox>,
     min_backoff: Duration,
     max_backoff: Duration,
@@ -472,11 +344,11 @@ pub struct ReconnectingSvcInbox {
 }
 
 impl ReconnectingSvcInbox {
-    pub fn new(register_sock_path: impl Into<PathBuf>, service_name: impl Into<String>) -> Self {
+    pub fn new(options: ClientOptions) -> Self {
         let min_backoff = Duration::from_secs(1);
         Self {
-            register_sock_path: register_sock_path.into(),
-            service_name: service_name.into(),
+            options,
+            client: Arc::new(UnixXmsgClient::disconnected()),
             current: None,
             min_backoff,
             max_backoff: Duration::from_secs(30),
@@ -504,16 +376,16 @@ impl ReconnectingSvcInbox {
 impl SvcInbox for ReconnectingSvcInbox {
     async fn poll(&mut self, wait_secs: u64) -> Result<Option<SvcDelivery>, AppError> {
         if self.current.is_none() {
-            match register_svc(&self.register_sock_path, &self.service_name).await {
+            match register_with_client(self.options.clone(), self.client.clone()).await {
                 Ok(inbox) => {
-                    tracing::info!("Registered on xmsg as {}", inbox.address());
+                    tracing::info!(address = ?inbox.address(), "Registered on xmsg");
                     self.current = Some(inbox);
                     self.current_backoff = self.min_backoff;
                 }
                 Err(e) => {
                     tracing::warn!(
                         "Failed to connect/register on xmsg at {}: {e}; retrying in {:?}",
-                        self.register_sock_path.display(),
+                        self.options.register_socket.display(),
                         self.current_backoff
                     );
                     tokio::time::sleep(self.current_backoff).await;
@@ -561,11 +433,16 @@ impl SvcInbox for ReconnectingSvcInbox {
     fn node(&self) -> Option<String> {
         self.current.as_ref().and_then(|i| i.node())
     }
+
+    fn xmsg_client(&self) -> Option<Arc<dyn XmsgClient>> {
+        Some(self.client.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendResponse {
     pub message_id: String,
+    pub outcome: Option<String>,
     /// The resolved address (`id[~n]@node` or `service@node`) read from `address` in `send`'s
     /// result. `None` for a reply.
     pub session_id: Option<String>,
@@ -576,6 +453,7 @@ impl SendResponse {
         Self {
             message_id: message_id.into(),
             session_id,
+            outcome: None,
         }
     }
 }
@@ -584,6 +462,7 @@ impl From<String> for SendResponse {
     fn from(message_id: String) -> Self {
         Self {
             message_id,
+            outcome: None,
             session_id: Some("mock-session@sini.cortex".to_string()),
         }
     }
@@ -593,7 +472,41 @@ impl From<&str> for SendResponse {
     fn from(message_id: &str) -> Self {
         Self {
             message_id: message_id.to_string(),
+            outcome: None,
             session_id: Some("mock-session@sini.cortex".to_string()),
+        }
+    }
+}
+
+/// Stored is accepted success, including a leaf reply waiting to be pulled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyOutcome {
+    /// An ID is assigned; record.push_outcome still distinguishes pending delivery.
+    Pushed {
+        response: SendResponse,
+        record: ReplyRecord,
+    },
+    Stored {
+        record: ReplyRecord,
+    },
+}
+
+impl ReplyOutcome {
+    fn from_record(record: ReplyRecord) -> Self {
+        match record
+            .pushed_message_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            Some(id) if record.push_outcome.as_deref() != Some("stored") => Self::Pushed {
+                response: SendResponse {
+                    message_id: id.into(),
+                    session_id: None,
+                    outcome: record.push_outcome.clone(),
+                },
+                record,
+            },
+            _ => Self::Stored { record },
         }
     }
 }
@@ -616,10 +529,9 @@ pub trait XmsgClient: Send + Sync {
         &self,
         _message_id: &str,
         _text: &str,
-    ) -> Result<SendResponse, AppError> {
-        Ok(SendResponse::new(
-            "mock-reply-msg-id",
-            Some("mock-session@sini.cortex".to_string()),
+    ) -> Result<ReplyOutcome, AppError> {
+        Err(AppError::Xmsg(
+            "reply is not implemented by this client".into(),
         ))
     }
 
@@ -644,108 +556,49 @@ pub trait XmsgClient: Send + Sync {
         message_id: &str,
         text: &str,
         _idempotency_key: &str,
-    ) -> Result<SendResponse, AppError> {
+    ) -> Result<ReplyOutcome, AppError> {
         self.reply_message(message_id, text).await
     }
 }
 
-/// One `agent.sock` request: writes `frame`, reads one answer, and returns it when its
-/// `status` is `ok`. Any other answer is an error naming the xmsg error code and detail.
-async fn agent_call(agent_sock_path: &Path, what: &str, frame: Value) -> Result<Value, AppError> {
-    let stream = tokio::net::UnixStream::connect(agent_sock_path)
-        .await
-        .map_err(|e| {
-            AppError::Xmsg(format!(
-                "Failed to connect to agent socket at {}: {e}",
-                agent_sock_path.display()
-            ))
-        })?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut lines = tokio::io::BufReader::new(read_half).lines();
-
-    write_half
-        .write_all(format!("{frame}\n").as_bytes())
-        .await
-        .map_err(|e| {
-            AppError::Xmsg(format!("Failed to write {what} request to agent.sock: {e}"))
-        })?;
-    write_half.flush().await.map_err(|e| {
-        AppError::Xmsg(format!("Failed to flush {what} request to agent.sock: {e}"))
-    })?;
-
-    let resp_line = lines
-        .next_line()
-        .await
-        .map_err(|e| {
-            AppError::Xmsg(format!(
-                "Failed to read {what} response from agent.sock: {e}"
-            ))
-        })?
-        .ok_or_else(|| AppError::Xmsg(format!("Agent socket closed before {what} response")))?;
-
-    let val: Value = serde_json::from_str(&resp_line).map_err(|e| {
-        AppError::Xmsg(format!(
-            "Invalid JSON in agent.sock {what} response: {e}; raw: {resp_line}"
-        ))
-    })?;
-
-    if val.get("status").and_then(|s| s.as_str()) != Some("ok") {
-        let code = val.get("error").and_then(|d| d.as_str()).unwrap_or("error");
-        let detail = val
-            .get("detail")
-            .and_then(|d| d.as_str())
-            .unwrap_or("no detail");
-        return Err(AppError::Xmsg(format!(
-            "agent.sock {what} failed ({code}): {detail}"
-        )));
-    }
-    Ok(val)
-}
-
-/// Sends `text` to `to` on agent.sock, keyed when `idempotency_key` is set, and returns the
-/// message ID and the resolved address `<id-or-service>@<node>` (`None` while a keyed repeat
-/// is `pending`: its address is empty).
-async fn agent_send(
-    agent_sock_path: &Path,
-    what: &str,
-    to: &str,
-    text: &str,
-    idempotency_key: Option<&str>,
-) -> Result<SendResponse, AppError> {
-    let mut frame = serde_json::json!({ "action": "send", "to": to, "text": text });
-    if let Some(key) = idempotency_key {
-        frame["idempotency_key"] = key.into();
-    }
-    let val = agent_call(agent_sock_path, what, frame).await?;
-    let message_id = val
-        .get("message_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            AppError::Xmsg(format!("agent.sock {what} answer has no message_id: {val}"))
-        })?
-        .to_string();
-    let session_id = val
-        .get("address")
-        .and_then(|v| v.as_str())
-        .filter(|a| !a.is_empty())
-        .map(|a| sender_address(a).to_string());
-    Ok(SendResponse {
-        message_id,
-        session_id,
-    })
-}
-
+/// Outbound facet of the inbox registration. It never holds a poll lock.
 pub struct UnixXmsgClient {
-    agent_sock_path: PathBuf,
+    agent: Mutex<Option<AgentClient>>,
 }
 
 impl UnixXmsgClient {
-    pub fn new(agent_sock_path: PathBuf) -> Self {
-        Self { agent_sock_path }
+    fn disconnected() -> Self {
+        Self {
+            agent: Mutex::new(None),
+        }
     }
 
-    pub fn agent_sock_path(&self) -> &Path {
-        &self.agent_sock_path
+    pub fn new(agent: AgentClient) -> Self {
+        Self {
+            agent: Mutex::new(Some(agent)),
+        }
+    }
+
+    fn agent(&self) -> Result<AgentClient, AppError> {
+        self.agent
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| ClientError::Disconnected.into())
+    }
+
+    async fn send(
+        &self,
+        to: &str,
+        text: &str,
+        key: Option<&str>,
+    ) -> Result<SendResponse, AppError> {
+        let receipt = self.agent()?.send(to, text, key).await?;
+        Ok(SendResponse {
+            message_id: receipt.message_id,
+            session_id: (!receipt.address.is_empty()).then_some(receipt.address),
+            outcome: Some(receipt.outcome),
+        })
     }
 }
 
@@ -757,7 +610,7 @@ impl XmsgClient for UnixXmsgClient {
         _from: &str,
         text: &str,
     ) -> Result<SendResponse, AppError> {
-        agent_send(&self.agent_sock_path, "send", expert_ref, text, None).await
+        self.send(expert_ref, text, None).await
     }
 
     async fn send_message_keyed(
@@ -767,18 +620,13 @@ impl XmsgClient for UnixXmsgClient {
         text: &str,
         idempotency_key: &str,
     ) -> Result<SendResponse, AppError> {
-        agent_send(
-            &self.agent_sock_path,
-            "send",
-            expert_ref,
-            text,
-            Some(idempotency_key),
-        )
-        .await
+        self.send(expert_ref, text, Some(idempotency_key)).await
     }
 
-    async fn reply_message(&self, message_id: &str, text: &str) -> Result<SendResponse, AppError> {
-        self.agent_reply(message_id, text, None).await
+    async fn reply_message(&self, message_id: &str, text: &str) -> Result<ReplyOutcome, AppError> {
+        Ok(ReplyOutcome::from_record(
+            self.agent()?.reply(message_id, text, None).await?,
+        ))
     }
 
     async fn reply_message_keyed(
@@ -786,42 +634,19 @@ impl XmsgClient for UnixXmsgClient {
         message_id: &str,
         text: &str,
         idempotency_key: &str,
-    ) -> Result<SendResponse, AppError> {
-        self.agent_reply(message_id, text, Some(idempotency_key))
-            .await
+    ) -> Result<ReplyOutcome, AppError> {
+        Ok(ReplyOutcome::from_record(
+            self.agent()?
+                .reply(message_id, text, Some(idempotency_key))
+                .await?,
+        ))
     }
 }
 
-impl UnixXmsgClient {
-    /// Replies to `message_id` on agent.sock, keyed when `idempotency_key` is set, and returns
-    /// the pushed reply's ID (a keyed repeat's, `pending` included, is the first reply's).
-    async fn agent_reply(
-        &self,
-        message_id: &str,
-        text: &str,
-        idempotency_key: Option<&str>,
-    ) -> Result<SendResponse, AppError> {
-        let mut frame =
-            serde_json::json!({ "action": "reply", "message_id": message_id, "text": text });
-        if let Some(key) = idempotency_key {
-            frame["idempotency_key"] = key.into();
-        }
-        let val = agent_call(&self.agent_sock_path, "reply", frame).await?;
-        let pushed_message_id = val
-            .get("reply")
-            .and_then(|r| r.get("pushedMessageId"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(message_id)
-            .to_string();
-        Ok(SendResponse {
-            message_id: pushed_message_id,
-            session_id: None,
-        })
-    }
-}
-
-pub fn create_xmsg_client(config: &Config) -> Arc<dyn XmsgClient> {
-    Arc::new(UnixXmsgClient::new(config.xmsg_agent_socket()))
+pub fn create_xmsg_client<I: SvcInbox + ?Sized>(inbox: &I) -> Arc<dyn XmsgClient> {
+    inbox
+        .xmsg_client()
+        .unwrap_or_else(|| Arc::new(UnixXmsgClient::disconnected()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -959,14 +784,6 @@ fn delivery_origin_session_id(delivery: &SvcDelivery) -> Option<String> {
         {
             let trimmed = id.trim();
             if !trimmed.is_empty() {
-                if let Some(sub) = orig
-                    .get("sub")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(format!("{trimmed}~{sub}"));
-                }
                 return Some(trimmed.to_string());
             }
         }
@@ -1053,8 +870,8 @@ pub async fn route_guard_reply(in_reply_to: &str, delivery: &SvcDelivery, guard_
     }
 }
 
-pub struct UnixGuardClient {
-    pub agent_sock_path: PathBuf,
+pub struct UnixGuardClient<'a> {
+    xmsg: &'a dyn XmsgClient,
     pub timeout_secs: u64,
     /// The bound on the guard request's `agent.sock` send. The pending map is locked for that
     /// send, and the inbox loop routes every pushed reply through the map, so this also bounds
@@ -1062,10 +879,10 @@ pub struct UnixGuardClient {
     pub send_timeout: Duration,
 }
 
-impl UnixGuardClient {
-    pub fn new(agent_sock_path: PathBuf, timeout_secs: u64) -> Self {
+impl<'a> UnixGuardClient<'a> {
+    pub fn new(xmsg: &'a dyn XmsgClient, timeout_secs: u64) -> Self {
         Self {
-            agent_sock_path,
+            xmsg,
             timeout_secs,
             send_timeout: Duration::from_secs(10),
         }
@@ -1155,7 +972,7 @@ pub fn parse_guard_reply(reply_text: &str) -> Result<GuardVerdict, AppError> {
 }
 
 #[async_trait]
-impl GuardClient for UnixGuardClient {
+impl GuardClient for UnixGuardClient<'_> {
     /// Sends the envelope to `guard_ref` and waits for the verdict pushed into the inbox.
     /// An `ambiguous` route (two guards in view, A-10) fails here, naming the error code.
     async fn check_guard(
@@ -1171,13 +988,7 @@ impl GuardClient for UnixGuardClient {
         // stalled agent.sock hold the map, and with it the inbox loop, past `send_timeout`.
         let (message_id, rx) = {
             let mut pending = guard_pending().lock().await;
-            let send = agent_send(
-                &self.agent_sock_path,
-                "guard send",
-                guard_ref,
-                &env_text,
-                None,
-            );
+            let send = self.xmsg.send_message(guard_ref, "", &env_text);
             let sent = tokio::time::timeout(self.send_timeout, send)
                 .await
                 .map_err(|_| {
@@ -1213,11 +1024,11 @@ impl GuardClient for UnixGuardClient {
     }
 }
 
-pub fn create_guard_client(config: &Config) -> Arc<dyn GuardClient> {
-    Arc::new(UnixGuardClient::new(
-        config.xmsg_agent_socket(),
-        config.guard_timeout_secs,
-    ))
+pub fn create_guard_client<'a>(
+    config: &Config,
+    xmsg: &'a dyn XmsgClient,
+) -> Arc<dyn GuardClient + 'a> {
+    Arc::new(UnixGuardClient::new(xmsg, config.guard_timeout_secs))
 }
 
 #[cfg(test)]
