@@ -297,6 +297,128 @@ async fn a_late_relay_reply_is_retried_under_its_key() {
     assert_eq!(posted, 1);
 }
 
+struct StoredRelay;
+
+#[async_trait]
+impl XmsgClient for StoredRelay {
+    async fn send_message(&self, _: &str, _: &str, _: &str) -> Result<SendResponse, AppError> {
+        panic!("a solicited relay is a reply, not a new send");
+    }
+
+    async fn reply_message_keyed(
+        &self,
+        message_id: &str,
+        text: &str,
+        key: &str,
+    ) -> Result<matrix_xmsg::xmsg::ReplyOutcome, AppError> {
+        assert_eq!(message_id, "01STOREDREQUEST");
+        assert!(!key.is_empty());
+        Ok(matrix_xmsg::xmsg::ReplyOutcome::Stored {
+            record: xmsg::client::ReplyRecord {
+                seq: 7,
+                message_id: message_id.into(),
+                created_at: 1,
+                replier_session_id: "matrix-xmsg".into(),
+                text: text.into(),
+                push_outcome: Some("stored".into()),
+                pushed_message_id: Some("01STOREDRELAY".into()),
+            },
+        })
+    }
+}
+
+// Mutants: use the request ID as the new reply ID, or omit the Stored association.
+#[tokio::test]
+async fn a_reply_to_a_stored_relay_routes_to_its_matrix_thread() {
+    use matrix_xmsg::store::ForwardedMessageRecord;
+    let store = Store::new_in_memory().unwrap();
+    store
+        .bind_solicited_thread("$stored-root", ROOM, "01STOREDREQUEST", 900)
+        .unwrap();
+    store
+        .record_forwarded_message(&ForwardedMessageRecord {
+            message_id: "01STOREDREQUEST".into(),
+            room_id: ROOM.into(),
+            thread_root_id: "$stored-root".into(),
+            event_id: "$original".into(),
+            sender_mxid: "@alice:example.org".into(),
+            addressed: true,
+            sent_at: 900,
+            ack_reaction_id: None,
+            timeout_dm_sent: false,
+            reply_count: 0,
+        })
+        .unwrap();
+    store
+        .set_forward_session("01STOREDREQUEST", Some("expert@fixture"))
+        .unwrap();
+    let config = config();
+    let matrix = MockMatrixClient::default();
+    let event = mention("$stored-root");
+    let outcome = handle_incoming_event_with_guard(
+        &event,
+        &[],
+        &config,
+        &matrix,
+        &StoredRelay,
+        &MockGuardClient::new(),
+        &store,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, BotOutcome::Forwarded);
+    let cursor = store.get_thread_cursor("$stored-root").unwrap().unwrap();
+    assert_eq!(cursor.session_id.as_deref(), Some("expert@fixture"));
+    assert_eq!(
+        store
+            .get_forwarded_message("01STOREDRELAY")
+            .unwrap()
+            .unwrap()
+            .thread_root_id,
+        "$stored-root"
+    );
+    assert_eq!(
+        store
+            .get_forwarded_message("01STOREDREQUEST")
+            .unwrap()
+            .unwrap()
+            .event_id,
+        "$original"
+    );
+    let mut answer = SvcDelivery::new(
+        "01FOLLOWUP",
+        "expert@fixture",
+        REPLY,
+        "fixture reply",
+        Some(serde_json::json!({"service":"expert","node":"fixture"})),
+    );
+    answer.in_reply_to = Some("01STOREDRELAY".into());
+    handle_inbox_delivery_with_xmsg(
+        &answer,
+        &config,
+        &matrix,
+        &store,
+        &NoXmsg,
+        &mut AckInbox,
+        1001,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        matrix
+            .sent_notices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(
+                |m| m.thread_root_id.as_deref() == Some("$stored-root") && m.body.contains(REPLY)
+            )
+            .count(),
+        1
+    );
+}
+
 /// An `agent.sock` that answers each frame with `answer` and records the frame.
 async fn agent_sock_answering(
     dir: &std::path::Path,

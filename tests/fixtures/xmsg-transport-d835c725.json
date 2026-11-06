@@ -1,0 +1,123 @@
+{
+  "agent_frames": [
+    {
+      "action": "send",
+      "idempotency_key": "key",
+      "text": "send",
+      "to": "expert@fixture"
+    },
+    {
+      "action": "send",
+      "idempotency_key": "key",
+      "text": "send",
+      "to": "expert@fixture"
+    },
+    {
+      "action": "reply",
+      "idempotency_key": "reply-key",
+      "message_id": "sent",
+      "text": "reply"
+    }
+  ],
+  "deliveries": [
+    {
+      "cursor_session": "instance@fixture",
+      "delivery": {
+        "envelope": "fixture envelope",
+        "from_name": "display \u00b7 anonymous@fixture",
+        "in_reply_to": "parent",
+        "message_id": "m0",
+        "origin": {
+          "id": "instance",
+          "node": "fixture"
+        },
+        "text": "fixture body"
+      }
+    },
+    {
+      "cursor_session": "expert@fixture",
+      "delivery": {
+        "envelope": "fixture envelope",
+        "from_name": "display \u00b7 anonymous@fixture",
+        "in_reply_to": "parent",
+        "message_id": "m1",
+        "origin": {
+          "node": "fixture",
+          "service": "expert"
+        },
+        "text": "fixture body"
+      }
+    },
+    {
+      "cursor_session": "anonymous@fixture",
+      "delivery": {
+        "envelope": "fixture envelope",
+        "from_name": "display \u00b7 anonymous@fixture",
+        "in_reply_to": "parent",
+        "message_id": "m2",
+        "origin": {
+          "label": "display-only",
+          "node": "fixture"
+        },
+        "text": "fixture body"
+      }
+    }
+  ],
+  "registration_node": "fixture",
+  "repeat": {
+    "message_id": "sent",
+    "session_id": "expert@fixture"
+  },
+  "reply": {
+    "message_id": "reply",
+    "session_id": null
+  },
+  "send": {
+    "message_id": "sent",
+    "session_id": "expert@fixture"
+  },
+  "service_frames": [
+    {
+      "cwd": "/",
+      "harness": "svc",
+      "name": "matrix-xmsg"
+    },
+    {
+      "action": "poll",
+      "waitSecs": 0
+    },
+    {
+      "action": "ack",
+      "messageId": "m0"
+    },
+    {
+      "action": "poll",
+      "waitSecs": 0
+    },
+    {
+      "action": "ack",
+      "messageId": "m1"
+    },
+    {
+      "action": "poll",
+      "waitSecs": 0
+    },
+    {
+      "action": "ack",
+      "messageId": "m2"
+    }
+  ],
+  "recording": {
+    "revision": "d835c7254e5197d05f9ca3a1520740867b3c35ee",
+    "capture_lock_sha256": "179a12c9aeed7cf5281c53ef181851e3e5aff473ef91ea57b647f060f0a0a596",
+    "source_sha256": {
+      "xmsg.rs": "741ea207fb1baa6f9083bd8cbcf84572477ec6402f6d2eac145bc2b598c01fdb",
+      "store.rs": "4728c2c27a43a62ab8e77d48fdc866c42d8b2d0857f3a1ba5213291d51806136",
+      "error.rs": "64f043566dd8068780c7258f8ef57645f734b9d526c53540f1624b4638e23ee0",
+      "bot.rs": "d82d1956a7ab35cb0c66a5ad2d119b8a2b716ebb3852816174995aa568457204"
+    },
+    "cursor_expression_sha256": "086d262577334dd8422159a5b58a06b8a7f25f143044dfa8105ea8c6333026db",
+    "scope": "unmodified legacy transport/store/error; minimal Config shim; verbatim bot principal functions and cursor selection; scripted private sockets, no Matrix SDK server",
+    "comparison": "include from_name, origin, stored cursor, destinations, bodies, idempotency keys, IDs and ACK order; exclude only outgoing schema_version"
+  }
+}
