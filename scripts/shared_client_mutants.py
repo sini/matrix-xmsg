@@ -20,6 +20,8 @@ CASES = [
     ("service-name-validation", "src/config.rs", "::xmsg::client::validate_service_name(&self.service_name)", "Ok::<(), ::xmsg::client::ClientError>(())", "shared_transport", "config_load_validates_configured_service_name"),
     ("service-name-client-options", "src/xmsg.rs", "service: service.into(),", 'service: { let _ = service; "matrix-xmsg".into() },', "shared_transport", "config_load_validates_configured_service_name"),
     ("service-name-main-wiring", "src/main.rs", "&config.service_name", '"matrix-xmsg"', "shared_transport", "daemon_registers_configured_non_default_service_name"),
+    ("transient-not-found", "src/bot.rs", 'if code == "not_found" || code == "unavailable" {', 'if code == "unavailable" {', "gate_idem_retry", "transient_expert_absence_retries_without_blocking_other_rooms_and_delivers_once"),
+    ("record-before-send", "src/bot.rs", '    let send_res = bounded_send("Forward to the expert", || {\n        xmsg.send_message_keyed(target_expert_ref, &mapped_sender, &envelope, &key)\n    })\n    .await;\n    let send_resp = match send_res {\n        Ok(resp) => {\n            store.record_event_relayed(&claim_id, now_secs)?;\n            resp\n        }', '    store.record_event_relayed(&claim_id, now_secs)?;\n    let send_res = bounded_send("Forward to the expert", || {\n        xmsg.send_message_keyed(target_expert_ref, &mapped_sender, &envelope, &key)\n    })\n    .await;\n    let send_resp = match send_res {\n        Ok(resp) => resp,', "gate_idem_retry", "expert_absent_past_window_posts_one_notice_and_permanent_refusal_does_not_retry"),
 ]
 
 

@@ -495,6 +495,623 @@ async fn keyed_frames_carry_the_key_and_read_pending() {
     );
 }
 
+const ROOM_OTHER: &str = "!other:example.org";
+
+struct TransientExpertXmsg {
+    /// For ROOM ("claude"): list of scripted outcomes per call; once exhausted, uses `default_outcome`.
+    scripted: Mutex<std::collections::VecDeque<Result<SendResponse, String>>>,
+    default_refusal_code: Mutex<Option<String>>,
+    attempts: Mutex<Vec<(String, Option<String>)>>,
+    keys: Mutex<HashMap<String, (String, String)>>,
+    delivered: Mutex<Vec<(String, String)>>,
+}
+
+impl TransientExpertXmsg {
+    fn new_refusing(code: &str) -> Self {
+        Self {
+            scripted: Mutex::new(std::collections::VecDeque::new()),
+            default_refusal_code: Mutex::new(Some(code.to_string())),
+            attempts: Mutex::new(Vec::new()),
+            keys: Mutex::new(HashMap::new()),
+            delivered: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn register_expert(&self) {
+        *self.default_refusal_code.lock().unwrap() = None;
+    }
+
+    fn set_refusal_code(&self, code: &str) {
+        *self.default_refusal_code.lock().unwrap() = Some(code.to_string());
+    }
+
+    fn attempts_for(&self, expert_ref: &str) -> usize {
+        self.attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(r, _)| r == expert_ref)
+            .count()
+    }
+
+    fn delivered_for(&self, expert_ref: &str) -> Vec<String> {
+        self.delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(r, _)| r == expert_ref)
+            .map(|(_, id)| id.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl XmsgClient for TransientExpertXmsg {
+    async fn send_message(
+        &self,
+        expert_ref: &str,
+        _from: &str,
+        text: &str,
+    ) -> Result<SendResponse, AppError> {
+        self.send_message_keyed(expert_ref, _from, text, "").await
+    }
+
+    async fn send_message_keyed(
+        &self,
+        expert_ref: &str,
+        _from: &str,
+        text: &str,
+        key: &str,
+    ) -> Result<SendResponse, AppError> {
+        self.attempts.lock().unwrap().push((
+            expert_ref.to_string(),
+            (!key.is_empty()).then(|| key.to_string()),
+        ));
+
+        if expert_ref == "other-expert" {
+            let id = format!("01OTHER{:06}", self.delivered.lock().unwrap().len() + 1);
+            self.delivered
+                .lock()
+                .unwrap()
+                .push((expert_ref.to_string(), id.clone()));
+            return Ok(SendResponse::new(
+                id,
+                Some("other-expert@sini.test".to_string()),
+            ));
+        }
+
+        if let Some(step) = self.scripted.lock().unwrap().pop_front() {
+            return step.map_err(|code| {
+                AppError::XmsgTransport(::xmsg::client::ClientError::Refused { code })
+            });
+        }
+
+        if let Some(code) = self.default_refusal_code.lock().unwrap().clone() {
+            return Err(AppError::XmsgTransport(
+                ::xmsg::client::ClientError::Refused { code },
+            ));
+        }
+
+        if !key.is_empty() {
+            if let Some((existing_id, existing_body)) = self.keys.lock().unwrap().get(key).cloned()
+            {
+                if existing_body != text {
+                    return Err(AppError::Xmsg(format!("conflict on key {key}")));
+                }
+                return Ok(SendResponse::new(
+                    existing_id,
+                    Some("claude@sini.test".to_string()),
+                ));
+            }
+        }
+
+        let id = format!("01RETRY{:06}", self.delivered.lock().unwrap().len() + 1);
+        if !key.is_empty() {
+            self.keys
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (id.clone(), text.to_string()));
+        }
+        self.delivered
+            .lock()
+            .unwrap()
+            .push((expert_ref.to_string(), id.clone()));
+        Ok(SendResponse::new(id, Some("claude@sini.test".to_string())))
+    }
+}
+
+// XM4 Cell 1 (D-1, D-2): Expert absent at mention time (`not_found`, then `unavailable`) and
+// registering within the 10-minute window => `handle_incoming_event_with_guard` returns
+// `BotOutcome::Pending` immediately without blocking another room's mention, and the background
+// retry worker delivers the message once with zero notices.
+// Mutant `transient-not-found`: classify `not_found` as permanent => RED.
+#[tokio::test(start_paused = true)]
+async fn transient_expert_absence_retries_without_blocking_other_rooms_and_delivers_once() {
+    use matrix_xmsg::bot::run_forward_retry_worker;
+    use matrix_xmsg::config::RoomRoute;
+    use std::sync::Arc;
+
+    let mut cfg = config();
+    cfg.rooms.push(ROOM_OTHER.to_string());
+    cfg.room_routes.insert(
+        ROOM_OTHER.to_string(),
+        RoomRoute {
+            expert_ref: Some("other-expert".to_string()),
+            expert_refs: None,
+            screen_mentions: Some(false),
+            screen_solicited: Some(false),
+        },
+    );
+    let cfg = Arc::new(cfg);
+    let store = Arc::new(Store::new_in_memory().unwrap());
+    let matrix = Arc::new(MockMatrixClient::default());
+    let xmsg = Arc::new(TransientExpertXmsg::new_refusing("not_found"));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let worker = tokio::spawn(run_forward_retry_worker(
+        cfg.clone(),
+        matrix.clone(),
+        xmsg.clone(),
+        store.clone(),
+        shutdown_rx,
+    ));
+
+    // 1. Mention in ROOM while expert is absent (`not_found`) returns `Pending` immediately.
+    let ev_room1 = IncomingMatrixEvent {
+        room_id: ROOM.to_string(),
+        event_id: "$ev_xm4_transient".to_string(),
+        sender_mxid: "@alice:example.org".to_string(),
+        body: "@genie help with transient retry".to_string(),
+        formatted_body: None,
+        mentions: Some(vec!["@genie:example.org".to_string()]),
+        timestamp_ms: EVENT_MS,
+        thread_root_id: Some("$root_xm4_1".to_string()),
+        replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
+    };
+    let outcome1 = handle_incoming_event_with_guard(
+        &ev_room1,
+        &[],
+        &cfg,
+        matrix.as_ref(),
+        xmsg.as_ref(),
+        &MockGuardClient::new(),
+        &store,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome1, BotOutcome::Pending);
+    assert_eq!(xmsg.attempts_for("claude"), 1);
+    assert!(xmsg.delivered_for("claude").is_empty());
+    assert!(matrix.sent_notices.lock().unwrap().is_empty());
+
+    // 2. D-1: While ROOM's retry is pending, an event in ROOM_OTHER is handled immediately.
+    let ev_other = IncomingMatrixEvent {
+        room_id: ROOM_OTHER.to_string(),
+        event_id: "$ev_xm4_other_room".to_string(),
+        sender_mxid: "@alice:example.org".to_string(),
+        body: "@genie other room question".to_string(),
+        formatted_body: None,
+        mentions: Some(vec!["@genie:example.org".to_string()]),
+        timestamp_ms: EVENT_MS + 100,
+        thread_root_id: Some("$root_other".to_string()),
+        replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
+    };
+    let outcome_other = handle_incoming_event_with_guard(
+        &ev_other,
+        &[],
+        &cfg,
+        matrix.as_ref(),
+        xmsg.as_ref(),
+        &MockGuardClient::new(),
+        &store,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome_other, BotOutcome::Forwarded);
+    assert_eq!(xmsg.delivered_for("other-expert").len(), 1);
+
+    // 3. Switch refusal to `unavailable` before the first 2s retry, then register expert before the 4s retry.
+    xmsg.set_refusal_code("unavailable");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        xmsg.attempts_for("claude"),
+        2,
+        "2s backoff retry must have fired"
+    );
+    assert!(xmsg.delivered_for("claude").is_empty());
+
+    xmsg.register_expert();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    assert_eq!(
+        xmsg.delivered_for("claude").len(),
+        1,
+        "expert must receive the forward exactly once after registering within the 10-minute window"
+    );
+    assert!(
+        matrix.sent_notices.lock().unwrap().is_empty(),
+        "zero failure notices when retry succeeds within the window"
+    );
+    assert!(store.is_event_relayed("$ev_xm4_transient").unwrap());
+    assert!(store
+        .get_forward_retry("$ev_xm4_transient")
+        .unwrap()
+        .is_none());
+
+    let _ = shutdown_tx.send(());
+    worker.await.unwrap().unwrap();
+}
+
+// XM4 Cell 2 (D-2, D-3, D-4): Expert absent past the 10-minute window => retries with 2s..60s
+// backoff, then gives up at 600s and posts ONE user-friendly notice with no internal IDs/codes;
+// permanent refusal (`ambiguous`) posts the notice straight away without retrying.
+// Mutant `record-before-send` (D-3): record `record_event_relayed` before the send => RED (the
+// give-up cell sees no retry).
+#[tokio::test(start_paused = true)]
+async fn expert_absent_past_window_posts_one_notice_and_permanent_refusal_does_not_retry() {
+    use matrix_xmsg::bot::{run_forward_retry_worker, FORWARD_FAILURE_NOTICE};
+    use std::sync::Arc;
+
+    let cfg = Arc::new(config());
+    let store = Arc::new(Store::new_in_memory().unwrap());
+    let matrix = Arc::new(MockMatrixClient::default());
+    let xmsg = Arc::new(TransientExpertXmsg::new_refusing("unavailable"));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let worker = tokio::spawn(run_forward_retry_worker(
+        cfg.clone(),
+        matrix.clone(),
+        xmsg.clone(),
+        store.clone(),
+        shutdown_rx,
+    ));
+
+    let ev_giveup = IncomingMatrixEvent {
+        room_id: ROOM.to_string(),
+        event_id: "$ev_xm4_giveup".to_string(),
+        sender_mxid: "@alice:example.org".to_string(),
+        body: "@genie still absent".to_string(),
+        formatted_body: None,
+        mentions: Some(vec!["@genie:example.org".to_string()]),
+        timestamp_ms: EVENT_MS,
+        thread_root_id: Some("$root_xm4_giveup".to_string()),
+        replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
+    };
+    let outcome = handle_incoming_event_with_guard(
+        &ev_giveup,
+        &[],
+        &cfg,
+        matrix.as_ref(),
+        xmsg.as_ref(),
+        &MockGuardClient::new(),
+        &store,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, BotOutcome::Pending);
+
+    // Advance 590s (still within the 600s window): multiple backoff retries must have run, 0 notices yet.
+    tokio::time::sleep(Duration::from_secs(590)).await;
+    assert!(
+        xmsg.attempts_for("claude") >= 10,
+        "expected backoff retries across the 10-minute window, got {}",
+        xmsg.attempts_for("claude")
+    );
+    assert!(
+        matrix.sent_notices.lock().unwrap().is_empty(),
+        "no notice may be posted before the 10-minute retry window expires"
+    );
+
+    // Advance past the 600s deadline: worker gives up and posts exactly one notice.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let attempts_at_giveup = xmsg.attempts_for("claude");
+    {
+        let notices = matrix.sent_notices.lock().unwrap();
+        assert_eq!(notices.len(), 1, "exactly one notice must be posted at give-up");
+        assert_eq!(notices[0].thread_root_id.as_deref(), Some("$root_xm4_giveup"));
+        assert_eq!(notices[0].body, FORWARD_FAILURE_NOTICE);
+        assert_eq!(
+            notices[0].mention_user.as_deref(),
+            Some("@alice:example.org")
+        );
+        assert!(!notices[0].body.contains("unavailable"));
+        assert!(!notices[0].body.contains("not_found"));
+        assert!(!notices[0].body.contains("$ev_xm4_giveup"));
+    }
+    assert_eq!(
+        matrix.sent_dms.lock().unwrap().len(),
+        1,
+        "owner DM must be sent once on give-up (D-4)"
+    );
+    assert!(xmsg.delivered_for("claude").is_empty());
+
+    // Advance another 120s: no further retries or notices after give-up.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(xmsg.attempts_for("claude"), attempts_at_giveup);
+    assert_eq!(matrix.sent_notices.lock().unwrap().len(), 1);
+
+    // Sub-cell B: Permanent refusal (`ambiguous`) posts the notice immediately with 0 retries.
+    xmsg.set_refusal_code("ambiguous");
+    let ev_perm = IncomingMatrixEvent {
+        room_id: ROOM.to_string(),
+        event_id: "$ev_xm4_perm".to_string(),
+        sender_mxid: "@alice:example.org".to_string(),
+        body: "@genie ambiguous route".to_string(),
+        formatted_body: None,
+        mentions: Some(vec!["@genie:example.org".to_string()]),
+        timestamp_ms: EVENT_MS + 800_000,
+        thread_root_id: Some("$root_xm4_perm".to_string()),
+        replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
+    };
+    let perm_outcome = handle_incoming_event_with_guard(
+        &ev_perm,
+        &[],
+        &cfg,
+        matrix.as_ref(),
+        xmsg.as_ref(),
+        &MockGuardClient::new(),
+        &store,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(perm_outcome, BotOutcome::ForwardFailed);
+    assert_eq!(xmsg.attempts_for("claude"), attempts_at_giveup + 1);
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(
+        xmsg.attempts_for("claude"),
+        attempts_at_giveup + 1,
+        "permanent refusal must never be retried"
+    );
+    assert_eq!(matrix.sent_notices.lock().unwrap().len(), 2);
+
+    let _ = shutdown_tx.send(());
+    worker.await.unwrap().unwrap();
+}
+
+// XM4 Cell 3: Redelivered event after give-up (or permanent refusal) produces no second notice
+// and no second forward attempt.
+#[tokio::test(start_paused = true)]
+async fn redelivered_event_after_give_up_posts_no_second_notice() {
+    use matrix_xmsg::bot::sweep_due_forward_retries;
+
+    let cfg = config();
+    let store = Store::new_in_memory().unwrap();
+    let matrix = MockMatrixClient::default();
+    let xmsg = TransientExpertXmsg::new_refusing("not_found");
+
+    let ev = IncomingMatrixEvent {
+        room_id: ROOM.to_string(),
+        event_id: "$ev_xm4_redeliver".to_string(),
+        sender_mxid: "@alice:example.org".to_string(),
+        body: "@genie redelivery check".to_string(),
+        formatted_body: None,
+        mentions: Some(vec!["@genie:example.org".to_string()]),
+        timestamp_ms: EVENT_MS,
+        thread_root_id: Some("$root_xm4_redeliver".to_string()),
+        replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
+    };
+    let now_secs = EVENT_MS / 1000;
+    assert_eq!(
+        handle_incoming_event_with_guard(
+            &ev,
+            &[],
+            &cfg,
+            &matrix,
+            &xmsg,
+            &MockGuardClient::new(),
+            &store,
+            None,
+        )
+        .await
+        .unwrap(),
+        BotOutcome::Pending
+    );
+
+    // Redelivery while retry is still pending returns Pending without a second initial attempt.
+    assert_eq!(
+        handle_incoming_event_with_guard(
+            &ev,
+            &[],
+            &cfg,
+            &matrix,
+            &xmsg,
+            &MockGuardClient::new(),
+            &store,
+            None,
+        )
+        .await
+        .unwrap(),
+        BotOutcome::Pending
+    );
+    assert_eq!(xmsg.attempts_for("claude"), 1);
+
+    // Drive past the 600s retry window so the retry gives up and posts the single notice.
+    sweep_due_forward_retries(&cfg, &matrix, &xmsg, &store, now_secs + 600)
+        .await
+        .unwrap();
+    assert_eq!(matrix.sent_notices.lock().unwrap().len(), 1);
+    let attempts_after_giveup = xmsg.attempts_for("claude");
+
+    // Redeliver the event after give-up (even if expert is now registered): must be ignored with no second notice.
+    xmsg.register_expert();
+    let redeliver_outcome = handle_incoming_event_with_guard(
+        &ev,
+        &[],
+        &cfg,
+        &matrix,
+        &xmsg,
+        &MockGuardClient::new(),
+        &store,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(redeliver_outcome, BotOutcome::IgnoredDuplicate);
+    assert_eq!(
+        matrix.sent_notices.lock().unwrap().len(),
+        1,
+        "redelivered event must not post a second notice"
+    );
+    assert_eq!(xmsg.attempts_for("claude"), attempts_after_giveup);
+    assert!(xmsg.delivered_for("claude").is_empty());
+}
+
+// XM4 Cell 4 (D-3): Crash/disconnect between `xmsg` accepting the forward send and `store.record_event_relayed`
+// => on restart, recovery replays the deterministic forward key (`matrix-xmsg:forward:<claim_id>`),
+// `xmsg` deduplicates within its idempotency TTL, and the message is delivered once.
+#[tokio::test(start_paused = true)]
+async fn crash_between_send_and_record_event_relayed_delivers_once_on_restart() {
+    use matrix_xmsg::bot::sweep_due_forward_retries;
+
+    struct CrashWindowXmsg {
+        crash_first_return: Mutex<bool>,
+        keys: Mutex<HashMap<String, (String, String)>>,
+        delivered: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl XmsgClient for CrashWindowXmsg {
+        async fn send_message(
+            &self,
+            _: &str,
+            _: &str,
+            text: &str,
+        ) -> Result<SendResponse, AppError> {
+            self.send_message_keyed("claude", "", text, "").await
+        }
+
+        async fn send_message_keyed(
+            &self,
+            _: &str,
+            _: &str,
+            text: &str,
+            key: &str,
+        ) -> Result<SendResponse, AppError> {
+            let existing = self.keys.lock().unwrap().get(key).cloned();
+            let id = if let Some((existing_id, existing_body)) = existing {
+                assert_eq!(existing_body, text, "deterministic key must carry identical body");
+                existing_id
+            } else {
+                let fresh = format!("01CRASH{:06}", self.delivered.lock().unwrap().len() + 1);
+                self.keys
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), (fresh.clone(), text.to_string()));
+                self.delivered.lock().unwrap().push(fresh.clone());
+                fresh
+            };
+
+            let should_crash_after_accept = {
+                let mut flag = self.crash_first_return.lock().unwrap();
+                let cur = *flag;
+                *flag = false;
+                cur
+            };
+            if should_crash_after_accept {
+                return Err(AppError::XmsgTransport(
+                    ::xmsg::client::ClientError::Disconnected,
+                ));
+            }
+            Ok(SendResponse::new(id, Some("claude@sini.test".to_string())))
+        }
+    }
+
+    let cfg = config();
+    let store = Store::new_in_memory().unwrap();
+    let matrix = MockMatrixClient::default();
+    let xmsg = CrashWindowXmsg {
+        crash_first_return: Mutex::new(true),
+        keys: Mutex::new(HashMap::new()),
+        delivered: Mutex::new(Vec::new()),
+    };
+
+    let ev = IncomingMatrixEvent {
+        room_id: ROOM.to_string(),
+        event_id: "$ev_xm4_crash".to_string(),
+        sender_mxid: "@alice:example.org".to_string(),
+        body: "@genie crash window test".to_string(),
+        formatted_body: None,
+        mentions: Some(vec!["@genie:example.org".to_string()]),
+        timestamp_ms: EVENT_MS,
+        thread_root_id: Some("$root_xm4_crash".to_string()),
+        replaces_event_id: None,
+        in_reply_to_event_id: None,
+        is_falling_back: false,
+    };
+
+    // First attempt: `xmsg` accepts the send under the deterministic forward key, then connection/process drops
+    // before `store.record_event_relayed` runs.
+    let first_outcome = handle_incoming_event_with_guard(
+        &ev,
+        &[],
+        &cfg,
+        &matrix,
+        &xmsg,
+        &MockGuardClient::new(),
+        &store,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_outcome, BotOutcome::Pending);
+
+    assert_eq!(
+        xmsg.delivered.lock().unwrap().len(),
+        1,
+        "xmsg accepted the send before the crash"
+    );
+    assert!(
+        !store.is_event_relayed("$ev_xm4_crash").unwrap(),
+        "crash occurred before record_event_relayed committed"
+    );
+    assert!(
+        store.get_forward_retry("$ev_xm4_crash").unwrap().is_some(),
+        "pending forward row must be durable in SQLite across the crash window"
+    );
+
+    // Restart recovery: retry worker sweep + Matrix sync redelivery both deduplicate on the forward key.
+    let retry_now = EVENT_MS / 1000 + 2;
+    let swept = sweep_due_forward_retries(&cfg, &matrix, &xmsg, &store, retry_now)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1);
+    assert!(store.is_event_relayed("$ev_xm4_crash").unwrap());
+    assert_eq!(
+        xmsg.delivered.lock().unwrap().len(),
+        1,
+        "restart recovery must deduplicate under the deterministic forward key (one delivery)"
+    );
+
+    let redeliver = handle_incoming_event_with_guard(
+        &ev,
+        &[],
+        &cfg,
+        &matrix,
+        &xmsg,
+        &MockGuardClient::new(),
+        &store,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(redeliver, BotOutcome::IgnoredDuplicate);
+    assert_eq!(xmsg.delivered.lock().unwrap().len(), 1);
+}
+
 #[path = "common/replies.rs"]
 mod replies;
 use matrix_xmsg::xmsg::ReplyOutcome;

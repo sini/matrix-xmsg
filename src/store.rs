@@ -224,6 +224,17 @@ impl Store {
                 asker_mxid TEXT NOT NULL,
                 escalated_by TEXT NOT NULL,
                 escalated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS forward_retries (
+                event_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                thread_root_id TEXT NOT NULL,
+                sender_mxid TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                first_attempt_at INTEGER NOT NULL,
+                last_attempt_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                notice_sent INTEGER NOT NULL DEFAULT 0
             );",
         )
         .map_err(|e| AppError::Store(format!("Failed to initialize SQLite schema: {e}")))?;
@@ -1422,6 +1433,178 @@ impl Store {
             Ok(None)
         }
     }
+
+    pub fn record_forward_retry_pending(
+        &self,
+        payload: &PendingForwardPayload,
+        now_secs: i64,
+        attempts: usize,
+    ) -> Result<ForwardRetryRecord, AppError> {
+        let payload_json = serde_json::to_string(payload)
+            .map_err(|e| AppError::Store(format!("Failed to serialize forward retry payload: {e}")))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO forward_retries (
+                event_id, room_id, thread_root_id, sender_mxid, payload_json,
+                first_attempt_at, last_attempt_at, attempts, notice_sent
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 0)
+            ON CONFLICT(event_id) DO UPDATE SET
+                payload_json = ?5,
+                last_attempt_at = ?6,
+                attempts = ?7",
+            params![
+                payload.claim_id,
+                payload.room_id,
+                payload.thread_root_id,
+                payload.sender_mxid,
+                payload_json,
+                now_secs,
+                attempts as i64,
+            ],
+        )
+        .map_err(|e| AppError::Store(format!("Failed to record forward retry: {e}")))?;
+        drop(conn);
+        self.get_forward_retry(&payload.claim_id)?
+            .ok_or_else(|| AppError::Store("Missing forward retry row after upsert".to_string()))
+    }
+
+    pub fn get_forward_retry(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<ForwardRetryRecord>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, room_id, thread_root_id, sender_mxid, payload_json,
+                        first_attempt_at, last_attempt_at, attempts, notice_sent
+                 FROM forward_retries WHERE event_id = ?1",
+            )
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![event_id])
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        if let Some(row) = rows.next().map_err(|e| AppError::Store(e.to_string()))? {
+            let payload_json: String = row.get(4).map_err(|e| AppError::Store(e.to_string()))?;
+            let payload: PendingForwardPayload = serde_json::from_str(&payload_json).map_err(|e| {
+                AppError::Store(format!("Failed to deserialize forward retry payload: {e}"))
+            })?;
+            let attempts: i64 = row.get(7).map_err(|e| AppError::Store(e.to_string()))?;
+            let notice_sent: i64 = row.get(8).map_err(|e| AppError::Store(e.to_string()))?;
+            Ok(Some(ForwardRetryRecord {
+                event_id: row.get(0).map_err(|e| AppError::Store(e.to_string()))?,
+                room_id: row.get(1).map_err(|e| AppError::Store(e.to_string()))?,
+                thread_root_id: row.get(2).map_err(|e| AppError::Store(e.to_string()))?,
+                sender_mxid: row.get(3).map_err(|e| AppError::Store(e.to_string()))?,
+                payload,
+                first_attempt_at: row.get(5).map_err(|e| AppError::Store(e.to_string()))?,
+                last_attempt_at: row.get(6).map_err(|e| AppError::Store(e.to_string()))?,
+                attempts: attempts.max(0) as usize,
+                notice_sent: notice_sent != 0,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_forward_retries_count(&self, event_id: &str) -> Result<Option<usize>, AppError> {
+        Ok(self.get_forward_retry(event_id)?.map(|r| r.attempts))
+    }
+
+    pub fn has_forward_failure_notice_sent(&self, event_id: &str) -> Result<bool, AppError> {
+        Ok(self
+            .get_forward_retry(event_id)?
+            .is_some_and(|r| r.notice_sent))
+    }
+
+    pub fn mark_forward_failure_notice_sent(
+        &self,
+        event_id: &str,
+        now_secs: i64,
+    ) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE forward_retries SET notice_sent = 1, last_attempt_at = ?2 WHERE event_id = ?1",
+            params![event_id, now_secs],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn clear_forward_retries(&self, event_id: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM forward_retries WHERE event_id = ?1 AND notice_sent = 0",
+            params![event_id],
+        )
+        .map_err(|e| AppError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn list_pending_forward_retries(&self) -> Result<Vec<ForwardRetryRecord>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, room_id, thread_root_id, sender_mxid, payload_json,
+                        first_attempt_at, last_attempt_at, attempts, notice_sent
+                 FROM forward_retries
+                 WHERE notice_sent = 0
+                 ORDER BY first_attempt_at ASC, event_id ASC",
+            )
+            .map_err(|e| AppError::Store(e.to_string()))?;
+        let mut rows = stmt.query([]).map_err(|e| AppError::Store(e.to_string()))?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| AppError::Store(e.to_string()))? {
+            let payload_json: String = row.get(4).map_err(|e| AppError::Store(e.to_string()))?;
+            let payload: PendingForwardPayload = serde_json::from_str(&payload_json).map_err(|e| {
+                AppError::Store(format!("Failed to deserialize forward retry payload: {e}"))
+            })?;
+            let attempts: i64 = row.get(7).map_err(|e| AppError::Store(e.to_string()))?;
+            let notice_sent: i64 = row.get(8).map_err(|e| AppError::Store(e.to_string()))?;
+            results.push(ForwardRetryRecord {
+                event_id: row.get(0).map_err(|e| AppError::Store(e.to_string()))?,
+                room_id: row.get(1).map_err(|e| AppError::Store(e.to_string()))?,
+                thread_root_id: row.get(2).map_err(|e| AppError::Store(e.to_string()))?,
+                sender_mxid: row.get(3).map_err(|e| AppError::Store(e.to_string()))?,
+                payload,
+                first_attempt_at: row.get(5).map_err(|e| AppError::Store(e.to_string()))?,
+                last_attempt_at: row.get(6).map_err(|e| AppError::Store(e.to_string()))?,
+                attempts: attempts.max(0) as usize,
+                notice_sent: notice_sent != 0,
+            });
+        }
+        Ok(results)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingForwardPayload {
+    pub room_id: String,
+    pub thread_root_id: String,
+    pub claim_id: String,
+    pub reaction_target_id: String,
+    pub trigger_event_id: String,
+    pub sender_mxid: String,
+    pub mapped_sender: String,
+    pub target_expert_ref: String,
+    pub envelope: String,
+    pub is_addressed: bool,
+    pub is_delta: bool,
+    pub cursor_session_id: Option<String>,
+    pub rebootstrap_envelope: Option<String>,
+    pub escalation_root_author: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardRetryRecord {
+    pub event_id: String,
+    pub room_id: String,
+    pub thread_root_id: String,
+    pub sender_mxid: String,
+    pub payload: PendingForwardPayload,
+    pub first_attempt_at: i64,
+    pub last_attempt_at: i64,
+    pub attempts: usize,
+    pub notice_sent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

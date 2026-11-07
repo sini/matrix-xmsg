@@ -202,6 +202,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let retry_config = config.clone();
+    let retry_matrix = matrix_client.clone();
+    let retry_xmsg = xmsg_client.clone();
+    let retry_store = store.clone();
+    let retry_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        if let Err(e) = matrix_xmsg::bot::run_forward_retry_worker(
+            retry_config,
+            retry_matrix,
+            retry_xmsg,
+            retry_store,
+            retry_shutdown_rx,
+        )
+        .await
+        {
+            error!("Fatal forward retry worker error: {e}");
+        }
+    });
+
     info!("Starting Matrix event sync loop");
     if let Err(e) = matrix_xmsg::bot::run_daemon_loop_with_drain(
         matrix_client.inner(),

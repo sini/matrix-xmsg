@@ -7,11 +7,57 @@ use crate::context::{
 use crate::error::AppError;
 use crate::matrix::{is_bot_mentioned, MatrixClient};
 use crate::sender_map::map_sender_mxid;
-use crate::store::{BotReplyEventRecord, ForwardedMessageRecord, Store};
+use crate::store::{
+    BotReplyEventRecord, ForwardRetryRecord, ForwardedMessageRecord, PendingForwardPayload, Store,
+};
 use crate::xmsg::{
     parse_in_reply_to_id, route_guard_reply, GuardClient, GuardContent, GuardEnvelope, GuardLine,
     ReplyOutcome, SvcDelivery, SvcInbox, XmsgClient,
 };
+
+/// The total retry window (in seconds) for transient expert forward refusals (`not_found`, `unavailable`).
+pub const FORWARD_RETRY_WINDOW_SECS: i64 = 600;
+
+/// Initial backoff (in seconds) between transient expert forward retry attempts.
+pub const FORWARD_RETRY_INITIAL_BACKOFF_SECS: i64 = 2;
+
+/// Maximum backoff cap (in seconds) between transient expert forward retry attempts.
+pub const FORWARD_RETRY_MAX_BACKOFF_SECS: i64 = 60;
+
+/// User-facing thread notice posted once when expert forward retries give up (or on permanent refusal).
+pub const FORWARD_FAILURE_NOTICE: &str =
+    "Couldn't reach the expert after several tries. Please resend in a bit.";
+
+/// Returns the backoff in seconds after `attempts` failed attempts (`2s` doubling to a `60s` cap).
+pub fn forward_retry_backoff_secs(attempts: usize) -> i64 {
+    let shift = attempts.saturating_sub(1).min(6) as u32;
+    (FORWARD_RETRY_INITIAL_BACKOFF_SECS.saturating_mul(1_i64 << shift))
+        .min(FORWARD_RETRY_MAX_BACKOFF_SECS)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardFailureKind {
+    Transient,
+    Permanent,
+}
+
+fn classify_forward_error(err: &AppError) -> Option<ForwardFailureKind> {
+    match err {
+        AppError::XmsgTransport(::xmsg::client::ClientError::Refused { code }) => {
+            if code == "not_found" || code == "unavailable" {
+                Some(ForwardFailureKind::Transient)
+            } else {
+                Some(ForwardFailureKind::Permanent)
+            }
+        }
+        AppError::XmsgTransport(
+            ::xmsg::client::ClientError::Disconnected
+            | ::xmsg::client::ClientError::Timeout
+            | ::xmsg::client::ClientError::Io(_),
+        ) => Some(ForwardFailureKind::Transient),
+        _ => None,
+    }
+}
 
 /// The bound on each attempt of a send made under `Store::forward_gate`, which holds the inbox.
 /// A send that times out is retried once with the same idempotency key, so a send xmsg accepted
@@ -143,6 +189,9 @@ pub enum BotOutcome {
     RedactRefused,
     Edited,
     EditRefused,
+    Pending,
+    ForwardFailed,
+    IgnoredDuplicate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -827,6 +876,18 @@ pub async fn handle_incoming_event_with_guard(
 
     let now_secs = event.timestamp_ms / 1000;
 
+    if store.has_forward_failure_notice_sent(&claim_id)? {
+        return Ok(BotOutcome::IgnoredDuplicate);
+    }
+    if let Some(existing_retry) = store.get_forward_retry(&claim_id)? {
+        if existing_retry.attempts > 0 {
+            return Ok(BotOutcome::Pending);
+        }
+    }
+    if store.is_event_relayed(&claim_id)? {
+        return Ok(BotOutcome::IgnoredDuplicate);
+    }
+
     // 4. Size Cap Gate
     if event.body.len() > config.size_cap_bytes {
         let notice = format!(
@@ -844,9 +905,11 @@ pub async fn handle_incoming_event_with_guard(
         return Ok(BotOutcome::SizeCapRefusal);
     }
 
-    // 5. Rate Limit Gate (skip re-charging on guard retry attempts of the same event)
+    // 5. Rate Limit Gate (skip re-charging on guard retry or crash-recovery attempts of the same event)
     let prior_guard_attempts = store.get_guard_retries(&trigger_msg.event_id)?.unwrap_or(0);
+    let prior_forward_retry = store.get_forward_retry(&claim_id)?.is_some();
     if prior_guard_attempts == 0
+        && !prior_forward_retry
         && store
             .check_and_record_rate_limit(
                 &event.sender_mxid,
@@ -1071,9 +1134,6 @@ pub async fn handle_incoming_event_with_guard(
         return Ok(BotOutcome::Forwarded);
     }
 
-    // Record relay claim in SQLite
-    store.record_event_relayed(&claim_id, now_secs)?;
-
     // M39 §2.1: At the first forward in a thread, when the sender is trusted, look up the root
     // before taking `forward_gate` (check `room_history` first, calling `fetch_event` only on a miss).
     let escalation_root_author = if event.thread_root_id.is_some()
@@ -1104,12 +1164,53 @@ pub async fn handle_incoming_event_with_guard(
 
     // 8. Send to xmsg Expert Inbox, recording the forward under `Store::forward_gate`.
     let mapped_sender = map_sender_mxid(&event.sender_mxid);
+    let pending_payload = PendingForwardPayload {
+        room_id: event.room_id.clone(),
+        thread_root_id: thread_root.clone(),
+        claim_id: claim_id.clone(),
+        reaction_target_id: reaction_target_id.clone(),
+        trigger_event_id: trigger_msg.event_id.clone(),
+        sender_mxid: event.sender_mxid.clone(),
+        mapped_sender: mapped_sender.clone(),
+        target_expert_ref: target_expert_ref.to_string(),
+        envelope: envelope.clone(),
+        is_addressed,
+        is_delta: matches!(mode, ContextMode::Delta { .. }),
+        cursor_session_id: cursor_opt.as_ref().and_then(|c| c.session_id.clone()),
+        rebootstrap_envelope: None,
+        escalation_root_author: escalation_root_author.clone(),
+    };
+    store.record_forward_retry_pending(&pending_payload, now_secs, 0)?;
+
     let gate = store.forward_gate.read().await;
     let key = forward_key("forward", &claim_id);
-    let send_resp = bounded_send("Forward to the expert", || {
+    // D-3: `record_event_relayed` runs ONLY after `xmsg` accepts the forward send.
+    // Moving `record_event_relayed` after the send opens a crash window (sent to `xmsg`,
+    // not recorded in `relayed_events` => re-forward on restart). This is safe ONLY because
+    // the forward key (`forward_key("forward", &claim_id)`) is deterministic and `xmsg`
+    // deduplicates repeat sends within its idempotency TTL.
+    let send_res = bounded_send("Forward to the expert", || {
         xmsg.send_message_keyed(target_expert_ref, &mapped_sender, &envelope, &key)
     })
-    .await?;
+    .await;
+    let send_resp = match send_res {
+        Ok(resp) => {
+            store.record_event_relayed(&claim_id, now_secs)?;
+            resp
+        }
+        Err(err) => {
+            drop(gate);
+            return handle_forward_send_error(
+                err,
+                &pending_payload,
+                config,
+                matrix,
+                store,
+                now_secs,
+            )
+            .await;
+        }
+    };
     let delta_message_id = send_resp.message_id;
     let delta_session_id = send_resp.session_id.clone();
     let mut session_id = send_resp.session_id;
@@ -1132,7 +1233,7 @@ pub async fn handle_incoming_event_with_guard(
                 supersedes: delta_message_id.clone(),
             };
             let boot_screened = if screened.all_trusted {
-                screen_forward_context(
+                match screen_forward_context(
                     &trigger_msg,
                     room_history,
                     replied_to_msg.as_ref(),
@@ -1148,8 +1249,14 @@ pub async fn handle_incoming_event_with_guard(
                     store,
                     now_secs,
                 )
-                .await?
-                .ok()
+                .await
+                {
+                    Ok(res) => res.ok(),
+                    Err(e) => {
+                        let _ = store.clear_forward_retries(&claim_id);
+                        return Err(e);
+                    }
+                }
             } else {
                 Some(screened.clone())
             };
@@ -1177,7 +1284,7 @@ pub async fn handle_incoming_event_with_guard(
                 );
 
                 let key = forward_key("rebootstrap", &claim_id);
-                let boot_resp = bounded_send("Rebootstrap to the expert", || {
+                let boot_resp = match bounded_send("Rebootstrap to the expert", || {
                     xmsg.send_message_keyed(
                         target_expert_ref,
                         &mapped_sender,
@@ -1185,7 +1292,14 @@ pub async fn handle_incoming_event_with_guard(
                         &key,
                     )
                 })
-                .await?;
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = store.clear_forward_retries(&claim_id);
+                        return Err(e);
+                    }
+                };
 
                 rebootstrap_message_id = Some(boot_resp.message_id);
                 session_id = boot_resp.session_id.or(session_id);
@@ -1193,76 +1307,334 @@ pub async fn handle_incoming_event_with_guard(
         }
     }
 
+    complete_expert_forward(
+        &pending_payload,
+        &delta_message_id,
+        delta_session_id.as_deref(),
+        rebootstrap_message_id.as_deref(),
+        session_id.as_deref(),
+        gate,
+        matrix,
+        store,
+        now_secs,
+    )
+    .await?;
+
+    Ok(BotOutcome::Forwarded)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_expert_forward(
+    payload: &PendingForwardPayload,
+    delta_message_id: &str,
+    delta_session_id: Option<&str>,
+    rebootstrap_message_id: Option<&str>,
+    session_id: Option<&str>,
+    gate: tokio::sync::RwLockReadGuard<'_, ()>,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    now_secs: i64,
+) -> Result<(), AppError> {
     // Rule 1 & Rule 3 & Rule 5 & M16 & M28: Advance cursor with the new session id and target ref
     store.set_thread_cursor_with_target(
-        &thread_root,
-        &trigger_msg.event_id,
+        &payload.thread_root_id,
+        &payload.trigger_event_id,
         now_secs,
-        session_id.as_deref(),
-        Some(target_expert_ref),
+        session_id,
+        Some(&payload.target_expert_ref),
     )?;
 
     // Record mapping in SQLite: record both message ids against the thread
-    store.record_thread_message(&thread_root, &delta_message_id, now_secs)?;
-    if let Some(ref r_msg_id) = rebootstrap_message_id {
-        store.record_thread_message(&thread_root, r_msg_id, now_secs)?;
+    store.record_thread_message(&payload.thread_root_id, delta_message_id, now_secs)?;
+    if let Some(r_msg_id) = rebootstrap_message_id {
+        store.record_thread_message(&payload.thread_root_id, r_msg_id, now_secs)?;
     }
-    if let Some(ref root_asker) = escalation_root_author {
-        store.record_thread_escalation(&thread_root, root_asker, &event.sender_mxid, now_secs)?;
+    if let Some(ref root_asker) = payload.escalation_root_author {
+        store.record_thread_escalation(
+            &payload.thread_root_id,
+            root_asker,
+            &payload.sender_mxid,
+            now_secs,
+        )?;
     } else {
-        store.record_thread_asker(&thread_root, &event.sender_mxid)?;
+        store.record_thread_asker(&payload.thread_root_id, &payload.sender_mxid)?;
     }
 
     // Record forwarded message for inbox reply routing and timeout tracking:
     // Both delta and rebootstrap message IDs are recorded so a reply to EITHER is attributed to the thread.
     let delta_forward_rec = ForwardedMessageRecord {
-        message_id: delta_message_id.clone(),
-        room_id: event.room_id.clone(),
-        thread_root_id: thread_root.clone(),
-        event_id: reaction_target_id.clone(),
-        sender_mxid: event.sender_mxid.clone(),
-        addressed: is_addressed,
+        message_id: delta_message_id.to_string(),
+        room_id: payload.room_id.clone(),
+        thread_root_id: payload.thread_root_id.clone(),
+        event_id: payload.reaction_target_id.clone(),
+        sender_mxid: payload.sender_mxid.clone(),
+        addressed: payload.is_addressed,
         sent_at: now_secs,
         ack_reaction_id: None,
         timeout_dm_sent: false,
         reply_count: 0,
     };
     store.record_forwarded_message(&delta_forward_rec)?;
-    store.set_forward_session(&delta_message_id, delta_session_id.as_deref())?;
+    store.set_forward_session(delta_message_id, delta_session_id)?;
 
-    if let Some(ref r_msg_id) = rebootstrap_message_id {
+    if let Some(r_msg_id) = rebootstrap_message_id {
         let boot_forward_rec = ForwardedMessageRecord {
-            message_id: r_msg_id.clone(),
-            room_id: event.room_id.clone(),
-            thread_root_id: thread_root.clone(),
-            event_id: reaction_target_id.clone(),
-            sender_mxid: event.sender_mxid.clone(),
-            addressed: is_addressed,
+            message_id: r_msg_id.to_string(),
+            room_id: payload.room_id.clone(),
+            thread_root_id: payload.thread_root_id.clone(),
+            event_id: payload.reaction_target_id.clone(),
+            sender_mxid: payload.sender_mxid.clone(),
+            addressed: payload.is_addressed,
             sent_at: now_secs,
             ack_reaction_id: None,
             timeout_dm_sent: false,
             reply_count: 0,
         };
         store.record_forwarded_message(&boot_forward_rec)?;
-        store.set_forward_session(r_msg_id, session_id.as_deref())?;
+        store.set_forward_session(r_msg_id, session_id)?;
     }
+    store.clear_forward_retries(&payload.claim_id)?;
     drop(gate);
 
     // The ack reaction is cosmetic: it follows the record, so it never delays a reply's routing.
-    if is_addressed {
-        let mut forwards = vec![delta_message_id.as_str()];
-        forwards.extend(rebootstrap_message_id.as_deref());
+    if payload.is_addressed {
+        let mut forwards = vec![delta_message_id];
+        forwards.extend(rebootstrap_message_id);
         ack_forward(
             matrix,
             store,
-            &event.room_id,
-            &reaction_target_id,
+            &payload.room_id,
+            &payload.reaction_target_id,
             &forwards,
         )
         .await?;
     }
 
-    Ok(BotOutcome::Forwarded)
+    Ok(())
+}
+
+async fn handle_forward_send_error(
+    err: AppError,
+    pending_payload: &PendingForwardPayload,
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    store: &Store,
+    now_secs: i64,
+) -> Result<BotOutcome, AppError> {
+    match classify_forward_error(&err) {
+        Some(ForwardFailureKind::Transient) => {
+            tracing::warn!(
+                event_id = %pending_payload.claim_id,
+                room_id = %pending_payload.room_id,
+                thread_root_id = %pending_payload.thread_root_id,
+                "Transient expert forward refusal ({err}); queueing non-blocking retry"
+            );
+            store.record_forward_retry_pending(pending_payload, now_secs, 1)?;
+            Ok(BotOutcome::Pending)
+        }
+        Some(ForwardFailureKind::Permanent) => {
+            tracing::warn!(
+                event_id = %pending_payload.claim_id,
+                room_id = %pending_payload.room_id,
+                thread_root_id = %pending_payload.thread_root_id,
+                "Permanent expert forward refusal ({err}); posting failure notice without retry"
+            );
+            store.record_forward_retry_pending(pending_payload, now_secs, 1)?;
+            if !store.has_forward_failure_notice_sent(&pending_payload.claim_id)? {
+                store.mark_forward_failure_notice_sent(&pending_payload.claim_id, now_secs)?;
+                matrix
+                    .send_notice(
+                        &pending_payload.room_id,
+                        Some(&pending_payload.thread_root_id),
+                        FORWARD_FAILURE_NOTICE,
+                        Some(&pending_payload.sender_mxid),
+                    )
+                    .await?;
+                let dm_text = format!(
+                    "[matrix-xmsg] Expert forward permanently refused in room {} thread {}: {}",
+                    pending_payload.room_id, pending_payload.thread_root_id, err
+                );
+                let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
+            }
+            Ok(BotOutcome::ForwardFailed)
+        }
+        None => {
+            let _ = store.clear_forward_retries(&pending_payload.claim_id);
+            Err(err)
+        }
+    }
+}
+
+fn forward_retry_due_at(row: &ForwardRetryRecord) -> i64 {
+    if row.attempts == 0 {
+        return row.first_attempt_at;
+    }
+    let deadline = row.first_attempt_at.saturating_add(FORWARD_RETRY_WINDOW_SECS);
+    let next_backoff = row
+        .last_attempt_at
+        .saturating_add(forward_retry_backoff_secs(row.attempts));
+    next_backoff.min(deadline)
+}
+
+/// Sweeps all pending `forward_retries` rows that are due at `now_secs` (or per-row clock
+/// overrides in `row_clocks`) and drives each due row once.
+pub async fn sweep_due_forward_retries(
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    xmsg: &dyn XmsgClient,
+    store: &Store,
+    now_secs: i64,
+) -> Result<usize, AppError> {
+    sweep_due_forward_retries_with_clocks(config, matrix, xmsg, store, now_secs, None).await
+}
+
+async fn sweep_due_forward_retries_with_clocks(
+    config: &Config,
+    matrix: &dyn MatrixClient,
+    xmsg: &dyn XmsgClient,
+    store: &Store,
+    default_now_secs: i64,
+    mut row_clocks: Option<&mut std::collections::HashMap<String, (tokio::time::Instant, i64)>>,
+) -> Result<usize, AppError> {
+    let pending = store.list_pending_forward_retries()?;
+    let mut processed = 0;
+
+    for row in pending {
+        if store.is_event_relayed(&row.event_id)? {
+            store.clear_forward_retries(&row.event_id)?;
+            if let Some(clocks) = row_clocks.as_deref_mut() {
+                clocks.remove(&row.event_id);
+            }
+            continue;
+        }
+
+        let row_now_secs = if let Some(clocks) = row_clocks.as_deref_mut() {
+            let now_inst = tokio::time::Instant::now();
+            let (seen_inst, base_secs) = clocks
+                .entry(row.event_id.clone())
+                .or_insert_with(|| {
+                    let base = if row.last_attempt_at > 1_000_000_000 {
+                        row.last_attempt_at.max(default_now_secs)
+                    } else {
+                        row.last_attempt_at
+                    };
+                    (now_inst, base)
+                });
+            *base_secs + now_inst.duration_since(*seen_inst).as_secs() as i64
+        } else {
+            default_now_secs
+        };
+
+        let due_at = forward_retry_due_at(&row);
+        if row_now_secs < due_at {
+            continue;
+        }
+
+        processed += 1;
+        let deadline = row.first_attempt_at.saturating_add(FORWARD_RETRY_WINDOW_SECS);
+        let gate = store.forward_gate.read().await;
+        let key = forward_key("forward", &row.payload.claim_id);
+        let send_res = bounded_send("Forward to the expert", || {
+            xmsg.send_message_keyed(
+                &row.payload.target_expert_ref,
+                &row.payload.mapped_sender,
+                &row.payload.envelope,
+                &key,
+            )
+        })
+        .await;
+
+        match send_res {
+            Ok(send_resp) => {
+                store.record_event_relayed(&row.payload.claim_id, row_now_secs)?;
+                complete_expert_forward(
+                    &row.payload,
+                    &send_resp.message_id,
+                    send_resp.session_id.as_deref(),
+                    None,
+                    send_resp.session_id.as_deref(),
+                    gate,
+                    matrix,
+                    store,
+                    row_now_secs,
+                )
+                .await?;
+                if let Some(clocks) = row_clocks.as_deref_mut() {
+                    clocks.remove(&row.event_id);
+                }
+            }
+            Err(err) => {
+                drop(gate);
+                let new_attempts = row.attempts.saturating_add(1);
+                let kind = classify_forward_error(&err).unwrap_or(ForwardFailureKind::Permanent);
+                if kind == ForwardFailureKind::Permanent || row_now_secs >= deadline {
+                    store.record_forward_retry_pending(&row.payload, row_now_secs, new_attempts)?;
+                    if !store.has_forward_failure_notice_sent(&row.payload.claim_id)? {
+                        store.mark_forward_failure_notice_sent(&row.payload.claim_id, row_now_secs)?;
+                        matrix
+                            .send_notice(
+                                &row.payload.room_id,
+                                Some(&row.payload.thread_root_id),
+                                FORWARD_FAILURE_NOTICE,
+                                Some(&row.payload.sender_mxid),
+                            )
+                            .await?;
+                        let dm_text = format!(
+                            "[matrix-xmsg] Expert forward failed after {} attempt(s) in room {} thread {}: {}",
+                            new_attempts, row.payload.room_id, row.payload.thread_root_id, err
+                        );
+                        let _ = matrix.send_dm(&config.owner_mxid, &dm_text).await;
+                    }
+                    if let Some(clocks) = row_clocks.as_deref_mut() {
+                        clocks.remove(&row.event_id);
+                    }
+                } else {
+                    store.record_forward_retry_pending(&row.payload, row_now_secs, new_attempts)?;
+                }
+            }
+        }
+    }
+
+    Ok(processed)
+}
+
+/// Runs the background expert-forward retry worker until `shutdown` fires.
+pub async fn run_forward_retry_worker(
+    config: std::sync::Arc<Config>,
+    matrix: std::sync::Arc<dyn MatrixClient>,
+    xmsg: std::sync::Arc<dyn XmsgClient>,
+    store: std::sync::Arc<Store>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), AppError> {
+    let start_inst = tokio::time::Instant::now();
+    let start_wall = chrono::Utc::now().timestamp();
+    let mut row_clocks: std::collections::HashMap<String, (tokio::time::Instant, i64)> =
+        std::collections::HashMap::new();
+
+    loop {
+        let now_secs = start_wall + start_inst.elapsed().as_secs() as i64;
+        if let Err(e) = sweep_due_forward_retries_with_clocks(
+            &config,
+            matrix.as_ref(),
+            xmsg.as_ref(),
+            &store,
+            now_secs,
+            Some(&mut row_clocks),
+        )
+        .await
+        {
+            tracing::warn!("Error sweeping pending expert forward retries: {e}");
+        }
+
+        tokio::select! {
+            _ = shutdown.recv() => {
+                tracing::info!("Shutdown signal received, exiting forward retry worker");
+                break;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Sends the 👀 ack reaction to `target` and records it on each of `forwards`, so a decline
