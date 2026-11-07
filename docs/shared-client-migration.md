@@ -1,7 +1,7 @@
 # Shared xmsg client migration
 
 Matrix uses `xmsg::client` from revision
-`87bd5cc28ae8632d7ca4283e03b6b0ec839fd9c0`, with default features disabled.
+`2d76fd63f4ebc63946a9303c7019a50d169f7ed3`, with default features disabled.
 Registration, inbound polling, expert sends and guard sends share one registered
 service identity. Reconnection replaces the outbound handle held by that service.
 Matrix retains its guard, sender binding, retry, thread and cursor policies.

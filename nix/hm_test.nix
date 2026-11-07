@@ -114,7 +114,7 @@ pkgs.testers.nixosTest {
             timeout=30,
         )
         machine.wait_until_succeeds(
-            "journalctl _SYSTEMD_USER_UNIT=matrix-xmsg.service | grep -F \"xmsg refused request: error\"",
+            "journalctl _SYSTEMD_USER_UNIT=matrix-xmsg.service | grep -F \"xmsg refused request: bad_request\"",
             timeout=30,
         )
 
