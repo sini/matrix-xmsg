@@ -371,6 +371,14 @@ fn config_load_validates_configured_service_name() {
         Config::from_toml_str_with_env(&explicit_valid, Some("/run/user/1001")).unwrap();
     assert_eq!(valid_cfg.service_name, "matrix-xmsg");
 
+    let custom_valid = format!("{base_toml}\nservice_name = \"matrix-xmsg-test\"\n");
+    let custom_cfg = Config::from_toml_str_with_env(&custom_valid, Some("/run/user/1001")).unwrap();
+    assert_eq!(custom_cfg.service_name, "matrix-xmsg-test");
+    assert_eq!(
+        matrix_xmsg::xmsg::client_options(&custom_cfg, &custom_cfg.service_name).service,
+        "matrix-xmsg-test"
+    );
+
     let long_name = "a".repeat(36);
     for invalid in [
         "a/b",
@@ -392,4 +400,160 @@ fn config_load_validates_configured_service_name() {
             "expected AppError::Config for `{invalid}`, got {err:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn daemon_registers_configured_non_default_service_name() {
+    use std::os::unix::fs::PermissionsExt;
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    struct MinimalHomeserver;
+    impl Respond for MinimalHomeserver {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let path = request.url.path();
+            let method = request.method.as_str();
+            if method == "GET" && path == "/_matrix/client/versions" {
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "versions": ["v1.1", "v1.2", "v1.3", "v1.4", "v1.5", "v1.6", "v1.7", "v1.8", "v1.9", "v1.10", "v1.11"]
+                }));
+            }
+            if method == "GET" && path == "/_matrix/client/v3/account/whoami" {
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "user_id": "@genie:example.org",
+                    "device_id": "MOCK_BOT_DEVICE"
+                }));
+            }
+            if method == "POST" && path == "/_matrix/client/v3/keys/query" {
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "device_keys": {},
+                    "master_keys": {},
+                    "self_signing_keys": {},
+                    "user_signing_keys": {},
+                    "failures": {}
+                }));
+            }
+            if method == "POST" && path == "/_matrix/client/v3/keys/upload" {
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "one_time_key_counts": {"signed_curve25519": 50}
+                }));
+            }
+            if method == "POST" && path == "/_matrix/client/v3/keys/signatures/upload" {
+                return ResponseTemplate::new(200).set_body_json(json!({"failures": {}}));
+            }
+            if method == "GET" && path.contains("/state/m.room.encryption") {
+                return ResponseTemplate::new(404).set_body_json(json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "Event not found."
+                }));
+            }
+            if method == "GET" && path == "/_matrix/client/v3/sync" {
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            "!room:example.org": {
+                                "timeline": {"events": [], "prev_batch": "s0"}
+                            }
+                        }
+                    }
+                }));
+            }
+            ResponseTemplate::new(200).set_body_json(json!({}))
+        }
+    }
+
+    let hs = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(MinimalHomeserver)
+        .mount(&hs)
+        .await;
+
+    let dir = private_dir();
+    let register = UnixListener::bind(dir.path().join("register.sock")).unwrap();
+
+    let token_path = dir.path().join("token");
+    std::fs::write(&token_path, "syt_test_token\n").unwrap();
+    std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let passphrase_path = dir.path().join("passphrase");
+    std::fs::write(&passphrase_path, "test_store_passphrase\n").unwrap();
+    std::fs::set_permissions(&passphrase_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let db_path = dir.path().join("bot.db");
+    let config_path = dir.path().join("config.toml");
+    let config_toml = format!(
+        r#"
+homeserver_url = "{}"
+bot_mxid = "@genie:example.org"
+access_token_file = {}
+store_passphrase_file = {}
+rooms = ["!room:example.org"]
+trusted_mxids = []
+owner_mxid = "@owner:example.org"
+guard_ref = "genie-guard"
+screen_mentions = false
+screen_solicited = false
+xmsg_socket = {}
+db_path = {}
+service_name = "matrix-xmsg-test"
+"#,
+        hs.uri(),
+        serde_json::to_string(token_path.to_str().unwrap()).unwrap(),
+        serde_json::to_string(passphrase_path.to_str().unwrap()).unwrap(),
+        serde_json::to_string(dir.path().to_str().unwrap()).unwrap(),
+        serde_json::to_string(db_path.to_str().unwrap()).unwrap(),
+    );
+    std::fs::write(&config_path, config_toml).unwrap();
+
+    let bin = option_env!("CARGO_BIN_EXE_matrix-xmsg")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("matrix-xmsg")
+        });
+    assert!(
+        bin.is_file(),
+        "expected matrix-xmsg binary at {}",
+        bin.display()
+    );
+
+    let mut child = tokio::process::Command::new(&bin)
+        .arg("--config")
+        .arg(&config_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn matrix-xmsg");
+
+    let reg_frame = tokio::time::timeout(Duration::from_secs(15), async {
+        let (stream, _) = register.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let frame = exchange(
+            &mut reader,
+            json!({
+                "status": "ok",
+                "node": "fixture",
+                "address": "matrix-xmsg-test@fixture"
+            }),
+        )
+        .await;
+        let mut poll_line = String::new();
+        reader.read_line(&mut poll_line).await.unwrap();
+        let poll_frame: Value = serde_json::from_str(&poll_line).unwrap();
+        assert_eq!(poll_frame["action"], "poll");
+        frame
+    })
+    .await
+    .expect("timed out waiting for matrix-xmsg to register on register.sock");
+
+    assert_eq!(reg_frame["harness"], "svc");
+    assert_eq!(reg_frame["name"], "matrix-xmsg-test");
+
+    child.kill().await.expect("kill matrix-xmsg");
 }

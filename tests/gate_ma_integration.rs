@@ -443,9 +443,9 @@ impl Bot {
         let store = Arc::new(Store::new(&config.db_path).unwrap());
         let matrix = Arc::new(MockMatrixClient::default());
         let (shutdown, rx) = tokio::sync::broadcast::channel(1);
-        let inbox = ReconnectingSvcInbox::new(transport_fixture::options(
-            config.xmsg_register_socket(),
-            "matrix-xmsg",
+        let inbox = ReconnectingSvcInbox::new(matrix_xmsg::xmsg::client_options(
+            &config,
+            &config.service_name,
         ))
         .with_backoff(Duration::from_millis(50), Duration::from_millis(200));
         let xmsg = create_xmsg_client(&inbox);

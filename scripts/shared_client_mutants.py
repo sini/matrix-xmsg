@@ -18,10 +18,12 @@ CASES = [
     ("reconnect-facade", "src/xmsg.rs", "*client.agent.lock().unwrap() = Some(service.agent_client());", "{ let mut slot = client.agent.lock().unwrap(); if slot.is_none() { *slot = Some(service.agent_client()); } }", "shared_transport", "reconnect_rebinds_the_existing_outbound_facade"),
     ("stored-classification", "src/xmsg.rs", 'if record.push_outcome.as_deref() != Some("stored")', "if true", "shared_transport", "stored_reply_preserves_its_record_without_inventing_a_pushed_id"),
     ("service-name-validation", "src/config.rs", "::xmsg::client::validate_service_name(&self.service_name)", "Ok::<(), ::xmsg::client::ClientError>(())", "shared_transport", "config_load_validates_configured_service_name"),
+    ("service-name-client-options", "src/xmsg.rs", "service: service.into(),", 'service: { let _ = service; "matrix-xmsg".into() },', "shared_transport", "config_load_validates_configured_service_name"),
+    ("service-name-main-wiring", "src/main.rs", "&config.service_name", '"matrix-xmsg"', "shared_transport", "daemon_registers_configured_non_default_service_name"),
 ]
 
 
-def run(root, target, test):
+def run(root, target, test, allow_bin=False):
     env = {**os.environ, "CARGO_TARGET_DIR": str(ROOT / "target")}
     profile = env.get("CARGO_PROFILE", "dev")
     started = time.monotonic()
@@ -30,6 +32,7 @@ def run(root, target, test):
     assert build.returncode == 0, ("compilation failed; not a mutant kill", build.stdout[-10000:], build.stderr[-10000:])
     executable = []
     rebuilt = False
+    bin_rebuilt = False
     for line in build.stdout.splitlines():
         try:
             item = json.loads(line)
@@ -38,17 +41,19 @@ def run(root, target, test):
         if item.get("reason") == "compiler-artifact" and item.get("target", {}).get("name") == target and item.get("profile", {}).get("test") and item.get("executable"):
             executable.append(item["executable"])
             rebuilt = not item.get("fresh", True)
-        assert not (item.get("reason") == "compiler-artifact" and item.get("target", {}).get("kind") == ["bin"]), "unexpected application binary build"
+        if item.get("reason") == "compiler-artifact" and item.get("target", {}).get("kind") == ["bin"]:
+            assert allow_bin, "unexpected application binary build"
+            bin_rebuilt = not item.get("fresh", True)
     assert len(executable) == 1 and Path(executable[0]).is_file(), ("missing intended executable", target)
-    assert rebuilt, FRESH_ERROR
+    assert (bin_rebuilt if allow_bin else rebuilt), FRESH_ERROR
     print(f"built intended test in {time.monotonic() - started:.1f}s", flush=True)
     return subprocess.run([executable[0], test, "--exact", "--test-threads=1"], cwd=root, env=env, capture_output=True, text=True, timeout=45)
 
 
 
-def verify_cached_refusal(root, target, test):
+def verify_cached_refusal(root, target, test, allow_bin=False):
     try:
-        run(root, target, test)
+        run(root, target, test, allow_bin=allow_bin)
     except AssertionError as error:
         if str(error) != FRESH_ERROR:
             raise
@@ -67,33 +72,40 @@ def main():
             shutil.copyfile(ROOT / source, root / source)
         for source in ("src", "tests", "scripts"):
             shutil.copytree(ROOT / source, root / source, copy_function=shutil.copyfile)
-        # These in-process tests exercise the library, never CARGO_BIN_EXE binaries.
+        # Library-only tests strip [[bin]] so Cargo does not relink matrix-xmsg on every library mutant;
+        # src/main.rs mutants restore [[bin]] so CARGO_BIN_EXE_matrix-xmsg is built and exercised.
         manifest = root / "Cargo.toml"
+        full_manifest_text = manifest.read_text()
         lines = []
         in_bin = False
-        for line in manifest.read_text().splitlines(keepends=True):
+        for line in full_manifest_text.splitlines(keepends=True):
             if line.startswith("["):
                 in_bin = line.strip() == "[[bin]]"
             if not in_bin:
                 lines.append(line)
                 if line.strip() == "[package]":
                     lines.append("autobins = false\n")
-        manifest.write_text("".join(lines))
+        no_bin_manifest_text = "".join(lines)
+        current_allow_bin = None
         for name, filename, old, new, target, test in CASES:
+            allow_bin = filename == "src/main.rs"
+            if current_allow_bin != allow_bin:
+                manifest.write_text(full_manifest_text if allow_bin else no_bin_manifest_text)
+                current_allow_bin = allow_bin
             file = root / filename
             body = file.read_text()
             assert body.count(old) == 1, (name, body.count(old))
             # New mtimes force Cargo to rebuild restored and mutated source alike.
             file.touch()
-            green = run(root, target, test)
+            green = run(root, target, test, allow_bin=allow_bin)
             assert green.returncode == 0 and "1 passed; 0 failed; 0 ignored" in green.stdout, (name, "invalid baseline", green.stdout, green.stderr)
             if not self_tested:
-                verify_cached_refusal(root, target, test)
+                verify_cached_refusal(root, target, test, allow_bin=allow_bin)
                 self_tested = True
             try:
                 file.write_text(body.replace(old, new, 1))
                 file.touch()
-                red = run(root, target, test)
+                red = run(root, target, test, allow_bin=allow_bin)
                 assert red.returncode == 101 and f"test {test} ... FAILED" in red.stdout, (name, "survived or wrong red", red.stdout, red.stderr)
                 (evidence / f"{name}.log").write_text(red.stdout + red.stderr)
                 print(f"{name}: GREEN baseline, RED intended test", flush=True)
