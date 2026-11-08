@@ -12,7 +12,7 @@ use crate::store::{
 };
 use crate::xmsg::{
     parse_in_reply_to_id, route_guard_reply, GuardClient, GuardContent, GuardEnvelope, GuardLine,
-    ReplyOutcome, SvcDelivery, SvcInbox, XmsgClient,
+    GuardReviewScope, ReplyOutcome, SvcDelivery, SvcInbox, XmsgClient,
 };
 
 /// The total retry window (in seconds) for transient expert forward refusals (`not_found`, `unavailable`).
@@ -1469,7 +1469,9 @@ fn forward_retry_due_at(row: &ForwardRetryRecord) -> i64 {
     if row.attempts == 0 {
         return row.first_attempt_at;
     }
-    let deadline = row.first_attempt_at.saturating_add(FORWARD_RETRY_WINDOW_SECS);
+    let deadline = row
+        .first_attempt_at
+        .saturating_add(FORWARD_RETRY_WINDOW_SECS);
     let next_backoff = row
         .last_attempt_at
         .saturating_add(forward_retry_backoff_secs(row.attempts));
@@ -1510,16 +1512,14 @@ async fn sweep_due_forward_retries_with_clocks(
 
         let row_now_secs = if let Some(clocks) = row_clocks.as_deref_mut() {
             let now_inst = tokio::time::Instant::now();
-            let (seen_inst, base_secs) = clocks
-                .entry(row.event_id.clone())
-                .or_insert_with(|| {
-                    let base = if row.last_attempt_at > 1_000_000_000 {
-                        row.last_attempt_at.max(default_now_secs)
-                    } else {
-                        row.last_attempt_at
-                    };
-                    (now_inst, base)
-                });
+            let (seen_inst, base_secs) = clocks.entry(row.event_id.clone()).or_insert_with(|| {
+                let base = if row.last_attempt_at > 1_000_000_000 {
+                    row.last_attempt_at.max(default_now_secs)
+                } else {
+                    row.last_attempt_at
+                };
+                (now_inst, base)
+            });
             *base_secs + now_inst.duration_since(*seen_inst).as_secs() as i64
         } else {
             default_now_secs
@@ -1531,7 +1531,9 @@ async fn sweep_due_forward_retries_with_clocks(
         }
 
         processed += 1;
-        let deadline = row.first_attempt_at.saturating_add(FORWARD_RETRY_WINDOW_SECS);
+        let deadline = row
+            .first_attempt_at
+            .saturating_add(FORWARD_RETRY_WINDOW_SECS);
         let gate = store.forward_gate.read().await;
         let key = forward_key("forward", &row.payload.claim_id);
         let send_res = bounded_send("Forward to the expert", || {
@@ -1570,7 +1572,10 @@ async fn sweep_due_forward_retries_with_clocks(
                 if kind == ForwardFailureKind::Permanent || row_now_secs >= deadline {
                     store.record_forward_retry_pending(&row.payload, row_now_secs, new_attempts)?;
                     if !store.has_forward_failure_notice_sent(&row.payload.claim_id)? {
-                        store.mark_forward_failure_notice_sent(&row.payload.claim_id, row_now_secs)?;
+                        store.mark_forward_failure_notice_sent(
+                            &row.payload.claim_id,
+                            row_now_secs,
+                        )?;
                         matrix
                             .send_notice(
                                 &row.payload.room_id,
@@ -2395,6 +2400,11 @@ async fn screen_forward_context(
     };
 
     let guard_env = GuardEnvelope {
+        review_scope: config.guard_review_scope.then_some(if trigger_trusted {
+            GuardReviewScope::UntrustedLines
+        } else {
+            GuardReviewScope::All
+        }),
         source: "message".to_string(),
         history,
         content,
@@ -2621,7 +2631,15 @@ async fn screen_page_messages(
             .filter(|m| m.sender_mxid != config.bot_mxid && !m.is_undecryptable())
             .collect();
 
-        if non_bot.is_empty() {
+        if non_bot.is_empty()
+            || (config.guard_review_scope
+                && non_bot
+                    .iter()
+                    .all(|m| config.is_user_trusted(&m.sender_mxid)))
+        {
+            if config.guard_review_scope {
+                kept_non_bot_chunk = true;
+            }
             for m in chunk {
                 kept_lines.push(format_context_line_with_screening(
                     m,
@@ -2660,6 +2678,9 @@ async fn screen_page_messages(
             text: last_msg.body.clone(),
         };
         let guard_env = GuardEnvelope {
+            review_scope: config
+                .guard_review_scope
+                .then_some(GuardReviewScope::UntrustedLines),
             source: "message".to_string(),
             history,
             content,
@@ -2668,7 +2689,9 @@ async fn screen_page_messages(
         match guard.check_guard(&config.guard_ref, &guard_env).await {
             Ok(verdict) => {
                 let _ = store.clear_guard_retries(delivery_message_id);
-                if verdict.verdict == "reject" {
+                if verdict.verdict == "reject"
+                    || (config.guard_review_scope && verdict.verdict == "rewrite")
+                {
                     tracing::info!(
                         "Guard rejected page chunk in thread {}: {}",
                         thread_root_id,

@@ -16,6 +16,7 @@ use tokio::net::UnixListener;
 
 fn envelope() -> GuardEnvelope {
     GuardEnvelope {
+        review_scope: None,
         source: "message".to_string(),
         history: vec![],
         content: GuardContent {

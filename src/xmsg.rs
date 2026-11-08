@@ -662,7 +662,17 @@ pub struct GuardContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Producer attestation; the consumer authorizes the transport origin before using this scope.
+#[serde(rename_all = "snake_case")]
+pub enum GuardReviewScope {
+    All,
+    UntrustedLines,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_scope: Option<GuardReviewScope>,
     pub source: String,
     pub history: Vec<GuardLine>,
     pub content: GuardContent,
