@@ -1469,7 +1469,9 @@ fn forward_retry_due_at(row: &ForwardRetryRecord) -> i64 {
     if row.attempts == 0 {
         return row.first_attempt_at;
     }
-    let deadline = row.first_attempt_at.saturating_add(FORWARD_RETRY_WINDOW_SECS);
+    let deadline = row
+        .first_attempt_at
+        .saturating_add(FORWARD_RETRY_WINDOW_SECS);
     let next_backoff = row
         .last_attempt_at
         .saturating_add(forward_retry_backoff_secs(row.attempts));
@@ -1510,16 +1512,14 @@ async fn sweep_due_forward_retries_with_clocks(
 
         let row_now_secs = if let Some(clocks) = row_clocks.as_deref_mut() {
             let now_inst = tokio::time::Instant::now();
-            let (seen_inst, base_secs) = clocks
-                .entry(row.event_id.clone())
-                .or_insert_with(|| {
-                    let base = if row.last_attempt_at > 1_000_000_000 {
-                        row.last_attempt_at.max(default_now_secs)
-                    } else {
-                        row.last_attempt_at
-                    };
-                    (now_inst, base)
-                });
+            let (seen_inst, base_secs) = clocks.entry(row.event_id.clone()).or_insert_with(|| {
+                let base = if row.last_attempt_at > 1_000_000_000 {
+                    row.last_attempt_at.max(default_now_secs)
+                } else {
+                    row.last_attempt_at
+                };
+                (now_inst, base)
+            });
             *base_secs + now_inst.duration_since(*seen_inst).as_secs() as i64
         } else {
             default_now_secs
@@ -1531,7 +1531,9 @@ async fn sweep_due_forward_retries_with_clocks(
         }
 
         processed += 1;
-        let deadline = row.first_attempt_at.saturating_add(FORWARD_RETRY_WINDOW_SECS);
+        let deadline = row
+            .first_attempt_at
+            .saturating_add(FORWARD_RETRY_WINDOW_SECS);
         let gate = store.forward_gate.read().await;
         let key = forward_key("forward", &row.payload.claim_id);
         let send_res = bounded_send("Forward to the expert", || {
@@ -1570,7 +1572,10 @@ async fn sweep_due_forward_retries_with_clocks(
                 if kind == ForwardFailureKind::Permanent || row_now_secs >= deadline {
                     store.record_forward_retry_pending(&row.payload, row_now_secs, new_attempts)?;
                     if !store.has_forward_failure_notice_sent(&row.payload.claim_id)? {
-                        store.mark_forward_failure_notice_sent(&row.payload.claim_id, row_now_secs)?;
+                        store.mark_forward_failure_notice_sent(
+                            &row.payload.claim_id,
+                            row_now_secs,
+                        )?;
                         matrix
                             .send_notice(
                                 &row.payload.room_id,
