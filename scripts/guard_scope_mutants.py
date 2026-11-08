@@ -26,7 +26,7 @@ CASES = [
 
 def run(root, name, evidence, arm):
     profile = os.environ.get("CARGO_PROFILE", "dev")
-    env = {**os.environ, "CARGO_TARGET_DIR": str(ROOT / "target")}
+    env = {**os.environ, "CARGO_TARGET_DIR": str(ROOT / "target" / "guard-scope-mutant-build")}
     command = ["cargo", "test", "--locked", "--offline", "--profile", profile, "-j", "4", "--test", "gate_gs1", "--no-run", "--message-format=json"]
     build = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=1200)
     (evidence / f"{name}-{arm}-build.log").write_text(build.stdout + build.stderr)
