@@ -114,6 +114,7 @@ fn test_config() -> Config {
         screen_mentions: false,
         screen_solicited: false,
         guard_failure_mode: GuardFailureMode::Closed,
+        guard_review_scope: false,
         guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
         store_passphrase_file: None,
@@ -742,6 +743,11 @@ async fn xb1_f3_route_guard_reply_checks_delivery_origin_matches_guard_ref() {
                     in_reply_to: Some(guard_req_id.to_string()),
                 };
                 assert!(
+                    !route_guard_reply("unknown-pending-request", &valid_verdict, "genie-guard")
+                        .await,
+                    "matching guard origin cannot consume another request ID"
+                );
+                assert!(
                     route_guard_reply(guard_req_id, &valid_verdict, "genie-guard").await,
                     "route_guard_reply must accept the verdict from the matching guard_ref origin"
                 );
@@ -753,6 +759,7 @@ async fn xb1_f3_route_guard_reply_checks_delivery_origin_matches_guard_ref() {
     let guard_xmsg = registration.client();
     let guard_client = UnixGuardClient::new(guard_xmsg.as_ref(), 5);
     let envelope = GuardEnvelope {
+        review_scope: None,
         source: "matrix:!support:example.org".to_string(),
         history: vec![],
         content: GuardContent {

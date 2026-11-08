@@ -249,6 +249,8 @@ pub struct Config {
 
     #[serde(default)]
     pub guard_failure_mode: GuardFailureMode,
+    #[serde(default)]
+    pub guard_review_scope: bool,
 
     #[serde(default = "default_guard_outage_dm_window_secs")]
     pub guard_outage_dm_window_secs: u64,
@@ -551,6 +553,7 @@ mod tests {
         "#;
         let cfg = Config::from_toml_str_with_env(toml_str, Some("/run/user/1001")).unwrap();
         assert_eq!(cfg.guard_ref, "genie-guard");
+        assert!(!cfg.guard_review_scope);
         assert_eq!(cfg.guard_timeout_secs, 150);
         assert_eq!(cfg.guard_retry_budget, 3);
         assert!(cfg.screen_mentions);
@@ -574,6 +577,7 @@ mod tests {
             owner_mxid = "@owner:example.org"
             screen_mentions = false
             screen_solicited = false
+            guard_review_scope = true
             guard_failure_mode = "open"
             guard_outage_dm_window_secs = 600
         "#;
@@ -582,6 +586,7 @@ mod tests {
         assert!(!cfg.screen_solicited);
         assert!(cfg.guard_ref.is_empty());
         assert_eq!(cfg.guard_failure_mode, GuardFailureMode::Open);
+        assert!(cfg.guard_review_scope);
         assert_eq!(cfg.guard_outage_dm_window_secs, 600);
     }
 

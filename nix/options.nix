@@ -277,6 +277,12 @@
         '';
       };
 
+      guardReviewScope = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Opt into entry-scoped review after configuring a compatible guard consumer.";
+      };
+
       guardFailureMode = lib.mkOption {
         type = lib.types.enum [
           "closed"
@@ -457,6 +463,7 @@
       screen_mentions = cfg.screenMentions;
       screen_solicited = cfg.screenSolicited;
       guard_failure_mode = cfg.guardFailureMode;
+      guard_review_scope = cfg.guardReviewScope;
       guard_outage_dm_window_secs = cfg.guardOutageDmWindowSecs;
       history_n = cfg.historyN;
       history_byte_cap = cfg.historyByteCap;

@@ -198,9 +198,15 @@
                       runHook preCheck
                       cargoWithProfile test --locked --test shared_transport --test gate_idem_retry -- --test-threads=1
                       python3 scripts/shared_client_mutants.py
+                      python3 scripts/guard_scope_mutants.py
                       runHook postCheck
                     '';
-                    installPhase = ''runHook preInstall; mkdir -p "$out"; runHook postInstall'';
+                    installPhase = ''
+                      runHook preInstall
+                      mkdir -p "$out"
+                      cp -r target/guard-scope-mutants "$out/"
+                      runHook postInstall
+                    '';
                   };
                   hm-user-service = import ../nix/hm_test.nix {
                     inherit

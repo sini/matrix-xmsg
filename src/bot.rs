@@ -12,7 +12,7 @@ use crate::store::{
 };
 use crate::xmsg::{
     parse_in_reply_to_id, route_guard_reply, GuardClient, GuardContent, GuardEnvelope, GuardLine,
-    ReplyOutcome, SvcDelivery, SvcInbox, XmsgClient,
+    GuardReviewScope, ReplyOutcome, SvcDelivery, SvcInbox, XmsgClient,
 };
 
 /// The total retry window (in seconds) for transient expert forward refusals (`not_found`, `unavailable`).
@@ -2400,6 +2400,11 @@ async fn screen_forward_context(
     };
 
     let guard_env = GuardEnvelope {
+        review_scope: config.guard_review_scope.then_some(if trigger_trusted {
+            GuardReviewScope::UntrustedLines
+        } else {
+            GuardReviewScope::All
+        }),
         source: "message".to_string(),
         history,
         content,
@@ -2626,7 +2631,15 @@ async fn screen_page_messages(
             .filter(|m| m.sender_mxid != config.bot_mxid && !m.is_undecryptable())
             .collect();
 
-        if non_bot.is_empty() {
+        if non_bot.is_empty()
+            || (config.guard_review_scope
+                && non_bot
+                    .iter()
+                    .all(|m| config.is_user_trusted(&m.sender_mxid)))
+        {
+            if config.guard_review_scope {
+                kept_non_bot_chunk = true;
+            }
             for m in chunk {
                 kept_lines.push(format_context_line_with_screening(
                     m,
@@ -2665,6 +2678,9 @@ async fn screen_page_messages(
             text: last_msg.body.clone(),
         };
         let guard_env = GuardEnvelope {
+            review_scope: config
+                .guard_review_scope
+                .then_some(GuardReviewScope::UntrustedLines),
             source: "message".to_string(),
             history,
             content,
@@ -2673,7 +2689,9 @@ async fn screen_page_messages(
         match guard.check_guard(&config.guard_ref, &guard_env).await {
             Ok(verdict) => {
                 let _ = store.clear_guard_retries(delivery_message_id);
-                if verdict.verdict == "reject" {
+                if verdict.verdict == "reject"
+                    || (config.guard_review_scope && verdict.verdict == "rewrite")
+                {
                     tracing::info!(
                         "Guard rejected page chunk in thread {}: {}",
                         thread_root_id,

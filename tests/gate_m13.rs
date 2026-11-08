@@ -205,6 +205,7 @@ fn test_config(socket_dir: &Path) -> Config {
         screen_mentions: false,
         screen_solicited: true,
         guard_failure_mode: matrix_xmsg::config::GuardFailureMode::Closed,
+        guard_review_scope: false,
         guard_outage_dm_window_secs: 3600,
         inbox_retry_budget: 10,
         store_passphrase_file: None,

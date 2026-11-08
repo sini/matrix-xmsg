@@ -252,6 +252,7 @@ async fn outbound_guard_send_is_not_blocked_by_the_inbox_poll() {
         guard.check_guard(
             "guard@fixture",
             &GuardEnvelope {
+                review_scope: None,
                 source: "fixture".into(),
                 history: vec![],
                 content: GuardContent {
