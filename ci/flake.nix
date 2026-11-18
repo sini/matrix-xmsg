@@ -10,12 +10,12 @@
     # The library and current daemon share one immutable revision. Keep the previous
     # daemon as an explicit compatibility arm, not as a second client implementation.
     xmsg = {
-      url = "github:sini/xmsg/2d76fd63f4ebc63946a9303c7019a50d169f7ed3";
+      url = "github:json64-dev/xmsg/2d76fd63f4ebc63946a9303c7019a50d169f7ed3";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.crane.follows = "crane";
     };
     xmsg-legacy = {
-      url = "github:sini/xmsg/cca3de77fbe95ea1ad90ab8ba7a83eb741fc9cb9";
+      url = "github:json64-dev/xmsg/cca3de77fbe95ea1ad90ab8ba7a83eb741fc9cb9";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.crane.follows = "crane";
     };
@@ -78,7 +78,7 @@
                 import (xmsg.outPath + "/ci/xmsg-source.nix") {
                   inherit pkgs;
                   pin = {
-                    repository = "https://github.com/sini/xmsg";
+                    repository = "https://github.com/json64-dev/xmsg";
                     revision = node.locked.rev;
                     source_hash = node.locked.narHash;
                   };

@@ -1,6 +1,6 @@
 # matrix-xmsg: Matrix Support Bot Backed by an Expert Agent Session
 
-`matrix-xmsg` is a secure Matrix bridge connecting public Matrix support rooms to a dedicated "expert" AI agent session (such as Claude Code) running behind [xmsg](https://github.com/sini/xmsg).
+`matrix-xmsg` is a secure Matrix bridge connecting public Matrix support rooms to a dedicated "expert" AI agent session (such as Claude Code) running behind [xmsg](https://github.com/json64-dev/xmsg).
 
 ---
 
@@ -395,7 +395,7 @@ On startup, the bot registers on `register.sock` as the service `matrix-xmsg`. x
 
 ## 4. OCI Container Image (M4)
 
-An unprivileged, minimal OCI container image is built via `dockerTools.buildLayeredImage` and published to `ghcr.io/sini/matrix-xmsg`.
+An unprivileged, minimal OCI container image is built via `dockerTools.buildLayeredImage` and published to `ghcr.io/json64-dev/matrix-xmsg`.
 
 ### 4.1 Security Properties
 

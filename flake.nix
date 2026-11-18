@@ -70,7 +70,7 @@
           );
 
           image = pkgs.dockerTools.buildLayeredImage {
-            name = "ghcr.io/sini/matrix-xmsg";
+            name = "ghcr.io/json64-dev/matrix-xmsg";
             tag = "latest";
             contents = [
               pkgs.cacert

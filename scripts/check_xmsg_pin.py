@@ -23,7 +23,7 @@ def check(root):
     flake = (root / "ci/flake.nix").read_text()
     lock = json.loads((root / "ci/flake.lock").read_text())
     for name, key in (("xmsg", "revision"), ("xmsg-legacy", "legacy_revision")):
-        match = re.search(r'\b' + name + r'\s*=\s*\{\s*url\s*=\s*"github:sini/xmsg/([a-f0-9]{40})"', flake)
+        match = re.search(r'\b' + name + r'\s*=\s*\{\s*url\s*=\s*"github:json64-dev/xmsg/([a-f0-9]{40})"', flake)
         assert match and match[1] == pin[key], f"{name} flake input mismatch"
         node = lock["nodes"][lock["nodes"]["root"]["inputs"][name]]
         assert node["locked"]["rev"] == pin[key], f"{name} flake lock mismatch"

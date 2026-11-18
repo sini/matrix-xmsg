@@ -1,7 +1,7 @@
 # matrix-xmsg: a Matrix support bot backed by an expert agent session
 
 *DRAFT design spec, 2026-10-07, rev 2. Status: owner rulings on audience and ACL applied (§4, §8); remaining questions open; not built.*
-*It builds on [xmsg](https://github.com/sini/xmsg): `docs/specs/` and `TODO.md`.*
+*It builds on [xmsg](https://github.com/json64-dev/xmsg): `docs/specs/` and `TODO.md`.*
 
 ## 1. Problem
 
