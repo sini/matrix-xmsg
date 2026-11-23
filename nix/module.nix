@@ -33,6 +33,18 @@ let
         null;
   } cfg "/run/credentials/matrix-xmsg-e2ee-setup.service/access-token";
 
+  # The own daemon's sockets, pinned in the directory the bot reads (its default xmsgSocket),
+  # so neither side resolves xmsg's managed runtime namespace and the two cannot disagree.
+  ownSocketDir = "/run/matrix-xmsg-xmsg/xmsg";
+  ownSockets = {
+    XMSG_HTTP_SOCK = "${ownSocketDir}/http.sock";
+    XMSG_AGENT_SOCK = "${ownSocketDir}/agent.sock";
+    XMSG_REGISTER_SOCK = "${ownSocketDir}/register.sock";
+  };
+  # RuntimeDirectoryPreserve keeps socket files across restarts; xmsg refuses to unlink one it
+  # has no record of (e.g. left by an older daemon), so remove the pinned ones nothing answers on.
+  reapDeadSockets = import ./reap-dead-sockets.nix { inherit pkgs; };
+
   cryptoStorePath = "${dirOf (toString cfg.dbPath)}/matrix-sdk-crypto.sqlite3";
 
   peersFile =
@@ -89,8 +101,8 @@ in
         cfg
         ;
       defaultStateDir = "/var/lib/matrix-xmsg";
-      defaultXmsgSocket = if cfg.xmsg.enable then "/run/matrix-xmsg-xmsg/xmsg" else null;
-      defaultXmsgSocketText = lib.literalExpression ''if config.services.matrix-xmsg.xmsg.enable then "/run/matrix-xmsg-xmsg/xmsg" else null'';
+      defaultXmsgSocket = if cfg.xmsg.enable then ownSocketDir else null;
+      defaultXmsgSocketText = lib.literalExpression ''if config.services.matrix-xmsg.xmsg.enable then "${ownSocketDir}" else null'';
       accessTokenDescription = ''
         Path to file containing the Matrix access token.
         Loaded securely at service startup via systemd LoadCredential;
@@ -194,6 +206,10 @@ in
       {
         assertion = xmsgCfg.enable -> xmsgCfg.package != null;
         message = "services.matrix-xmsg.xmsg.enable requires services.matrix-xmsg.xmsg.package to be set.";
+      }
+      {
+        assertion = xmsgCfg.enable -> toString cfg.xmsgSocket == ownSocketDir;
+        message = "services.matrix-xmsg.xmsg.enable pins the own daemon's sockets in ${ownSocketDir}; services.matrix-xmsg.xmsgSocket must be left at that default.";
       }
       {
         assertion = xmsgCfg.enable -> !cfg.dynamicUser;
@@ -399,7 +415,8 @@ in
           HOME = toString cfg.stateDir;
           XDG_RUNTIME_DIR = "/run/matrix-xmsg-xmsg";
           XMSG_DB_PATH = "/var/lib/matrix-xmsg-xmsg/xmsg.db";
-        };
+        }
+        // ownSockets;
 
         serviceConfig = {
           Type = "simple";
@@ -413,6 +430,7 @@ in
           RuntimeDirectoryPreserve = "yes";
           StateDirectory = "matrix-xmsg-xmsg";
           StateDirectoryMode = "0700";
+          ExecStartPre = "${reapDeadSockets} ${lib.escapeShellArgs (lib.attrValues ownSockets)}";
           ExecStart = "${lib.getExe xmsgCfg.package} ${lib.escapeShellArgs xmsgArgs}";
           Restart = "on-failure";
           RestartSec = "2s";

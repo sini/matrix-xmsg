@@ -169,6 +169,15 @@
                 (matrix-xmsg.checks.${system} or { })
                 // {
                   package = matrix-xmsg.packages.${system}.default;
+                  # The own daemon's ExecStartPre: dead pinned sockets go, everything else stays.
+                  reap-dead-sockets =
+                    pkgs.runCommand "matrix-xmsg-reap-dead-sockets" { nativeBuildInputs = [ pkgs.python3 ]; }
+                      ''
+                        python3 ${../nix/reap_dead_sockets_check.py} ${
+                          import ../nix/reap-dead-sockets.nix { inherit pkgs; }
+                        }
+                        touch "$out"
+                      '';
                   xmsg-pins = pkgs.runCommand "matrix-xmsg-pins" { nativeBuildInputs = [ pkgs.python3 ]; } ''
                     mkdir ci
                     cp ${../Cargo.toml} Cargo.toml

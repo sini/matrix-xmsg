@@ -412,6 +412,64 @@ in
         };
       };
 
+    test-own-xmsg-sockets-pinned-in-bot-socket-dir =
+      let
+        res = evalModule {
+          xmsg = {
+            enable = true;
+            package = xmsgNoCheck;
+          };
+        };
+        dir = toString res.config.services.matrix-xmsg.xmsgSocket;
+        xmsgSvc = res.config.systemd.services.matrix-xmsg-xmsg;
+        sockets = lib.filterAttrs (
+          n: _: lib.hasPrefix "XMSG_" n && lib.hasSuffix "_SOCK" n
+        ) xmsgSvc.environment;
+        # The bot joins these names onto xmsgSocket (src/config.rs xmsg_*_socket).
+        botSockets = map (n: "${dir}/${n}.sock") [
+          "http"
+          "agent"
+          "register"
+        ];
+      in
+      {
+        expr = {
+          inherit sockets;
+          daemonMatchesBot =
+            lib.sort lib.lessThan (lib.attrValues sockets) == lib.sort lib.lessThan botSockets;
+          reapsPinnedSockets = lib.hasSuffix (lib.escapeShellArgs (
+            map (n: "${dir}/${n}.sock") [
+              "agent"
+              "http"
+              "register"
+            ]
+          )) (xmsgSvc.serviceConfig.ExecStartPre or "");
+        };
+        expected = {
+          sockets = {
+            XMSG_HTTP_SOCK = "/run/matrix-xmsg-xmsg/xmsg/http.sock";
+            XMSG_AGENT_SOCK = "/run/matrix-xmsg-xmsg/xmsg/agent.sock";
+            XMSG_REGISTER_SOCK = "/run/matrix-xmsg-xmsg/xmsg/register.sock";
+          };
+          daemonMatchesBot = true;
+          reapsPinnedSockets = true;
+        };
+      };
+
+    test-own-xmsg-refuses-a-diverging-xmsg-socket = {
+      expr =
+        builtins.elem
+          "services.matrix-xmsg.xmsg.enable pins the own daemon's sockets in /run/matrix-xmsg-xmsg/xmsg; services.matrix-xmsg.xmsgSocket must be left at that default."
+          (evalConfig {
+            xmsgSocket = "/run/user/1000/xmsg";
+            xmsg = {
+              enable = true;
+              package = xmsgNoCheck;
+            };
+          });
+      expected = true;
+    };
+
     test-m30-guard-ref-null-allowed-when-both-switches-off = {
       expr = evalConfig {
         xmsgSocket = "/run/xmsg.sock";

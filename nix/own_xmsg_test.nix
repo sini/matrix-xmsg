@@ -578,8 +578,8 @@ pkgs.testers.nixosTest {
     machine.wait_for_file("/tmp/m18_delivery_in_flight", timeout=25)
 
     # Restart the real xmsg daemon under the running bot while the delivery is in-flight and unacked.
-    # Unlink old socket files between stop and start so readiness checks observe the new server binding.
-    machine.succeed("systemctl stop matrix-xmsg-xmsg.service && rm -f /run/matrix-xmsg-xmsg/xmsg/register.sock /run/matrix-xmsg-xmsg/xmsg/agent.sock /run/matrix-xmsg-xmsg/xmsg/http.sock && systemctl start matrix-xmsg-xmsg.service")
+    # No manual unlink: the unit's ExecStartPre removes the dead pinned sockets left by the stop.
+    machine.succeed("systemctl stop matrix-xmsg-xmsg.service && systemctl start matrix-xmsg-xmsg.service")
     machine.wait_until_succeeds(
         "journalctl -u matrix-xmsg.service | grep -F 'xmsg registration connection lost'",
         timeout=25,

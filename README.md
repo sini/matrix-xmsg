@@ -248,7 +248,6 @@ The flake exports two modules sharing the same `services.matrix-xmsg` option set
     rooms = [ "!general:json64.dev" ];
     trustedMxids = [ "@owner:json64.dev" ];
     ownerMxid = "@owner:json64.dev";
-    xmsgSocket = "/run/user/1000/xmsg";
     expertRef = "genie-support@sini.bitstream";
     guardRef = "genie-guard@sini.bitstream";
     openThreadNodes = [
@@ -358,7 +357,7 @@ When imported alongside `xmsg.homeManagerModules.xmsg`, the module automatically
 | `trustedMxids`            | `listOf str`               | `[]`                           | Allowlist of user Matrix IDs permitted to interact with the bot.                                                                                                                                      |
 | `ownerMxid`               | `str`                      | *(required)*                   | Owner Matrix ID for escalations and direct notices.                                                                                                                                                   |
 | `stateDir`                | `path`                     | `"/var/lib/matrix-xmsg"`       | State directory for persistent store and database.                                                                                                                                                    |
-| `xmsgSocket`              | `nullOr (either path str)` | `"/run/user/1000/xmsg"`        | Path to xmsg runtime directory containing register.sock and agent.sock.                                                                                                                               |
+| `xmsgSocket`              | `nullOr (either path str)` | `"/run/matrix-xmsg-xmsg/xmsg"` | Runtime directory with register.sock, agent.sock and http.sock; the default applies with `xmsg.enable` (else `null`), and must stay the default then.                                                 |
 | `expertRef`               | `str`                      | `"claude"`                     | Session name/ref in xmsg to route queries to.                                                                                                                                                         |
 | `guardRef`                | `str`                      | `"genie-guard"`                | Guard service xmsg address (`name` or `name@node`).                                                                                                                                                   |
 | `screenMentions`          | `bool`                     | `true`                         | Screen regular mentions and thread replies through `guardRef` (solicited threads are always screened).                                                                                                |
@@ -384,6 +383,20 @@ When imported alongside `xmsg.homeManagerModules.xmsg`, the module automatically
 - **State Persistence:** `StateDirectory = "matrix-xmsg"` provisions `/var/lib/matrix-xmsg` owned by the service user. The SQLite database is created mode `0600` via `Store::new`.
 - **Bounded Shutdown:** `TimeoutStopSec = 60` provides generous margin above the 5-second in-flight drain and 5-second shutdown notice bounds.
 - **Boot Synchronization & Failure Retry:** The systemd unit sets `Restart = "on-failure"` with `RestartSec = "5s"`. Because `/run/user/1000` exists only under the user's lingering user manager session, registration on `register.sock` can fail at early system boot before the user session initializes. When registration fails, the bot logs the failure and exits non-zero (`std::process::exit(1)`), causing systemd to automatically retry every 5 seconds until `register.sock` becomes available.
+
+### 3.4b Own xmsg Node (`xmsg.enable`)
+
+With `xmsg.enable = true` the module runs a dedicated daemon, `matrix-xmsg-xmsg.service`, and the bot reads its sockets from `xmsgSocket`, which defaults to `/run/matrix-xmsg-xmsg/xmsg`. The module pins the daemon's three sockets in that directory, through the unit's environment:
+
+| Variable             | Path                                       |
+| -------------------- | ------------------------------------------ |
+| `XMSG_HTTP_SOCK`     | `/run/matrix-xmsg-xmsg/xmsg/http.sock`     |
+| `XMSG_AGENT_SOCK`    | `/run/matrix-xmsg-xmsg/xmsg/agent.sock`    |
+| `XMSG_REGISTER_SOCK` | `/run/matrix-xmsg-xmsg/xmsg/register.sock` |
+
+Unpinned, the daemon would bind its sockets in xmsg's managed runtime namespace (`<runtime dir>/xmsg-<uid>-<id>/`), a path the bot cannot know in advance. Pinning both ends to one directory means the daemon and the bot cannot disagree, and nothing depends on the namespace. For the same reason the module refuses, at evaluation, an `xmsgSocket` other than the default while `xmsg.enable` is set.
+
+The runtime directory is kept across daemon restarts (`RuntimeDirectoryPreserve = "yes"`), so the bot's bind mount of it stays valid while the daemon restarts underneath it. A stopped daemon can therefore leave socket files behind, and xmsg refuses to replace a socket it has no record of (for example one left by an older xmsg version). The unit's `ExecStartPre` removes each pinned socket that is not accepting connections; it never touches a socket something is listening on, or a path that is not a socket.
 
 ### 3.5 xmsg Attestation & Svc Harness
 

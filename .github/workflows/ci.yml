@@ -13,6 +13,7 @@ env:
     ci-self-input
     default
     mdformat-plugins
+    reap-dead-sockets
     root-surface
     treefmt-tree-root
     xmsg-pins
