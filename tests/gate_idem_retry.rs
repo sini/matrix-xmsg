@@ -325,8 +325,11 @@ impl XmsgClient for StoredRelay {
                 message_id: message_id.into(),
                 created_at: 1,
                 replier_session_id: "matrix-xmsg".into(),
+                replier: None,
                 text: text.into(),
+                attachments: Vec::new(),
                 push_outcome: Some("stored".into()),
+                push_error: None,
                 pushed_message_id: Some("01STOREDRELAY".into()),
             },
         })

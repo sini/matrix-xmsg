@@ -103,8 +103,10 @@ pkgs.testers.nixosTest {
         machine.wait_for_open_port(8008)
         machine.wait_for_unit("user@1000.service")
         machine.wait_until_succeeds(
-            "${pkgs.python3}/bin/python3 -c 'import socket; "
-            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(f\"/run/user/1000/xmsg/{n}.sock\"), s.close()) for n in (\"register\",\"agent\",\"http\") ]'",
+            "${pkgs.python3}/bin/python3 -c 'import glob, socket; "
+            "socks = [glob.glob(f\"/run/user/1000/xmsg*/{n}.sock\") for n in (\"register\",\"agent\",\"http\")]; "
+            "assert all(len(m) == 1 for m in socks), socks; "
+            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(m[0]), s.close()) for m in socks ]'",
             timeout=30,
         )
 
@@ -129,8 +131,9 @@ pkgs.testers.nixosTest {
 
         machine.succeed(
             "${pkgs.strace}/bin/strace -e trace=connect -o /tmp/agent-connect-control.trace "
-            "${pkgs.python3}/bin/python3 -c 'import socket; "
-            "s=socket.socket(socket.AF_UNIX); s.connect(\"/run/user/1000/xmsg/agent.sock\")'"
+            "${pkgs.python3}/bin/python3 -c 'import glob, socket; "
+            "p = glob.glob(\"/run/user/1000/xmsg*/agent.sock\")[0]; "
+            "s=socket.socket(socket.AF_UNIX); s.connect(p)'"
         )
         control = machine.succeed("cat /tmp/agent-connect-control.trace")
         assert "agent.sock" in control, f"Agent connection trace control was not live: {control}"
@@ -147,8 +150,10 @@ pkgs.testers.nixosTest {
         machine.wait_for_open_port(8008)
         machine.wait_for_unit("user@1000.service")
         machine.wait_until_succeeds(
-            "${pkgs.python3}/bin/python3 -c 'import socket; "
-            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(f\"/run/user/1000/xmsg/{n}.sock\"), s.close()) for n in (\"register\",\"agent\",\"http\") ]'",
+            "${pkgs.python3}/bin/python3 -c 'import glob, socket; "
+            "socks = [glob.glob(f\"/run/user/1000/xmsg*/{n}.sock\") for n in (\"register\",\"agent\",\"http\")]; "
+            "assert all(len(m) == 1 for m in socks), socks; "
+            "[ (s:=socket.socket(socket.AF_UNIX), s.connect(m[0]), s.close()) for m in socks ]'",
             timeout=30,
         )
 

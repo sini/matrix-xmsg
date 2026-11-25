@@ -1162,4 +1162,35 @@ mod tests {
         let text = "not json";
         assert!(parse_guard_reply(text).is_err());
     }
+
+    #[test]
+    fn test_list_result_accepts_recipient_carrying_tags_and_coverage() {
+        let payload = serde_json::json!({
+            "recipients": [{
+                "address": "11111111-1111-4111-8111-111111111111@bus",
+                "label": "worker",
+                "kind": "instance",
+                "status": "live",
+                "node": "bus",
+                "user": "alice",
+                "harness": "claude",
+                "tags": ["review", "orchestrator.proj"],
+                "registered_at": 1_728_000_000i64
+            }],
+            "nodes": [{ "node": "bus", "status": "ok" }],
+            "coverage": {
+                "complete": true,
+                "tag_incapable": [],
+                "unanswered": []
+            },
+            "total": 1,
+            "truncated": false
+        });
+        let parsed: ::xmsg::client::ListResult = serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            parsed.recipients[0].tags,
+            vec!["review", "orchestrator.proj"]
+        );
+        assert!(parsed.coverage.as_ref().is_some_and(|c| c.complete));
+    }
 }
