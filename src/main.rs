@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     info!("Loading configuration from {}", args.config.display());
 
-    let config = match Config::from_file(&args.config) {
+    let (config, xmsg_socket_explicit) = match Config::from_file_with_explicit(&args.config) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to load configuration: {e}");
@@ -168,9 +168,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Failed resolving configured rooms in client state: {e}");
     }
 
-    let svc_inbox = matrix_xmsg::xmsg::ReconnectingSvcInbox::new(
+    let mut svc_inbox = matrix_xmsg::xmsg::ReconnectingSvcInbox::new(
         matrix_xmsg::xmsg::client_options(&config, &config.service_name),
     );
+    if !xmsg_socket_explicit {
+        let resolver_cfg = config.clone();
+        svc_inbox = svc_inbox.with_socket_resolver(std::sync::Arc::new(move || {
+            resolver_cfg.resolve_runtime_xmsg_socket()
+        }));
+    }
 
     let xmsg_client = matrix_xmsg::xmsg::create_xmsg_client(&svc_inbox);
 

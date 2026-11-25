@@ -22,13 +22,84 @@ fn darwin_user_temp_dir() -> Option<PathBuf> {
     Some(PathBuf::from(OsStr::from_bytes(s.to_bytes())))
 }
 
+#[cfg(unix)]
+fn is_managed_namespace_dir(name: &str, uid: u32) -> bool {
+    let prefix = format!("xmsg-{uid}-");
+    let Some(digest) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    digest.len() == 12
+        && digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[cfg(unix)]
+pub fn discover_managed_socket_dir(parent: &Path, uid: u32) -> Result<Option<PathBuf>, AppError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Ok(None);
+    };
+    let mut matches: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name_str = name.to_str()?;
+            if !is_managed_namespace_dir(name_str, uid) {
+                return None;
+            }
+            let path = entry.path();
+            let dir_meta = fs::symlink_metadata(&path).ok()?;
+            if dir_meta.file_type().is_symlink()
+                || !dir_meta.is_dir()
+                || dir_meta.uid() != uid
+                || (dir_meta.permissions().mode() & 0o777) != 0o700
+            {
+                return None;
+            }
+            let reg_meta = fs::symlink_metadata(path.join("register.sock")).ok()?;
+            if !reg_meta.file_type().is_socket() || reg_meta.uid() != uid {
+                return None;
+            }
+            Some(path)
+        })
+        .collect();
+    matches.sort();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(AppError::Config(format!(
+                "Multiple managed xmsg socket directories found for uid {uid}: {candidates}; set `xmsg_socket` explicitly"
+            )))
+        }
+    }
+}
+
 pub fn socket_dir_for_env(xdg_var: Option<&str>) -> Result<PathBuf, AppError> {
+    let uid = xmsg::client::current_uid();
     if let Some(val) = xdg_var.filter(|s| !s.trim().is_empty()) {
-        return Ok(PathBuf::from(val).join("xmsg"));
+        let base = PathBuf::from(val);
+        #[cfg(unix)]
+        if let Some(managed) = discover_managed_socket_dir(&base, uid)? {
+            return Ok(managed);
+        }
+        return Ok(base.join("xmsg"));
     }
     #[cfg(target_os = "macos")]
-    if let Some(dir) = darwin_user_temp_dir() {
-        return Ok(dir.join("xmsg"));
+    {
+        if let Some(managed) = discover_managed_socket_dir(Path::new("/tmp"), uid)? {
+            return Ok(managed);
+        }
+        if let Some(dir) = darwin_user_temp_dir() {
+            return Ok(dir.join("xmsg"));
+        }
     }
     Err(AppError::Config(
         "Neither `xmsg_socket` in config nor `XDG_RUNTIME_DIR` in environment is set; refusing to guess an xmsg socket directory".to_string(),
@@ -403,13 +474,22 @@ impl Config {
     }
 
     pub fn from_toml_str_with_env(content: &str, xdg_var: Option<&str>) -> Result<Self, AppError> {
+        let (cfg, _) = Self::from_toml_str_with_env_explicit(content, xdg_var)?;
+        Ok(cfg)
+    }
+
+    pub fn from_toml_str_with_env_explicit(
+        content: &str,
+        xdg_var: Option<&str>,
+    ) -> Result<(Self, bool), AppError> {
         let mut cfg: Self = toml::from_str(content)
             .map_err(|e| AppError::Config(format!("Failed to parse TOML config: {e}")))?;
-        if cfg.xmsg_socket.as_os_str().is_empty() {
+        let explicit = !cfg.xmsg_socket.as_os_str().is_empty();
+        if !explicit {
             cfg.xmsg_socket = socket_dir_for_env(xdg_var)?;
         }
         cfg.validate()?;
-        Ok(cfg)
+        Ok((cfg, explicit))
     }
 
     pub fn from_toml_str(content: &str) -> Result<Self, AppError> {
@@ -418,13 +498,19 @@ impl Config {
     }
 
     pub fn from_file(path: &Path) -> Result<Self, AppError> {
+        let (cfg, _) = Self::from_file_with_explicit(path)?;
+        Ok(cfg)
+    }
+
+    pub fn from_file_with_explicit(path: &Path) -> Result<(Self, bool), AppError> {
         let content = fs::read_to_string(path).map_err(|e| {
             AppError::Config(format!(
                 "Failed to read config file at {}: {e}",
                 path.display()
             ))
         })?;
-        Self::from_toml_str(&content)
+        let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        Self::from_toml_str_with_env_explicit(&content, xdg.as_deref())
     }
 
     pub fn route_for(&self, room_id: &str) -> Route<'_> {
@@ -529,6 +615,22 @@ impl Config {
 
     pub fn xmsg_agent_socket(&self) -> PathBuf {
         self.xmsg_socket.join("agent.sock")
+    }
+
+    pub fn resolve_runtime_xmsg_socket(&self) -> Result<Option<(PathBuf, PathBuf)>, AppError> {
+        #[cfg(unix)]
+        {
+            let uid = xmsg::client::current_uid();
+            if let Some(parent) = self.xmsg_socket.parent() {
+                if let Some(dir) = discover_managed_socket_dir(parent, uid)? {
+                    return Ok(Some((dir.join("register.sock"), dir.join("agent.sock"))));
+                }
+            }
+            if let Some(dir) = discover_managed_socket_dir(Path::new("/tmp"), uid)? {
+                return Ok(Some((dir.join("register.sock"), dir.join("agent.sock"))));
+            }
+        }
+        Ok(None)
     }
 
     pub fn xmsg_http_socket(&self) -> PathBuf {
@@ -667,6 +769,64 @@ mod tests {
             assert!(err.contains("xmsg_socket"), "{err}");
             assert!(err.contains("XDG_RUNTIME_DIR"), "{err}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_managed_socket_dir_zero_one_and_multiple() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let parent = tempfile::tempdir().unwrap();
+        let uid = xmsg::client::current_uid();
+
+        // Zero matches
+        assert_eq!(discover_managed_socket_dir(parent.path(), uid).unwrap(), None);
+
+        // One match
+        let dir1 = parent.path().join(format!("xmsg-{uid}-111111111111"));
+        fs::create_dir(&dir1).unwrap();
+        fs::set_permissions(&dir1, fs::Permissions::from_mode(0o700)).unwrap();
+        let _sock1 = UnixListener::bind(dir1.join("register.sock")).unwrap();
+        assert_eq!(
+            discover_managed_socket_dir(parent.path(), uid).unwrap(),
+            Some(dir1.clone())
+        );
+
+        let toml_str = r#"
+            homeserver_url = "https://matrix.example.org"
+            bot_mxid = "@genie:example.org"
+            access_token_file = "/tmp/token"
+            rooms = ["!room:example.org"]
+            trusted_mxids = []
+            owner_mxid = "@owner:example.org"
+            guard_ref = "genie-guard"
+        "#;
+        let cfg =
+            Config::from_toml_str_with_env(toml_str, Some(parent.path().to_str().unwrap()))
+                .unwrap();
+        assert_eq!(cfg.xmsg_socket, dir1);
+
+        // Two matches -> refusal naming all candidates and telling user to set xmsg_socket
+        let dir2 = parent.path().join(format!("xmsg-{uid}-222222222222"));
+        fs::create_dir(&dir2).unwrap();
+        fs::set_permissions(&dir2, fs::Permissions::from_mode(0o700)).unwrap();
+        let _sock2 = UnixListener::bind(dir2.join("register.sock")).unwrap();
+
+        let err = discover_managed_socket_dir(parent.path(), uid)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&dir1.display().to_string()), "{err}");
+        assert!(err.contains(&dir2.display().to_string()), "{err}");
+        assert!(err.contains("xmsg_socket"), "{err}");
+
+        let cfg_err =
+            Config::from_toml_str_with_env(toml_str, Some(parent.path().to_str().unwrap()))
+                .unwrap_err()
+                .to_string();
+        assert!(cfg_err.contains(&dir1.display().to_string()), "{cfg_err}");
+        assert!(cfg_err.contains(&dir2.display().to_string()), "{cfg_err}");
+        assert!(cfg_err.contains("xmsg_socket"), "{cfg_err}");
     }
 
     #[test]

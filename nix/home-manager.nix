@@ -19,7 +19,9 @@ let
     (options ? programs.xmsg) && config.programs.xmsg.enable && config.programs.xmsg.server.enable;
 
   defaultXmsgSocket =
-    if xmsgEnabled && config.programs.xmsg.server.httpSocket != null then
+    if xmsgEnabled && (config.programs.xmsg.server.sockets.dir or null) != null then
+      config.programs.xmsg.server.sockets.dir
+    else if xmsgEnabled && config.programs.xmsg.server.httpSocket != null then
       builtins.dirOf config.programs.xmsg.server.httpSocket
     else
       null;
@@ -37,7 +39,7 @@ in
       ;
     defaultStateDir = "${config.xdg.stateHome}/matrix-xmsg";
     defaultStateDirText = lib.literalExpression "\"\${config.xdg.stateHome}/matrix-xmsg\"";
-    defaultXmsgSocketText = lib.literalExpression "builtins.dirOf config.programs.xmsg.server.httpSocket when set, otherwise null (runtime default)";
+    defaultXmsgSocketText = lib.literalExpression "config.programs.xmsg.server.sockets.dir or builtins.dirOf config.programs.xmsg.server.httpSocket when set, otherwise null (runtime default)";
     accessTokenDescription = ''
       Runtime path to file (mode 0600 or 0400) containing the Matrix access token.
       Never an inline secret or a /nix/store path.

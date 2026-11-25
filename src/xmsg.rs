@@ -331,6 +331,9 @@ pub async fn register_svc(options: ClientOptions) -> Result<SvcSocketInbox, AppE
     register_with_client(options, Arc::new(UnixXmsgClient::disconnected())).await
 }
 
+pub type SocketResolver =
+    Arc<dyn Fn() -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, AppError> + Send + Sync>;
+
 /// An auto-reconnecting service inbox that wraps `register_svc`.
 /// When connection is lost or registration fails, reconnects with exponential backoff
 /// (default: start 1s, cap 30s).
@@ -341,6 +344,7 @@ pub struct ReconnectingSvcInbox {
     min_backoff: Duration,
     max_backoff: Duration,
     current_backoff: Duration,
+    socket_resolver: Option<SocketResolver>,
 }
 
 impl ReconnectingSvcInbox {
@@ -353,7 +357,13 @@ impl ReconnectingSvcInbox {
             min_backoff,
             max_backoff: Duration::from_secs(30),
             current_backoff: min_backoff,
+            socket_resolver: None,
         }
+    }
+
+    pub fn with_socket_resolver(mut self, resolver: SocketResolver) -> Self {
+        self.socket_resolver = Some(resolver);
+        self
     }
 
     pub fn with_backoff(mut self, min: Duration, max: Duration) -> Self {
@@ -376,6 +386,19 @@ impl ReconnectingSvcInbox {
 impl SvcInbox for ReconnectingSvcInbox {
     async fn poll(&mut self, wait_secs: u64) -> Result<Option<SvcDelivery>, AppError> {
         if self.current.is_none() {
+            if let Some(resolver) = &self.socket_resolver {
+                match resolver() {
+                    Ok(Some((reg, agent))) => {
+                        self.options.register_socket = reg;
+                        self.options.agent_socket = agent;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!("{e}");
+                        return Err(e);
+                    }
+                }
+            }
             match register_with_client(self.options.clone(), self.client.clone()).await {
                 Ok(inbox) => {
                     if let Some(address) = inbox.address() {
